@@ -28,20 +28,20 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASS", "admin_password")
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datos")
 CONFIG_PARCIALES_PATH = os.path.join(DATA_DIR, "config_parciales.json")
 
-# Mapeo de meses en español
-MONTHS_ES = {
-    'ene': 1, 'enero': 1,
-    'feb': 2, 'febrero': 2,
-    'mar': 3, 'marzo': 3,
-    'abr': 4, 'abril': 4,
-    'may': 5, 'mayo': 5,
-    'jun': 6, 'junio': 6,
-    'jul': 7, 'julio': 7,
-    'ago': 8, 'agosto': 8,
-    'sep': 9, 'sept': 9, 'set': 9, 'septiembre': 9, 'setiembre': 9,
-    'oct': 10, 'octubre': 10,
-    'nov': 11, 'noviembre': 11,
-    'dic': 12, 'diciembre': 12
+# Diccionario de traducción de meses en español a inglés
+SPANISH_TO_ENGLISH_MONTHS = {
+    'ene': 'Jan', 'enero': 'Jan',
+    'feb': 'Feb', 'febrero': 'Feb',
+    'mar': 'Mar', 'marzo': 'Mar',
+    'abr': 'Apr', 'abril': 'Apr',
+    'may': 'May', 'mayo': 'May',
+    'jun': 'Jun', 'junio': 'Jun',
+    'jul': 'Jul', 'julio': 'Jul',
+    'ago': 'Aug', 'agosto': 'Aug',
+    'sep': 'Sep', 'sept': 'Sep', 'set': 'Sep', 'septiembre': 'Sep', 'setiembre': 'Sep',
+    'oct': 'Oct', 'octubre': 'Oct',
+    'nov': 'Nov', 'noviembre': 'Nov',
+    'dic': 'Dec', 'diciembre': 'Dec'
 }
 
 # Inyección de estilos CSS
@@ -114,17 +114,22 @@ st.markdown("""
 # GESTIÓN Y CONFIGURACIÓN DE PARCIALES (PERIODOS DE EVALUACIÓN)
 # ==============================================================================
 def get_default_parciales_config():
-    """Configuración predeterminada de fechas para los 3 Parciales del ciclo."""
+    """Configuración predeterminada de fechas dinámicas para los 3 Parciales del ciclo."""
+    now_year = datetime.now().year
+    next_year = now_year + 1
     return {
-        'Parcial 1': {'start': '2025-08-15', 'end': '2025-10-03'},
-        'Parcial 2': {'start': '2025-10-04', 'end': '2025-11-21'},
-        'Parcial 3': {'start': '2025-11-22', 'end': '2026-01-23'}
+        'Parcial 1': {'start': f'{now_year}-08-15', 'end': f'{now_year}-10-03'},
+        'Parcial 2': {'start': f'{now_year}-10-04', 'end': f'{now_year}-11-21'},
+        'Parcial 3': {'start': f'{now_year}-11-22', 'end': f'{next_year}-01-23'}
     }
 
 
 def load_parciales_config():
-    """Carga la configuración de fechas de Parciales desde archivo JSON o default."""
+    """Carga la configuración de fechas de Parciales desde archivo JSON o default dinámico."""
     os.makedirs(DATA_DIR, exist_ok=True)
+    defaults = get_default_parciales_config()
+    now_year = datetime.now().year
+
     if os.path.exists(CONFIG_PARCIALES_PATH):
         try:
             with open(CONFIG_PARCIALES_PATH, "r", encoding="utf-8") as f:
@@ -137,15 +142,23 @@ def load_parciales_config():
                             'end': date.fromisoformat(data[p_name]['end'])
                         }
                 if len(parsed) == 3:
+                    # Si el archivo tiene un año inferior al actual, migrar automáticamente al ciclo actual
+                    if parsed['Parcial 1']['start'].year < now_year:
+                        parsed = {
+                            k: {'start': date.fromisoformat(v['start']), 'end': date.fromisoformat(v['end'])}
+                            for k, v in defaults.items()
+                        }
+                        save_parciales_config(parsed)
                     return parsed
         except Exception:
             pass
 
-    defaults = get_default_parciales_config()
-    return {
+    parsed_defaults = {
         k: {'start': date.fromisoformat(v['start']), 'end': date.fromisoformat(v['end'])}
         for k, v in defaults.items()
     }
+    save_parciales_config(parsed_defaults)
+    return parsed_defaults
 
 
 def save_parciales_config(config_dict):
@@ -161,22 +174,37 @@ def save_parciales_config(config_dict):
         json.dump(serializable, f, indent=4, ensure_ascii=False)
 
 
-def assign_parcial(dt, parcial_config):
+def assign_parciales_vectorized(df, parcial_config):
     """
-    Asigna una etiqueta 'Parcial 1', 'Parcial 2', 'Parcial 3' o 'Sin asignar'
-    a una fecha de entrega según los rangos configurados.
+    CRÍTICO: Asigna la etiqueta 'Parcial' a cada actividad extrayendo .dt.date
+    de la columna 'dt_entrega' (Timestamp de Pandas) y comparándola directamente
+    contra los objetos datetime.date obtenidos de st.date_input con operadores >= y <=.
     """
-    if pd.isna(dt):
-        return 'Sin asignar'
-    task_date = dt.date() if hasattr(dt, 'date') else dt
+    if df.empty or 'dt_entrega' not in df.columns:
+        df['Parcial'] = 'Sin asignar'
+        return df
+
+    # Extracción explícita de datetime.date desde la columna Timestamp de Pandas
+    task_dates = df['dt_entrega'].dt.date
+    parcial_series = pd.Series('Sin asignar', index=df.index, dtype='object')
+
     for p_name in ['Parcial 1', 'Parcial 2', 'Parcial 3']:
         cfg = parcial_config.get(p_name, {})
         start_d = cfg.get('start')
         end_d = cfg.get('end')
-        if start_d and end_d:
-            if start_d <= task_date <= end_d:
-                return p_name
-    return 'Sin asignar'
+
+        if start_d is not None and end_d is not None:
+            if isinstance(start_d, str):
+                start_d = date.fromisoformat(start_d)
+            if isinstance(end_d, str):
+                end_d = date.fromisoformat(end_d)
+
+            # Comparación directa de fechas (datetime.date vs datetime.date)
+            mask = (task_dates >= start_d) & (task_dates <= end_d)
+            parcial_series[mask] = p_name
+
+    df['Parcial'] = parcial_series
+    return df
 
 
 # ==============================================================================
@@ -186,7 +214,6 @@ def extract_group(filename):
     """
     Extrae el identificador de grupo a partir del nombre de archivo.
     Busca patrones como '5°H', '5° H', '5H', '5-H', '5° F', '5F', '5° G', etc.
-    Si no encuentra coincidencia, retorna el nombre base sin extensión.
     """
     base_name = os.path.basename(filename)
     match = re.search(r'([1-6])[\s°º\-_]*([A-Za-z])(?=[^a-zA-Z]|$)', base_name)
@@ -197,43 +224,66 @@ def extract_group(filename):
 
 
 # ==============================================================================
-# PARSER DE FECHAS PERSONALIZADO PARA KHAN ACADEMY
+# PARSER DE FECHAS AGRESIVO PERSONALIZADO PARA KHAN ACADEMY
 # ==============================================================================
-def parse_khan_date(val, default_year=2025):
+def parse_khan_date(val, default_year=None):
     """
-    Convierte una cadena de fecha de Khan Academy en español con símbolo de grado/ordinal
-    (ej. 'sep. 12º, 11:59PM' o 'dic. 14º, 11:00PM') en un objeto pd.Timestamp.
-    Por defecto asigna el año 2025.
+    Limpia agresivamente la cadena de fecha de Khan Academy:
+    - Remueve 'º', '°', 'ª'
+    - Traduce abreviaturas y nombres de meses en español a inglés
+    - Determina dinámicamente el año actual (datetime.now().year)
+    - Aplica lógica inteligente de cambio de año (crossover):
+      Si el mes parseado es entre enero y julio (1-7) y el mes actual es entre agosto y diciembre (8-12),
+      suma 1 al año para manejar correctamente los semestres interanuales (agosto-enero).
+    - Convierte a pd.Timestamp con formato mixto y manejo robusto de errores
     """
     if pd.isna(val) or not str(val).strip():
         return pd.NaT
 
-    s = str(val).strip().lower()
+    s = str(val).strip()
 
-    pattern = r'([a-záéíóú]+)\.?\s+(\d{1,2})[º°ª]?(?:[,\s]+(\d{4}))?[,\s]+(\d{1,2}):(\d{2})\s*(am|pm)?'
-    match = re.search(pattern, s)
+    # 1. Quitar símbolos de grado u ordinales
+    s = re.sub(r'[º°ª]', '', s)
 
-    if match:
-        mon_str, day_str, yr_str, hr_str, min_str, ampm_str = match.groups()
-        mon = MONTHS_ES.get(mon_str[:3], 1)
-        day = int(day_str)
-        yr = int(yr_str) if yr_str else default_year
-        hr = int(hr_str)
-        mn = int(min_str)
+    # 2. Reemplazar nombres y abreviaturas de meses en español por inglés
+    def replace_month(match):
+        m = match.group(1).lower()
+        return SPANISH_TO_ENGLISH_MONTHS.get(m, match.group(1))
 
-        if ampm_str:
-            if ampm_str == 'pm' and hr < 12:
-                hr += 12
-            elif ampm_str == 'am' and hr == 12:
-                hr = 0
+    s = re.sub(r'\b([a-záéíóú]{3,10})\.?', replace_month, s, flags=re.IGNORECASE)
 
-        try:
-            return pd.Timestamp(year=yr, month=mon, day=day, hour=hr, minute=mn)
-        except Exception:
-            return pd.NaT
+    # 3. Normalizar espacios
+    s = re.sub(r'\s+', ' ', s).strip()
+
+    # 4. Determinar año dinámicamente con lógica inteligente de crossover
+    now = datetime.now()
+    now_year = now.year if default_year is None else default_year
+    now_month = now.month
+
+    # Identificar el número de mes a partir de la cadena traducida
+    month_match = re.search(r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b', s, re.IGNORECASE)
+    parsed_month_num = None
+    if month_match:
+        m_name = month_match.group(1).capitalize()
+        month_map = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
+                     'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
+        parsed_month_num = month_map.get(m_name)
+
+    # Si la cadena no contiene ya un año de 4 dígitos:
+    if not re.search(r'\b(20\d\d)\b', s):
+        target_year = now_year
+        # Crossover: si el mes es de enero a julio (1 a 7) y estamos en agosto a diciembre (8 a 12)
+        if parsed_month_num is not None:
+            if 1 <= parsed_month_num <= 7 and 8 <= now_month <= 12:
+                target_year = now_year + 1
+
+        # Insertar año después del día y antes de la hora
+        s = re.sub(r'([A-Za-z]+\s+\d{1,2})([,\s]+)', rf'\1 {target_year}\2', s)
+        if not re.search(r'\b(20\d\d)\b', s):
+            s = f"{s} {target_year}"
 
     try:
-        return pd.to_datetime(s)
+        return pd.to_datetime(s, format='mixed', errors='coerce')
     except Exception:
         return pd.NaT
 
@@ -384,6 +434,37 @@ def calculate_weighted_task(row):
 
 
 # ==============================================================================
+# CLASIFICACIÓN DE RENDIMIENTO DEL ESTUDIANTE (ESTATUS)
+# ==============================================================================
+def classify_student(score):
+    """
+    Clasifica el rendimiento del estudiante según su promedio general:
+    - 'Excelente': >= 9.5
+    - 'Bien': 8.5 a 9.49
+    - 'Regular': 7.0 a 8.49
+    - 'Mal': 6.0 a 6.99
+    - 'En riesgo': < 6.0
+    """
+    if pd.isna(score):
+        return 'En riesgo'
+    try:
+        val = float(score)
+    except (ValueError, TypeError):
+        return 'En riesgo'
+
+    if val >= 9.5:
+        return 'Excelente'
+    elif val >= 8.5:
+        return 'Bien'
+    elif val >= 7.0:
+        return 'Regular'
+    elif val >= 6.0:
+        return 'Mal'
+    else:
+        return 'En riesgo'
+
+
+# ==============================================================================
 # CARGA Y CACHÉ DE DATOS
 # ==============================================================================
 @st.cache_data
@@ -453,8 +534,9 @@ def load_credentials():
 @st.cache_data
 def load_assignments():
     """
-    Lee todos los archivos CSV en la carpeta datos/ (exceptuando credenciales)
-    y procesa las tareas aplicando extracción de grupo, parseo de fechas y cálculo ponderado.
+    Lee todos los archivos CSV en la carpeta datos/ (exceptuando credenciales),
+    extrae el Grupo de cada archivo, limpia agresivamente y parsea fechas de Khan Academy
+    y calcula puntos ponderados.
     """
     os.makedirs(DATA_DIR, exist_ok=True)
     csv_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
@@ -488,7 +570,7 @@ def load_assignments():
     if 'Nombre del estudiante' in all_data.columns:
         all_data['Nombre del estudiante'] = all_data['Nombre del estudiante'].astype(str).str.strip()
 
-    # Parsear fechas usando regla de Khan Academy
+    # Parsear fechas usando regla limpia y dinámica de Khan Academy
     if 'Fecha de entrega' in all_data.columns:
         all_data['dt_entrega'] = all_data['Fecha de entrega'].apply(parse_khan_date)
     else:
@@ -505,10 +587,6 @@ def load_assignments():
 
     for col in grades_df.columns:
         all_data[col] = grades_df[col]
-
-    # Asignar Parcial según configuración
-    parcial_config = load_parciales_config()
-    all_data['Parcial'] = all_data['dt_entrega'].apply(lambda d: assign_parcial(d, parcial_config))
 
     return all_data
 
@@ -529,7 +607,7 @@ def compute_student_block_grades(assignments_df):
         earned_sum=('earned_points', 'sum'),
         max_sum=('max_points', 'sum'),
         dt_entrega=('dt_entrega', 'first'),
-        parcial=('Parcial', 'first')
+        parcial=('Parcial', 'first') if 'Parcial' in assignments_df.columns else ('dt_entrega', 'first')
     )
 
     block_summary['block_grade'] = block_summary.apply(
@@ -547,7 +625,6 @@ def render_student_dashboard(student_name, student_data, is_admin_drilldown=Fals
     """
     Renderiza la interfaz detallada del estudiante (tarjetas KPIs, filtros por Parcial
     y tipo de tarea, y bloques expandibles con tareas, intentos, fechas y puntos).
-    Se utiliza tanto en la vista del Estudiante como en el Drill-Down del Administrador.
     """
     if student_data.empty:
         st.info(f"No se encontraron actividades registradas para **{student_name}**.")
@@ -560,8 +637,6 @@ def render_student_dashboard(student_name, student_data, is_admin_drilldown=Fals
 
     with filter_col1:
         parciales_disponibles = ["Todas", "Parcial 1", "Parcial 2", "Parcial 3", "Sin asignar"]
-        # Detectar qué parciales tienen realmente datos
-        present_parciales = set(student_data['Parcial'].unique())
         selected_parcial = st.radio(
             "Filtrar por Periodo (Parcial):",
             parciales_disponibles,
@@ -839,10 +914,10 @@ def render_admin():
             st.session_state.clear()
             st.rerun()
 
-    # Cargar datos
+    # Cargar datos base
     all_assignments = load_assignments()
     all_credentials = load_credentials()
-    parcial_config = load_parciales_config()
+    saved_parcial_config = load_parciales_config()
 
     # --------------------------------------------------------------------------
     # SECCIÓN 1: CONFIGURACIÓN DE PARCIALES Y CARGA DE ARCHIVOS (EXPANDIBLES)
@@ -855,13 +930,13 @@ def render_admin():
             with st.form("form_parciales"):
                 cp1_col1, cp1_col2 = st.columns(2)
                 with cp1_col1:
-                    p1_s = st.date_input("Inicio Parcial 1", value=parcial_config['Parcial 1']['start'])
-                    p2_s = st.date_input("Inicio Parcial 2", value=parcial_config['Parcial 2']['start'])
-                    p3_s = st.date_input("Inicio Parcial 3", value=parcial_config['Parcial 3']['start'])
+                    p1_s = st.date_input("Inicio Parcial 1", value=saved_parcial_config['Parcial 1']['start'])
+                    p2_s = st.date_input("Inicio Parcial 2", value=saved_parcial_config['Parcial 2']['start'])
+                    p3_s = st.date_input("Inicio Parcial 3", value=saved_parcial_config['Parcial 3']['start'])
                 with cp1_col2:
-                    p1_e = st.date_input("Fin Parcial 1", value=parcial_config['Parcial 1']['end'])
-                    p2_e = st.date_input("Fin Parcial 2", value=parcial_config['Parcial 2']['end'])
-                    p3_e = st.date_input("Fin Parcial 3", value=parcial_config['Parcial 3']['end'])
+                    p1_e = st.date_input("Fin Parcial 1", value=saved_parcial_config['Parcial 1']['end'])
+                    p2_e = st.date_input("Fin Parcial 2", value=saved_parcial_config['Parcial 2']['end'])
+                    p3_e = st.date_input("Fin Parcial 3", value=saved_parcial_config['Parcial 3']['end'])
 
                 save_p_btn = st.form_submit_button("💾 Guardar Fechas de Parciales", type="primary")
                 if save_p_btn:
@@ -871,9 +946,13 @@ def render_admin():
                         'Parcial 3': {'start': p3_s, 'end': p3_e}
                     }
                     save_parciales_config(new_cfg)
+                    st.session_state['active_parcial_config'] = new_cfg
                     st.cache_data.clear()
-                    st.success("✅ Fechas de Parciales actualizadas con éxito.")
+                    st.success("✅ Fechas de Parciales guardadas exitosamente.")
                     st.rerun()
+
+    # Configuración de parciales activa (session_state o guardada)
+    active_parcial_config = st.session_state.get('active_parcial_config', saved_parcial_config)
 
     with col_cfg2:
         with st.expander("📂 Carga de Archivos (CSV y Credenciales)", expanded=False):
@@ -919,17 +998,20 @@ def render_admin():
     st.divider()
 
     # --------------------------------------------------------------------------
-    # SECCIÓN 2: MASTER DASHBOARD CON FILTRO DE GRUPO Y COLUMNA 'GRUPO'
+    # SECCIÓN 2: MASTER DASHBOARD CON CLASIFICACIÓN DE RENDIMIENTO (ESTATUS)
     # --------------------------------------------------------------------------
     st.markdown("### 📊 Master Dashboard de Calificaciones")
-    st.caption("Concentrado de calificaciones por bloques. Incluye columna de Grupo y filtros interactivos.")
+    st.caption("Concentrado de calificaciones por bloques con estatus de desempeño y filtros por Grupo y Parcial.")
 
     if all_assignments.empty:
         st.warning("No hay tareas registradas en la carpeta `datos/`.")
         return
 
-    # Obtener grupos disponibles
-    available_groups = sorted([g for g in all_assignments['Grupo'].dropna().unique() if g])
+    # CRÍTICO: Asignar Parciales vectorialmente comparando .dt.date contra datetime.date
+    assignments_tagged = assign_parciales_vectorized(all_assignments.copy(), active_parcial_config)
+
+    # Grupos disponibles
+    available_groups = sorted([g for g in assignments_tagged['Grupo'].dropna().unique() if g])
 
     # Controles del Master Dashboard
     f_col1, f_col2, f_col3, f_col4 = st.columns([3, 2, 2, 2])
@@ -956,9 +1038,9 @@ def render_admin():
 
     # Filtrar asignaciones por grupo(s)
     if selected_groups:
-        active_master = all_assignments[all_assignments['Grupo'].isin(selected_groups)].copy()
+        active_master = assignments_tagged[assignments_tagged['Grupo'].isin(selected_groups)].copy()
     else:
-        active_master = all_assignments.copy()
+        active_master = assignments_tagged.copy()
 
     # Filtrar por parcial si se seleccionó uno en específico
     if filtro_parcial_master != "Todos los Parciales":
@@ -982,43 +1064,63 @@ def render_admin():
         if d not in date_order:
             date_order.append(d)
 
-    # Construir tabla pivote con 'Grupo' y 'Nombre del estudiante' en las filas
+    # Construir tabla pivote base
     pivot_df = block_summary.pivot(
         index=['Grupo', 'Nombre del estudiante'],
         columns='Fecha de entrega',
         values='block_grade'
     ).reset_index()
 
-    # Asegurar que las columnas de fecha sigan el orden cronológico
+    # Columnas de fecha existentes en el pivote
     existing_date_cols = [c for c in date_order if c in pivot_df.columns]
-    column_arrangement = ['Grupo', 'Nombre del estudiante'] + existing_date_cols
-    pivot_df = pivot_df[column_arrangement]
 
-    # Búsqueda por nombre
-    if search_student:
-        pivot_df = pivot_df[pivot_df['Nombre del estudiante'].str.contains(search_student, case=False, na=False)]
-
-    # Calcular promedio general
+    # Calcular Promedio General del estudiante a través de todos los bloques disponibles
     numeric_only = pivot_df[existing_date_cols].fillna(0.0)
     pivot_df['Promedio General'] = numeric_only.mean(axis=1).round(1)
 
-    # Métricas grupales
-    m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        st.metric("Total de Alumnos", len(pivot_df))
-    with m2:
-        st.metric("Bloques Evaluados", len(existing_date_cols))
-    with m3:
-        avg_g = pivot_df['Promedio General'].mean() if not pivot_df.empty else 0.0
-        st.metric("Promedio General Grupal", f"{avg_g:.1f} / 10")
-    with m4:
-        aprob = (pivot_df['Promedio General'] >= 6.0).sum() if not pivot_df.empty else 0
-        pct_aprob = (aprob / len(pivot_df) * 100) if len(pivot_df) > 0 else 0
-        st.metric("Tasa de Aprobación", f"{pct_aprob:.0f}% ({aprob}/{len(pivot_df)})")
+    # NUEVO: Crear columna 'Estatus' que clasifica al estudiante según su promedio general
+    pivot_df['Estatus'] = pivot_df['Promedio General'].apply(classify_student)
+
+    # Organizar columnas: 'Estatus' al lado del nombre del estudiante
+    column_arrangement = ['Grupo', 'Nombre del estudiante', 'Estatus'] + existing_date_cols + ['Promedio General']
+    pivot_df = pivot_df[column_arrangement]
+
+    # Búsqueda por nombre si se especificó
+    if search_student:
+        pivot_df = pivot_df[pivot_df['Nombre del estudiante'].str.contains(search_student, case=False, na=False)]
+
+    # --------------------------------------------------------------------------
+    # MÉTRICAS Y RESUMEN RÁPIDO DE LAS 5 CATEGORÍAS DE RENDIMIENTO
+    # --------------------------------------------------------------------------
+    st.markdown("#### 🎯 Distribución de Rendimiento Académico")
+    estatus_counts = pivot_df['Estatus'].value_counts()
+    c_exc = int(estatus_counts.get('Excelente', 0))
+    c_bien = int(estatus_counts.get('Bien', 0))
+    c_reg = int(estatus_counts.get('Regular', 0))
+    c_mal = int(estatus_counts.get('Mal', 0))
+    c_riesgo = int(estatus_counts.get('En riesgo', 0))
+    total_st = len(pivot_df)
+
+    col_e1, col_e2, col_e3, col_e4, col_e5 = st.columns(5)
+    with col_e1:
+        pct = (c_exc / total_st * 100) if total_st else 0
+        st.metric("🌟 Excelente (≥ 9.5)", f"{c_exc}", f"{pct:.0f}% alumnos")
+    with col_e2:
+        pct = (c_bien / total_st * 100) if total_st else 0
+        st.metric("👍 Bien (8.5 - 9.4)", f"{c_bien}", f"{pct:.0f}% alumnos")
+    with col_e3:
+        pct = (c_reg / total_st * 100) if total_st else 0
+        st.metric("👌 Regular (7.0 - 8.4)", f"{c_reg}", f"{pct:.0f}% alumnos")
+    with col_e4:
+        pct = (c_mal / total_st * 100) if total_st else 0
+        st.metric("⚠️ Mal (6.0 - 6.9)", f"{c_mal}", f"{pct:.0f}% alumnos")
+    with col_e5:
+        pct = (c_riesgo / total_st * 100) if total_st else 0
+        st.metric("🚨 En riesgo (< 6.0)", f"{c_riesgo}", f"{pct:.0f}% alumnos")
 
     st.write("")
 
-    # Formateo de visualización
+    # Formateo de visualización de notas
     display_pivot = pivot_df.copy()
     if fill_option == "N/A":
         for col in existing_date_cols:
@@ -1029,7 +1131,7 @@ def render_admin():
             display_pivot[col] = display_pivot[col].fillna(0.0).map("{:.1f}".format)
         display_pivot['Promedio General'] = display_pivot['Promedio General'].fillna(0.0).map("{:.1f}".format)
 
-    # Renderizar la tabla pivote con la columna Grupo visible
+    # Renderizar la tabla pivote con Estatus inmediatamente después del nombre
     st.dataframe(
         display_pivot,
         use_container_width=True,
@@ -1038,6 +1140,7 @@ def render_admin():
         column_config={
             "Grupo": st.column_config.TextColumn("Grupo", width="small"),
             "Nombre del estudiante": st.column_config.TextColumn("Nombre del estudiante", width="large"),
+            "Estatus": st.column_config.TextColumn("Estatus", width="medium"),
             "Promedio General": st.column_config.TextColumn("Promedio General", width="small")
         }
     )
@@ -1066,20 +1169,19 @@ def render_admin():
     st.divider()
 
     # --------------------------------------------------------------------------
-    # SECCIÓN 3: ADMIN DRILL-DOWN (INSPECCIÓN INDIVIDUAL DE ESTUDIANTE)
+    # SECCIÓN 3: ENHANCED ADMIN DRILL-DOWN (INSPECCIÓN INDIVIDUAL DE ESTUDIANTE)
     # --------------------------------------------------------------------------
     st.markdown("### 🔍 Detalle Individual de Estudiante (Drill-Down)")
-    st.caption("Selecciona a un estudiante para inspeccionar su dashboard individual exacto, con tareas, intentos, fechas y puntos.")
+    st.caption("Selecciona a un estudiante para inspeccionar el desglose completo de todas sus actividades con formato condicional.")
 
-    # Estudiantes disponibles según el filtro de grupos
-    candidate_students_df = all_assignments[all_assignments['Grupo'].isin(selected_groups)] if selected_groups else all_assignments
+    candidate_students_df = assignments_tagged[assignments_tagged['Grupo'].isin(selected_groups)] if selected_groups else assignments_tagged
     available_students = sorted(candidate_students_df['Nombre del estudiante'].dropna().unique())
 
     if not available_students:
         st.info("No hay estudiantes para los grupos seleccionados.")
         return
 
-    drill_col1, drill_col2 = st.columns([3, 1])
+    drill_col1, drill_col2, drill_col3 = st.columns([3, 1, 1])
     with drill_col1:
         selected_student = st.selectbox(
             "Selecciona un estudiante para inspeccionar en detalle:",
@@ -1087,18 +1189,84 @@ def render_admin():
             key="admin_drilldown_student_select"
         )
 
-    # Obtener grupo del estudiante seleccionado
-    student_record = all_assignments[all_assignments['Nombre del estudiante'] == selected_student]
-    student_group = student_record['Grupo'].iloc[0] if not student_record.empty else "N/A"
+    student_tasks_data = assignments_tagged[assignments_tagged['Nombre del estudiante'] == selected_student].copy()
+    student_group = student_tasks_data['Grupo'].iloc[0] if not student_tasks_data.empty else "N/A"
+
+    # Calcular promedio del estudiante en todos los bloques
+    st_blocks = compute_student_block_grades(student_tasks_data)
+    st_avg = st_blocks['block_grade'].mean() if not st_blocks.empty else 0.0
+    st_estatus = classify_student(st_avg)
 
     with drill_col2:
         st.write("")
         st.write("")
         st.info(f"**Grupo:** {student_group}")
 
-    # Renderizar la vista idéntica que ve el estudiante
-    student_tasks_data = all_assignments[all_assignments['Nombre del estudiante'] == selected_student].copy()
-    render_student_dashboard(selected_student, student_tasks_data, is_admin_drilldown=True)
+    with drill_col3:
+        st.write("")
+        st.write("")
+        st.info(f"**Estatus:** {st_estatus} ({st_avg:.1f})")
+
+    # --------------------------------------------------------------------------
+    # TABLA COMPLETA CON FORMATO CONDICIONAL (.style)
+    # --------------------------------------------------------------------------
+    st.markdown("#### 📋 Listado Completo de Actividades del Alumno")
+    st.caption("Semáforo de detección rápida: 🟥 **Rojo tenue:** Calificación de 0 puntos (sin entrega o penalizada) | 🟨 **Amarillo tenue:** Actividad realizada con más de 3 intentos.")
+
+    # Ordenar por fecha de entrega y nombre
+    all_tasks_sorted = student_tasks_data.sort_values(by=['dt_entrega', 'Nombre de la tarea']).copy()
+
+    # Columnas requeridas: 'Nombre de la tarea', 'Parcial', 'Fecha de entrega', 'Número de intentos', 'Puntos Obtenidos'
+    drill_display = pd.DataFrame({
+        'Nombre de la tarea': all_tasks_sorted['Nombre de la tarea'],
+        'Parcial': all_tasks_sorted['Parcial'],
+        'Fecha de entrega': all_tasks_sorted['Fecha de entrega'],
+        'Número de intentos': all_tasks_sorted['Número de intentos'].fillna('0'),
+        'Puntos Obtenidos': all_tasks_sorted['earned_points']
+    })
+
+    # Función de formato condicional con Pandas .style
+    def highlight_drilldown_rows(row):
+        score = row.get('Puntos Obtenidos', 0)
+        attempts = row.get('Número de intentos', 0)
+        try:
+            s_val = float(score)
+        except (ValueError, TypeError):
+            s_val = 0.0
+        try:
+            a_val = int(float(str(attempts).strip()))
+        except (ValueError, TypeError):
+            a_val = 0
+
+        # Rojo tenue para puntaje final de 0
+        if s_val == 0.0:
+            return ['background-color: #fee2e2; color: #991b1b; font-weight: 500;'] * len(row)
+        # Amarillo tenue para intentos extras (> 3)
+        elif a_val > 3:
+            return ['background-color: #fef9c3; color: #854d0e; font-weight: 500;'] * len(row)
+        return [''] * len(row)
+
+    styled_drilldown = drill_display.style.apply(highlight_drilldown_rows, axis=1).format({'Puntos Obtenidos': '{:.1f}'})
+
+    st.dataframe(
+        styled_drilldown,
+        use_container_width=True,
+        hide_index=True,
+        height=min(550, 100 + len(drill_display) * 35),
+        column_config={
+            "Nombre de la tarea": st.column_config.TextColumn("Nombre de la tarea", width="large"),
+            "Parcial": st.column_config.TextColumn("Parcial", width="small"),
+            "Fecha de entrega": st.column_config.TextColumn("Fecha de entrega", width="medium"),
+            "Número de intentos": st.column_config.TextColumn("Número de intentos", width="small"),
+            "Puntos Obtenidos": st.column_config.TextColumn("Puntos Obtenidos", width="small"),
+        }
+    )
+
+    st.write("")
+
+    # Visualización complementaria: Dashboard idéntico con desglose por bloques y filtros
+    with st.expander("👁️ Ver Vista Detallada por Bloques (Vista del Estudiante)", expanded=True):
+        render_student_dashboard(selected_student, student_tasks_data, is_admin_drilldown=True)
 
 
 # ==============================================================================
@@ -1108,13 +1276,17 @@ def render_student():
     student_name = st.session_state.get('student_name', '')
     username = st.session_state.get('username', '')
 
-    # Encabezado principal
+    all_assignments = load_assignments()
+    active_parcial_config = load_parciales_config()
+
+    # CRÍTICO: Asignar Parciales vectorialmente comparando .dt.date contra datetime.date
+    assignments_tagged = assign_parciales_vectorized(all_assignments.copy(), active_parcial_config)
+
+    student_tasks = assignments_tagged[assignments_tagged['Nombre del estudiante'].str.strip() == student_name.strip()]
+    student_group = student_tasks['Grupo'].iloc[0] if not student_tasks.empty else ""
+
     header_col1, header_col2 = st.columns([5, 1])
     with header_col1:
-        all_assignments = load_assignments()
-        student_tasks = all_assignments[all_assignments['Nombre del estudiante'].str.strip() == student_name.strip()]
-        student_group = student_tasks['Grupo'].iloc[0] if not student_tasks.empty else ""
-
         st.markdown(f"""
         <div class="main-header">
             <h1>🎓 Calificaciones: {student_name}</h1>
@@ -1132,7 +1304,6 @@ def render_student():
         st.warning("No hay tareas registradas en el sistema. Contacta al docente.")
         return
 
-    # Renderizar dashboard reutilizable
     render_student_dashboard(student_name, student_tasks, is_admin_drilldown=False)
 
 
