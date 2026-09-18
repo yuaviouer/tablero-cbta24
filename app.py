@@ -783,20 +783,20 @@ def load_docentes_master():
     """
     service = get_drive_service()
     if not service or str(ROOT_FOLDER_ID).startswith('PEGA_AQUÍ'):
-        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre'])
+        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente'])
 
     doc_file = find_drive_item(service, "docentes.xlsx", ROOT_FOLDER_ID, is_folder=False)
     if not doc_file:
-        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre'])
+        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente'])
 
     df = read_drive_excel(service, doc_file['id'])
     if df.empty:
-        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre'])
+        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente'])
 
     df.columns = [str(c).strip() for c in df.columns]
     rename_map = {}
     for col in df.columns:
-        cl = col.lower()
+        cl = col.lower().strip()
         if 'usuario' in cl:
             rename_map[col] = 'usuario_docente'
         elif 'pass' in cl or 'contrase' in cl:
@@ -805,15 +805,27 @@ def load_docentes_master():
             rename_map[col] = 'asignatura'
         elif 'carpeta' in cl:
             rename_map[col] = 'carpeta_nombre'
+        elif 'nombre' in cl and ('docente' in cl or 'profesor' in cl or 'maestro' in cl):
+            rename_map[col] = 'Nombre del Docente'
+        elif 'docente' in cl or 'profesor' in cl or 'maestro' in cl:
+            rename_map[col] = 'Nombre del Docente'
     df = df.rename(columns=rename_map)
 
-    for req in ['usuario_docente', 'password', 'asignatura', 'carpeta_nombre']:
+    if 'Nombre del Docente' not in df.columns:
+        df['Nombre del Docente'] = df.get('usuario_docente', 'Docente')
+
+    for req in ['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente']:
         if req not in df.columns:
             df[req] = ''
         else:
             df[req] = df[req].astype(str).str.strip()
 
-    return df[['usuario_docente', 'password', 'asignatura', 'carpeta_nombre']]
+    df['Nombre del Docente'] = df.apply(
+        lambda r: r['Nombre del Docente'] if r['Nombre del Docente'].strip() else r['usuario_docente'],
+        axis=1
+    )
+
+    return df[['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente']]
 
 
 def normalize_credentials_df(df):
@@ -1332,22 +1344,39 @@ def render_login():
         tab_student, tab_teacher = st.tabs(["🎓 Acceso Estudiantes", "🛡️ Acceso Docentes"])
 
         # ----------------------------------------------------------------------
-        # 1. ACCESO ESTUDIANTES (AISLAMIENTO POR ASIGNATURA / DOCENTE)
+        # 1. ACCESO ESTUDIANTES (AISLAMIENTO POR DOCENTE / ASIGNATURA)
         # ----------------------------------------------------------------------
         with tab_student:
-            st.caption("Selecciona tu asignatura e ingresa con tu usuario y contraseña de Khan Academy:")
+            st.caption("Selecciona a tu docente e ingresa con tu usuario y contraseña de Khan Academy:")
 
-            # Opciones de asignaturas disponibles desde docentes.xlsx
-            if not docentes_df.empty and 'asignatura' in docentes_df.columns:
-                available_asigs = sorted([a for a in docentes_df['asignatura'].unique() if str(a).strip()])
+            # Opciones de docentes disponibles desde docentes.xlsx
+            if not docentes_df.empty and 'Nombre del Docente' in docentes_df.columns:
+                available_teachers = sorted([t for t in docentes_df['Nombre del Docente'].unique() if str(t).strip()])
             else:
-                available_asigs = ["Temas Selectos de Matemáticas II"]
+                available_teachers = ["Docente General"]
 
-            selected_asig = st.selectbox(
-                "Asignatura / Materia:",
-                options=available_asigs,
-                key="student_asig_selector"
+            selected_teacher = st.selectbox(
+                "👨‍🏫 Docente / Profesor:",
+                options=available_teachers,
+                key="student_teacher_selector"
             )
+
+            # Filtrar las asignaturas que imparte el docente seleccionado
+            teacher_df = docentes_df[docentes_df['Nombre del Docente'] == selected_teacher] if not docentes_df.empty else pd.DataFrame()
+            teacher_subjects = sorted([s for s in teacher_df['asignatura'].unique() if str(s).strip()]) if not teacher_df.empty else []
+
+            # Si el docente imparte más de una materia, permitir elegirla; de lo contrario, auto-asignar
+            if len(teacher_subjects) > 1:
+                selected_asig = st.selectbox(
+                    "📚 Materia / Asignatura:",
+                    options=teacher_subjects,
+                    key="student_asig_selector"
+                )
+            elif len(teacher_subjects) == 1:
+                selected_asig = teacher_subjects[0]
+                st.caption(f"📚 Materia asignada: **{selected_asig}**")
+            else:
+                selected_asig = "Temas Selectos de Matemáticas II"
 
             with st.form("student_login_form", clear_on_submit=False):
                 username_input = st.text_input("Usuario Khan Academy", placeholder="ej. alboresclementepaulo", key="login_st_user").strip()
@@ -1360,16 +1389,16 @@ def render_login():
                     else:
                         folder_id = None
                         folder_name = ""
-                        if not docentes_df.empty:
-                            matched_asig = docentes_df[docentes_df['asignatura'] == selected_asig]
-                            if not matched_asig.empty:
-                                folder_name = matched_asig.iloc[0]['carpeta_nombre']
+                        if not teacher_df.empty:
+                            matched_teacher_asig = teacher_df[teacher_df['asignatura'] == selected_asig]
+                            if not matched_teacher_asig.empty:
+                                folder_name = matched_teacher_asig.iloc[0]['carpeta_nombre']
                                 if service and not str(ROOT_FOLDER_ID).startswith('PEGA_AQUÍ'):
                                     t_item = find_drive_item(service, folder_name, ROOT_FOLDER_ID, is_folder=True)
                                     if t_item:
                                         folder_id = t_item['id']
                                     else:
-                                        st.error(f"No se localizó la subcarpeta '{folder_name}' en Google Drive para la materia seleccionada.")
+                                        st.error(f"No se localizó la subcarpeta '{folder_name}' en Google Drive para el docente y materia seleccionados.")
                                         return
 
                         creds_df = load_teacher_credentials(folder_id)
@@ -1384,15 +1413,16 @@ def render_login():
                                 st.session_state['role'] = 'student'
                                 st.session_state['username'] = username_input
                                 st.session_state['student_name'] = student_name
+                                st.session_state['teacher_name'] = selected_teacher
                                 st.session_state['asignatura'] = selected_asig
                                 st.session_state['carpeta_nombre'] = folder_name
                                 st.session_state['teacher_folder_id'] = folder_id
                                 st.success(f"Bienvenido(a), {student_name}")
                                 st.rerun()
                             else:
-                                st.error("Usuario o contraseña incorrectos para la asignatura seleccionada.")
+                                st.error(f"Usuario o contraseña incorrectos para el docente '{selected_teacher}'.")
                         else:
-                            st.error(f"No se encontraron credenciales para la asignatura '{selected_asig}'. Contacta al docente.")
+                            st.error(f"No se encontraron credenciales para la asignatura '{selected_asig}' del docente '{selected_teacher}'. Contacta al docente.")
 
         # ----------------------------------------------------------------------
         # 2. ACCESO DOCENTES (ENRUTAMIENTO MAESTRO)
@@ -1420,6 +1450,7 @@ def render_login():
                             doc_row = matched_doc.iloc[0]
                             folder_name = doc_row['carpeta_nombre']
                             asig_name = doc_row['asignatura']
+                            teacher_full_name = doc_row.get('Nombre del Docente', doc_row['usuario_docente'])
                             folder_id = None
                             if service and not str(ROOT_FOLDER_ID).startswith('PEGA_AQUÍ'):
                                 t_item = find_drive_item(service, folder_name, ROOT_FOLDER_ID, is_folder=True)
@@ -1432,17 +1463,19 @@ def render_login():
                             st.session_state['logged_in'] = True
                             st.session_state['role'] = 'admin'
                             st.session_state['username'] = doc_row['usuario_docente']
-                            st.session_state['student_name'] = f"Prof. {doc_row['usuario_docente']}"
+                            st.session_state['teacher_name'] = teacher_full_name
+                            st.session_state['student_name'] = f"Prof. {teacher_full_name}"
                             st.session_state['asignatura'] = asig_name
                             st.session_state['carpeta_nombre'] = folder_name
                             st.session_state['teacher_folder_id'] = folder_id
-                            st.success(f"Bienvenido(a), Prof. {doc_row['usuario_docente']}")
+                            st.success(f"Bienvenido(a), {teacher_full_name}")
                             st.rerun()
 
                         elif doc_user_input == ADMIN_USERNAME and doc_pass_input == ADMIN_PASSWORD:
                             st.session_state['logged_in'] = True
                             st.session_state['role'] = 'admin'
                             st.session_state['username'] = ADMIN_USERNAME
+                            st.session_state['teacher_name'] = "Administrador General"
                             st.session_state['student_name'] = "Profesor / Administrador General"
                             st.session_state['asignatura'] = "Temas Selectos de Matemáticas II"
                             st.session_state['carpeta_nombre'] = "datos (Local)"
@@ -1453,7 +1486,7 @@ def render_login():
                         else:
                             st.error("Credenciales de docente no válidas.")
 
-        st.info("💡 **Estudiantes:** Seleccionen su materia y utilicen su cuenta de Khan Academy.\n\n"
+        st.info("💡 **Estudiantes:** Seleccionen a su docente e inicien sesión con su usuario y contraseña de Khan Academy.\n\n"
                 "🛡️ **Docentes:** Inicien sesión con sus credenciales maestras.")
 
 
@@ -1465,12 +1498,13 @@ def render_admin():
     asignatura = st.session_state.get('asignatura', 'Temas Selectos de Matemáticas II')
     carpeta_nombre = st.session_state.get('carpeta_nombre', 'Google Drive')
 
+    teacher_name = st.session_state.get('teacher_name', st.session_state.get('username', 'Profesor'))
     header_col1, header_col2 = st.columns([5, 1])
     with header_col1:
         st.markdown(f"""
         <div class="main-header" style="background: linear-gradient(135deg, #0f172a 0%, #334155 100%);">
             <h1>🛡️ Panel Docente - {asignatura}</h1>
-            <p>Docente: <strong>{st.session_state.get('username', 'Profesor')}</strong> | Carpeta Drive: <code>{carpeta_nombre}</code> | Sincronización en memoria</p>
+            <p>Docente: <strong>{teacher_name}</strong> | Carpeta Drive: <code>{carpeta_nombre}</code> | Sincronización en memoria</p>
         </div>
         """, unsafe_allow_html=True)
     with header_col2:
@@ -2000,12 +2034,13 @@ def render_student():
     student_tasks = assignments_tagged[assignments_tagged['Nombre del estudiante'].str.strip() == student_name.strip()]
     student_group = student_tasks['Grupo'].iloc[0] if not student_tasks.empty else ""
 
+    teacher_name = st.session_state.get('teacher_name', 'Docente')
     header_col1, header_col2 = st.columns([5, 1])
     with header_col1:
         st.markdown(f"""
         <div class="main-header">
             <h1>🎓 Calificaciones: {student_name}</h1>
-            <p>Grupo: <strong>{student_group}</strong> | Usuario: <code>{username}</code> | Asignatura: <strong>{asignatura}</strong></p>
+            <p>Grupo: <strong>{student_group}</strong> | Usuario: <code>{username}</code> | Asignatura: <strong>{asignatura}</strong> | Docente: <strong>{teacher_name}</strong></p>
         </div>
         """, unsafe_allow_html=True)
     with header_col2:
@@ -2032,6 +2067,7 @@ def main():
         st.session_state['role'] = None
         st.session_state['username'] = None
         st.session_state['student_name'] = None
+        st.session_state['teacher_name'] = None
         st.session_state['asignatura'] = None
         st.session_state['carpeta_nombre'] = None
         st.session_state['teacher_folder_id'] = None
