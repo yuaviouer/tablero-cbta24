@@ -27,6 +27,7 @@ ADMIN_USERNAME = os.environ.get("ADMIN_USER", "javier_admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASS", "admin_password")
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datos")
 CONFIG_PARCIALES_PATH = os.path.join(DATA_DIR, "config_parciales.json")
+CONFIG_CRITERIOS_PATH = os.path.join(DATA_DIR, "config_criterios.json")
 
 # Diccionario de traducción de meses en español a inglés
 SPANISH_TO_ENGLISH_MONTHS = {
@@ -289,95 +290,180 @@ def parse_khan_date(val, default_year=None):
 
 
 # ==============================================================================
-# MOTOR DE CALIFICACIÓN PONDERADA
+# GESTIÓN Y CONFIGURACIÓN DINÁMICA DE CRITERIOS DE EVALUACIÓN
 # ==============================================================================
-def calculate_weighted_task(row):
+def get_default_criteria_config(unique_task_types):
     """
-    Calcula los puntos máximos y puntos ganados según el sistema ponderado:
-    - Video: Max points = 1. Earned = 1.0 (a tiempo), 0.1 (tardío), 0.0 (no completado).
-    - Artículo: Max points = 2. Earned = 2.0 (a tiempo), 0.2 (tardío), 0.0 (no completado).
-    - Ejercicios / Quizzes (donde 'Número total de preguntas' > 0):
-        Max points = N (Número total de preguntas).
-        Earned = n (aciertos) tras aplicar penalizaciones:
-          * Penalización por intentos (>3): -1 acierto por cada intento extra.
-          * Si tardía: máx es 10% de N (0.1 * N).
-          * Si tardía Y >3 intentos: 0 puntos.
-          * Si no completado: 0 puntos.
+    Genera criterios de evaluación predeterminados para los tipos de tareas detectados:
+    - Ejercicios / Pruebas / Cuestionarios: multiplicados por aciertos, evalúan intentos (máx 3 libres).
+    - Artículos: 2.0 pts a tiempo, 0.2 tardío, puntaje plano, sin evaluación de intentos.
+    - Videos: 1.0 pto a tiempo, 0.1 tardío, puntaje plano, sin evaluación de intentos.
+    - Otros: 1.0 pto a tiempo, 0.1 tardío, puntaje plano, sin evaluación de intentos.
     """
-    task_type = str(row.get('Tipo de tarea', '')).strip().lower()
-    due_dt = row.get('dt_entrega')
-    comp_dt = row.get('dt_terminacion')
-
-    is_completed = pd.notna(comp_dt)
-    is_late = is_completed and pd.notna(due_dt) and (comp_dt > due_dt)
-
-    raw_attempts = row.get('Número de intentos', '')
-    try:
-        if pd.isna(raw_attempts) or str(raw_attempts).strip() in ['', 'En progreso']:
-            attempts = 1 if is_completed else 0
+    defaults = {}
+    for t in unique_task_types:
+        t_clean = t.lower()
+        if any(w in t_clean for w in ['ejercicio', 'cuestionario', 'prueba', 'quiz', 'examen']):
+            defaults[t] = {
+                'valor_a_tiempo': 1.0,
+                'valor_tardio': 0.1,
+                'multiplicar_por_aciertos': True,
+                'evaluar_intentos': True,
+                'max_intentos': 3
+            }
+        elif 'art' in t_clean:
+            defaults[t] = {
+                'valor_a_tiempo': 2.0,
+                'valor_tardio': 0.2,
+                'multiplicar_por_aciertos': False,
+                'evaluar_intentos': False,
+                'max_intentos': 1
+            }
+        elif 'video' in t_clean:
+            defaults[t] = {
+                'valor_a_tiempo': 1.0,
+                'valor_tardio': 0.1,
+                'multiplicar_por_aciertos': False,
+                'evaluar_intentos': False,
+                'max_intentos': 1
+            }
         else:
-            attempts = int(float(raw_attempts))
-    except (ValueError, TypeError):
-        attempts = 1 if is_completed else 0
+            defaults[t] = {
+                'valor_a_tiempo': 1.0,
+                'valor_tardio': 0.1,
+                'multiplicar_por_aciertos': False,
+                'evaluar_intentos': False,
+                'max_intentos': 1
+            }
+    return defaults
 
-    # 1. VIDEO
-    if task_type == 'video':
-        max_pts = 1.0
-        if not is_completed:
-            earned_pts = 0.0
-            status = 'No completado'
-            obs = 'No completado'
-        elif is_late:
-            earned_pts = 0.1
-            status = 'Tardía'
-            obs = 'Completado tardío (0.1 / 1.0 pt)'
+
+def load_criteria_config(unique_task_types):
+    """
+    Carga la configuración de criterios desde config_criterios.json.
+    Si faltan tipos de tarea presentes en los datos, los completa con los valores predeterminados.
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+    defaults = get_default_criteria_config(unique_task_types)
+
+    if os.path.exists(CONFIG_CRITERIOS_PATH):
+        try:
+            with open(CONFIG_CRITERIOS_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            config = {}
+            for t in unique_task_types:
+                if t in saved:
+                    config[t] = {
+                        'valor_a_tiempo': float(saved[t].get('valor_a_tiempo', 1.0)),
+                        'valor_tardio': float(saved[t].get('valor_tardio', 0.1)),
+                        'multiplicar_por_aciertos': bool(saved[t].get('multiplicar_por_aciertos', False)),
+                        'evaluar_intentos': bool(saved[t].get('evaluar_intentos', False)),
+                        'max_intentos': int(saved[t].get('max_intentos', 3))
+                    }
+                else:
+                    config[t] = defaults.get(t, {
+                        'valor_a_tiempo': 1.0,
+                        'valor_tardio': 0.1,
+                        'multiplicar_por_aciertos': False,
+                        'evaluar_intentos': False,
+                        'max_intentos': 1
+                    })
+            return config
+        except Exception:
+            pass
+
+    save_criteria_config(defaults)
+    return defaults
+
+
+def save_criteria_config(config_dict):
+    """Guarda la configuración de criterios en formato JSON."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(CONFIG_CRITERIOS_PATH, "w", encoding="utf-8") as f:
+        json.dump(config_dict, f, indent=4, ensure_ascii=False)
+
+
+def render_criteria_explanation(criteria_config):
+    """Genera texto dinámico en formato Markdown explicando los criterios activos."""
+    md = ["### Sistema de Criterios de Evaluación Vigente\n"]
+    for t_name, cfg in criteria_config.items():
+        v_ot = cfg.get('valor_a_tiempo', 1.0)
+        v_lt = cfg.get('valor_tardio', 0.1)
+        mult = cfg.get('multiplicar_por_aciertos', False)
+        eval_int = cfg.get('evaluar_intentos', False)
+        max_int = cfg.get('max_intentos', 3)
+
+        if mult:
+            rule_pts = f"**{v_ot:g} pto(s)** por acierto a tiempo | **{v_lt:g} pto(s)** por acierto tardío"
         else:
-            earned_pts = 1.0
-            status = 'A tiempo'
-            obs = 'Completado a tiempo (1.0 / 1.0 pt)'
+            rule_pts = f"**{v_ot:g} pto(s)** a tiempo | **{v_lt:g} pto(s)** tardío | 0 pts sin entrega"
 
-        return {
-            'earned_points': earned_pts,
-            'max_points': max_pts,
-            'status': status,
-            'observations': obs,
-            'attempts_count': attempts,
-            'correct_count': 0,
-            'total_count': 0,
-            'is_completed': is_completed,
-            'is_late': is_late
-        }
-
-    # 2. ARTÍCULO
-    elif task_type in ['artículo', 'articulo']:
-        max_pts = 2.0
-        if not is_completed:
-            earned_pts = 0.0
-            status = 'No completado'
-            obs = 'No completado'
-        elif is_late:
-            earned_pts = 0.2
-            status = 'Tardía'
-            obs = 'Completado tardío (0.2 / 2.0 pts)'
+        if eval_int:
+            rule_int = f"Permite hasta **{max_int} intento(s) libre(s)**. A partir del {max_int + 1}º intento se resta 1 acierto por cada intento extra. Entrega tardía con más de {max_int} intentos = **0 puntos**."
         else:
-            earned_pts = 2.0
-            status = 'A tiempo'
-            obs = 'Completado a tiempo (2.0 / 2.0 pts)'
+            rule_int = "No se contabilizan ni penalizan intentos adicionales."
 
-        return {
-            'earned_points': earned_pts,
-            'max_points': max_pts,
-            'status': status,
-            'observations': obs,
-            'attempts_count': attempts,
-            'correct_count': 0,
-            'total_count': 0,
-            'is_completed': is_completed,
-            'is_late': is_late
-        }
+        md.append(f"- **{t_name}:** {rule_pts}. {rule_int}")
 
-    # 3. EJERCICIOS / PREGUNTAS
-    else:
+    md.append("\n- **Calificación del Bloque:** $\\left( \\frac{\\sum \\text{Puntos Ganados}}{\\sum \\text{Puntos Posibles}} \\right) \\times 10$, redondeado a 1 decimal.")
+    return "\n".join(md)
+
+
+# ==============================================================================
+# MOTOR DE CALIFICACIÓN DINÁMICO
+# ==============================================================================
+def apply_dynamic_grading(df, criteria_config):
+    """
+    Aplica las reglas de calificación y penalización dinámicamente según criteria_config,
+    sin recurrir a cadenas fijas ('Video', 'Artículo', etc.):
+    - Busca la configuración del 'Tipo de tarea' correspondiente.
+    - Si evaluar_intentos es True: penaliza cada intento > max_intentos restando 1 acierto.
+      Si la entrega es tardía Y los intentos > max_intentos, califica con 0 puntos.
+    - Si evaluar_intentos es False: no penaliza intentos.
+    - Si multiplicar_por_aciertos es True:
+        max_points = valor_a_tiempo * total_questions
+        earned_points = min(valor_elegido * effective_correct, valor_elegido * total_questions)
+    - Si multiplicar_por_aciertos es False:
+        max_points = valor_a_tiempo
+        earned_points = valor_elegido (si completado y no anulado)
+    """
+    if df.empty:
+        return df
+
+    graded_rows = []
+    cfg_lookup = {k.strip().lower(): v for k, v in criteria_config.items()}
+
+    for _, row in df.iterrows():
+        raw_type = str(row.get('Tipo de tarea', '')).strip()
+        cfg = cfg_lookup.get(raw_type.lower())
+        if not cfg:
+            cfg = {
+                'valor_a_tiempo': 1.0,
+                'valor_tardio': 0.1,
+                'multiplicar_por_aciertos': False,
+                'evaluar_intentos': False,
+                'max_intentos': 1
+            }
+
+        start_dt = row.get('dt_inicio')
+        due_dt = row.get('dt_entrega')
+        comp_dt = row.get('dt_terminacion')
+
+        now = datetime.now()
+        is_future = pd.notna(start_dt) and (start_dt > now)
+
+        raw_attempts = row.get('Número de intentos', '')
+        try:
+            if pd.isna(raw_attempts) or str(raw_attempts).strip() in ['', 'En progreso']:
+                attempts = 0 if is_future else (1 if (pd.notna(comp_dt) and str(comp_dt).strip() != '') else 0)
+            else:
+                attempts = int(float(str(raw_attempts).strip()))
+        except (ValueError, TypeError):
+            attempts = 0
+
+        evaluar_intentos = cfg.get('evaluar_intentos', False)
+        max_intentos = int(cfg.get('max_intentos', 3))
+
         try:
             val_total = row.get('Número total de preguntas', 0)
             total_q = float(val_total) if (pd.notna(val_total) and str(val_total).strip() != '') else 0.0
@@ -392,45 +478,90 @@ def calculate_weighted_task(row):
         except (ValueError, TypeError):
             correct_q = 0.0
 
-        max_pts = total_q
-        penalties = []
-
-        if not is_completed or total_q == 0:
+        if is_future:
+            # Tarea futura (no iniciada): se fijan Max Points y Earned Points a 0
+            # para no tener ningún peso matemático sobre el promedio del bloque
             earned_pts = 0.0
-            status = 'No completado'
-            obs = 'Sin entrega'
+            max_pts = 0.0
+            status = 'Programada'
+            obs = 'Programada (no iniciada)'
+            is_completed = False
+            is_late = False
         else:
-            penalty_attempts = max(0, attempts - 3)
-            effective_correct = max(0.0, correct_q - penalty_attempts)
+            is_completed = pd.notna(comp_dt) and str(comp_dt).strip() != ''
+            is_late = is_completed and pd.notna(due_dt) and (comp_dt > due_dt)
 
-            if penalty_attempts > 0:
-                penalties.append(f"-{penalty_attempts} acierto(s) por {attempts} intentos")
-
-            if is_late and attempts > 3:
-                earned_pts = 0.0
-                penalties.append("Tardía + >3 intentos (0 pts)")
-                status = "Tardía (>3 intentos)"
-            elif is_late:
-                earned_pts = min(effective_correct, 0.1 * total_q)
-                penalties.append(f"Entrega tardía (Máx. {0.1 * total_q:.1f} pts)")
-                status = "Tardía"
+            if evaluar_intentos:
+                penalty_attempts = max(0, attempts - max_intentos)
             else:
-                earned_pts = min(effective_correct, total_q)
-                status = "A tiempo" if penalty_attempts == 0 else "A tiempo (con penalización)"
+                penalty_attempts = 0
 
-            obs = "; ".join(penalties) if penalties else "A tiempo (sin penalización)"
+            effective_correct = max(0.0, correct_q - penalty_attempts)
+            valor_a_tiempo = float(cfg.get('valor_a_tiempo', 1.0))
+            valor_tardio = float(cfg.get('valor_tardio', 0.1))
+            multiplicar = bool(cfg.get('multiplicar_por_aciertos', False))
 
-        return {
+            if not is_completed:
+                earned_pts = 0.0
+                status = 'No completado'
+                obs = 'Sin entrega'
+                max_pts = (valor_a_tiempo * total_q) if (multiplicar and total_q > 0) else valor_a_tiempo
+
+            elif is_late and evaluar_intentos and attempts > max_intentos:
+                earned_pts = 0.0
+                status = f'Tardía (>{max_intentos} intentos)'
+                obs = f'Tardía + >{max_intentos} intentos (0 pts)'
+                max_pts = (valor_a_tiempo * total_q) if (multiplicar and total_q > 0) else valor_a_tiempo
+
+            elif is_late:
+                chosen_val = valor_tardio
+                status = 'Tardía'
+                if multiplicar:
+                    max_pts = (valor_a_tiempo * total_q) if total_q > 0 else valor_a_tiempo
+                    earned_pts = min(chosen_val * effective_correct, chosen_val * total_q) if total_q > 0 else 0.0
+                    obs = f'Entrega tardía ({chosen_val:.2f} pts/acierto)'
+                else:
+                    max_pts = valor_a_tiempo
+                    earned_pts = chosen_val
+                    obs = f'Completado tardío ({chosen_val:.1f} / {valor_a_tiempo:.1f} pts)'
+
+            else:
+                chosen_val = valor_a_tiempo
+                if penalty_attempts > 0:
+                    status = 'A tiempo (con penalización)'
+                    obs = f'-{penalty_attempts} acierto(s) por {attempts} intentos (máx. {max_intentos})'
+                else:
+                    status = 'A tiempo'
+                    obs = 'A tiempo (sin penalización)' if multiplicar else f'Completado a tiempo ({chosen_val:.1f} / {valor_a_tiempo:.1f} pts)'
+
+                if multiplicar:
+                    max_pts = (valor_a_tiempo * total_q) if total_q > 0 else valor_a_tiempo
+                    earned_pts = min(chosen_val * effective_correct, chosen_val * total_q) if total_q > 0 else 0.0
+                else:
+                    max_pts = valor_a_tiempo
+                    earned_pts = chosen_val
+
+        graded_rows.append({
             'earned_points': round(earned_pts, 2),
-            'max_points': max_pts,
+            'max_points': round(max_pts, 2),
             'status': status,
             'observations': obs,
             'attempts_count': attempts,
             'correct_count': int(correct_q) if pd.notna(correct_q) else 0,
             'total_count': int(total_q) if pd.notna(total_q) else 0,
             'is_completed': is_completed,
-            'is_late': is_late
-        }
+            'is_late': is_late,
+            'is_future': is_future,
+            'evaluar_intentos': evaluar_intentos,
+            'max_intentos': max_intentos
+        })
+
+    graded_df = pd.DataFrame(graded_rows, index=df.index)
+    result_df = df.copy()
+    for col in graded_df.columns:
+        result_df[col] = graded_df[col]
+    return result_df
+
 
 
 # ==============================================================================
@@ -532,11 +663,11 @@ def load_credentials():
 
 
 @st.cache_data
-def load_assignments():
+def load_raw_assignments():
     """
     Lee todos los archivos CSV en la carpeta datos/ (exceptuando credenciales),
-    extrae el Grupo de cada archivo, limpia agresivamente y parsea fechas de Khan Academy
-    y calcula puntos ponderados.
+    extrae el Grupo de cada archivo, y limpia y parsea fechas de Khan Academy.
+    Retorna el DataFrame sin calificaciones fijas para permitir recalcular en tiempo real.
     """
     os.makedirs(DATA_DIR, exist_ok=True)
     csv_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
@@ -570,6 +701,9 @@ def load_assignments():
     if 'Nombre del estudiante' in all_data.columns:
         all_data['Nombre del estudiante'] = all_data['Nombre del estudiante'].astype(str).str.strip()
 
+    if 'Tipo de tarea' in all_data.columns:
+        all_data['Tipo de tarea'] = all_data['Tipo de tarea'].astype(str).str.strip()
+
     # Parsear fechas usando regla limpia y dinámica de Khan Academy
     if 'Fecha de entrega' in all_data.columns:
         all_data['dt_entrega'] = all_data['Fecha de entrega'].apply(parse_khan_date)
@@ -581,14 +715,26 @@ def load_assignments():
     else:
         all_data['dt_terminacion'] = pd.NaT
 
-    # Calcular puntos ponderados
-    grades_info = all_data.apply(calculate_weighted_task, axis=1)
-    grades_df = pd.DataFrame(list(grades_info))
-
-    for col in grades_df.columns:
-        all_data[col] = grades_df[col]
+    if 'Fecha de inicio' in all_data.columns:
+        all_data['dt_inicio'] = all_data['Fecha de inicio'].apply(parse_khan_date)
+    else:
+        all_data['dt_inicio'] = pd.NaT
 
     return all_data
+
+
+def load_assignments(criteria_config=None):
+    """
+    Carga los datos crudos y les aplica la calificación dinámica según criteria_config.
+    """
+    raw_df = load_raw_assignments()
+    if raw_df.empty:
+        return raw_df
+    if criteria_config is None:
+        unique_types = sorted([t for t in raw_df['Tipo de tarea'].dropna().unique() if t]) if 'Tipo de tarea' in raw_df.columns else []
+        criteria_config = load_criteria_config(unique_types)
+    return apply_dynamic_grading(raw_df.copy(), criteria_config)
+
 
 
 def compute_student_block_grades(assignments_df):
@@ -596,6 +742,8 @@ def compute_student_block_grades(assignments_df):
     Calcula la calificación por bloque (Fecha de entrega) para cada estudiante y grupo:
     Block Grade = (Sum(Puntos Ganados) / Sum(Puntos Posibles)) * 10
     Redondeado a 1 decimal.
+    Si todas las tareas del bloque son futuras (status == 'Programada' y max_points == 0),
+    la calificación del bloque se marca como NaN para no afectar el promedio del estudiante.
     """
     if assignments_df.empty:
         return pd.DataFrame()
@@ -607,31 +755,46 @@ def compute_student_block_grades(assignments_df):
         earned_sum=('earned_points', 'sum'),
         max_sum=('max_points', 'sum'),
         dt_entrega=('dt_entrega', 'first'),
-        parcial=('Parcial', 'first') if 'Parcial' in assignments_df.columns else ('dt_entrega', 'first')
+        parcial=('Parcial', 'first') if 'Parcial' in assignments_df.columns else ('dt_entrega', 'first'),
+        all_future=('status', lambda s: (s == 'Programada').all() if len(s) > 0 else False)
     )
 
-    block_summary['block_grade'] = block_summary.apply(
-        lambda r: round((r['earned_sum'] / r['max_sum'] * 10.0), 1) if r['max_sum'] > 0 else 0.0,
-        axis=1
-    )
+    def calc_grade(r):
+        if r['max_sum'] > 0:
+            return round((r['earned_sum'] / r['max_sum'] * 10.0), 1)
+        elif r.get('all_future', False):
+            return float('nan')
+        else:
+            return 0.0
+
+    block_summary['block_grade'] = block_summary.apply(calc_grade, axis=1)
 
     return block_summary
+
 
 
 # ==============================================================================
 # COMPONENTE REUTILIZABLE: DASHBOARD DETALLADO DEL ESTUDIANTE
 # ==============================================================================
-def render_student_dashboard(student_name, student_data, is_admin_drilldown=False):
+def render_student_dashboard(student_name, student_data, criteria_config=None, is_admin_drilldown=False):
     """
     Renderiza la interfaz detallada del estudiante (tarjetas KPIs, filtros por Parcial
-    y tipo de tarea, y bloques expandibles con tareas, intentos, fechas y puntos).
+    y tipo de tarea dinámico, y bloques expandibles con tareas, intentos, fechas y puntos).
     """
     if student_data.empty:
         st.info(f"No se encontraron actividades registradas para **{student_name}**.")
         return
 
+    # Obtener tipos de tarea presentes y configuración de criterios
+    available_types = sorted([
+        t for t in student_data['Tipo de tarea'].dropna().astype(str).str.strip().unique() if t
+    ]) if 'Tipo de tarea' in student_data.columns else []
+
+    if criteria_config is None:
+        criteria_config = load_criteria_config(available_types)
+
     # --------------------------------------------------------------------------
-    # Filtros superiores (Parcial y Tipo de Actividad)
+    # Filtros superiores (Parcial y Tipo de Actividad dinámico)
     # --------------------------------------------------------------------------
     filter_col1, filter_col2 = st.columns([3, 2])
 
@@ -645,9 +808,10 @@ def render_student_dashboard(student_name, student_data, is_admin_drilldown=Fals
         )
 
     with filter_col2:
+        tipo_options = ["Todas las actividades"] + [f"Solo {t}" for t in available_types]
         tipo_filtro = st.selectbox(
             "Filtrar por tipo de actividad:",
-            ["Todas las actividades", "Solo Ejercicios", "Solo Videos", "Solo Artículos"],
+            tipo_options,
             key=f"tipo_filter_{'admin' if is_admin_drilldown else 'student'}_{student_name}"
         )
 
@@ -664,13 +828,16 @@ def render_student_dashboard(student_name, student_data, is_admin_drilldown=Fals
     # Tarjetas de Resumen General (KPIs)
     # --------------------------------------------------------------------------
     total_tasks = len(active_data)
+    future_tasks = (active_data['status'] == 'Programada').sum()
+    active_tasks = total_tasks - future_tasks
     completed_tasks = active_data['is_completed'].sum()
     late_tasks = active_data['is_late'].sum()
     ontime_tasks = completed_tasks - late_tasks
 
-    # Promedio del estudiante para el filtro activo
+    # Promedio del estudiante para el filtro activo (excluyendo bloques futuros)
     active_blocks = compute_student_block_grades(active_data)
-    overall_avg = active_blocks['block_grade'].mean() if not active_blocks.empty else 0.0
+    valid_blocks = active_blocks['block_grade'].dropna()
+    overall_avg = valid_blocks.mean() if not valid_blocks.empty else 0.0
 
     kpi_col1, kpi_col2, kpi_col3, kpi_col4, kpi_col5 = st.columns(5)
     with kpi_col1:
@@ -682,10 +849,11 @@ def render_student_dashboard(student_name, student_data, is_admin_drilldown=Fals
         </div>
         """, unsafe_allow_html=True)
     with kpi_col2:
+        caption_future = f"<div style='font-size:0.75rem; color:#64748b; margin-top:2px;'>({future_tasks} programadas)</div>" if future_tasks > 0 else ""
         st.markdown(f"""
         <div class="stat-card">
             <div class="stat-title">Actividades</div>
-            <div class="stat-val">{total_tasks}</div>
+            <div class="stat-val">{active_tasks}{caption_future}</div>
         </div>
         """, unsafe_allow_html=True)
     with kpi_col3:
@@ -736,15 +904,34 @@ def render_student_dashboard(student_name, student_data, is_admin_drilldown=Fals
         # Puntos del bloque completos
         block_earned_total = block_df['earned_points'].sum()
         block_max_total = block_df['max_points'].sum()
-        block_grade = round((block_earned_total / block_max_total * 10.0), 1) if block_max_total > 0 else 0.0
+        is_block_all_future = (block_df['status'] == 'Programada').all() if not block_df.empty else False
+
+        if block_max_total > 0:
+            block_grade = round((block_earned_total / block_max_total * 10.0), 1)
+            grade_str = f"{block_grade:.1f}"
+            grade_color = '#16a34a' if block_grade >= 7.0 else '#dc2626'
+            progress_val = min(1.0, max(0.0, block_grade / 10.0))
+            pts_display = f"<strong>{block_earned_total:.1f} / {block_max_total:.1f}</strong>"
+            grade_suffix = "<span style='font-size: 0.95rem; color: #64748b;'> / 10</span>"
+        elif is_block_all_future:
+            block_grade = None
+            grade_str = "Programada"
+            grade_color = '#64748b'
+            progress_val = 0.0
+            pts_display = "<span style='color: #64748b; font-style: italic;'>Pendiente de inicio</span>"
+            grade_suffix = ""
+        else:
+            block_grade = 0.0
+            grade_str = "0.0"
+            grade_color = '#dc2626'
+            progress_val = 0.0
+            pts_display = f"<strong>{block_earned_total:.1f} / {block_max_total:.1f}</strong>"
+            grade_suffix = "<span style='font-size: 0.95rem; color: #64748b;'> / 10</span>"
 
         # Filtrar solo para visualización en tabla si seleccionó tipo
-        if tipo_filtro == "Solo Ejercicios":
-            display_df = block_df[block_df['Tipo de tarea'].str.lower() == 'ejercicio']
-        elif tipo_filtro == "Solo Videos":
-            display_df = block_df[block_df['Tipo de tarea'].str.lower() == 'video']
-        elif tipo_filtro == "Solo Artículos":
-            display_df = block_df[block_df['Tipo de tarea'].str.lower().isin(['artículo', 'articulo'])]
+        if tipo_filtro != "Todas las actividades":
+            sel_t = tipo_filtro.replace("Solo ", "").strip()
+            display_df = block_df[block_df['Tipo de tarea'].str.lower() == sel_t.lower()]
         else:
             display_df = block_df
 
@@ -765,41 +952,53 @@ def render_student_dashboard(student_name, student_data, is_admin_drilldown=Fals
                     </h3>
                     <span style="color: #64748b; font-size: 0.9rem;">
                         Actividades: {block_tasks_count} | Completadas: {block_completed} | 
-                        Puntos Obtenidos: <strong>{block_earned_total:.1f} / {block_max_total:.1f}</strong>
+                        Puntos Obtenidos: {pts_display}
                     </span>
                 </div>
                 <div style="text-align: right; margin-top: 5px;">
                     <span style="font-size: 0.85rem; color: #64748b; font-weight: 600; text-transform: uppercase;">Calificación del Bloque:</span>
-                    <span style="font-size: 1.7rem; font-weight: 800; color: {'#16a34a' if block_grade >= 7.0 else '#dc2626'}; margin-left: 8px;">{block_grade:.1f}</span>
-                    <span style="font-size: 0.95rem; color: #64748b;"> / 10</span>
+                    <span style="font-size: 1.7rem; font-weight: 800; color: {grade_color}; margin-left: 8px;">{grade_str}</span>
+                    {grade_suffix}
                 </div>
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        st.progress(min(1.0, max(0.0, block_grade / 10.0)))
+        st.progress(progress_val)
 
         # Tabla detallada del bloque
         table_rows = []
         for _, row in display_df.iterrows():
-            if row['Tipo de tarea'].lower() == 'ejercicio' or row['total_count'] > 0:
-                aciertos_str = f"{row['correct_count']} / {row['total_count']}"
-                intentos_str = str(row['attempts_count'])
+            if row['status'] == 'Programada':
+                aciertos_str = "—"
+                intentos_str = "—"
+                puntos_str = "Programada"
+                terminacion_str = "—"
+                estado_str = "Programada"
+                inicio_val = row.get('Fecha de inicio')
+                detalle_str = f"Programada (Inicia: {inicio_val})" if pd.notna(inicio_val) and str(inicio_val).strip() else "Programada (no iniciada)"
             else:
-                aciertos_str = "N/A"
-                intentos_str = "1" if row['is_completed'] else "0"
+                if row.get('evaluar_intentos', False) or row.get('total_count', 0) > 0:
+                    aciertos_str = f"{row['correct_count']} / {row['total_count']}"
+                    intentos_str = str(row['attempts_count'])
+                else:
+                    aciertos_str = "N/A"
+                    intentos_str = str(row['attempts_count']) if row['is_completed'] else "0"
 
-            terminacion_str = row['Última fecha de terminación'] if pd.notna(row['Última fecha de terminación']) else "Sin entrega"
+                puntos_str = f"{row['earned_points']:.1f} / {row['max_points']:.1f}"
+                terminacion_str = row['Última fecha de terminación'] if pd.notna(row['Última fecha de terminación']) else "Sin entrega"
+                estado_str = row['status']
+                detalle_str = row['observations']
 
             table_rows.append({
                 "Actividad": row['Nombre de la tarea'],
                 "Tipo": row['Tipo de tarea'],
                 "Intentos": intentos_str,
                 "Aciertos": aciertos_str,
-                "Puntos Ganados": f"{row['earned_points']:.1f} / {row['max_points']:.1f}",
+                "Puntos Ganados": puntos_str,
                 "Fecha Terminación": terminacion_str,
-                "Estado": row['status'],
-                "Detalle / Penalización": row['observations']
+                "Estado": estado_str,
+                "Detalle / Penalización": detalle_str
             })
 
         table_df = pd.DataFrame(table_rows)
@@ -821,19 +1020,9 @@ def render_student_dashboard(student_name, student_data, is_admin_drilldown=Fals
         )
         st.write("")
 
-    # Acordeón de reglas
+    # Acordeón de reglas con criterios activos dinámicos
     with st.expander("ℹ️ ¿Cómo se calculan los puntos ponderados y penalizaciones?"):
-        st.markdown("""
-        ### Sistema de Puntuación Ponderada
-        - **Videos (1 pto base):** 1.0 pto a tiempo, 0.1 pto tardío, 0 no completado.
-        - **Artículos (2 ptos base):** 2.0 ptos a tiempo, 0.2 ptos tardío, 0 no completado.
-        - **Ejercicios ($N$ preguntas = $N$ ptos posibles):**
-          - Aciertos obtenidos con 3 intentos libres.
-          - A partir del 4º intento, se resta 1 acierto por cada intento extra.
-          - Entrega tardía: máximo el 10% de $N$ ($0.1 \\times N$).
-          - Tardía con más de 3 intentos: **0 puntos**.
-        - **Calificación del Bloque:** $\\left( \\frac{\\sum \\text{Puntos Ganados}}{\\sum \\text{Puntos Posibles}} \\right) \\times 10$, redondeado a 1 decimal.
-        """)
+        st.markdown(render_criteria_explanation(criteria_config))
 
 
 # ==============================================================================
@@ -914,18 +1103,115 @@ def render_admin():
             st.session_state.clear()
             st.rerun()
 
-    # Cargar datos base
-    all_assignments = load_assignments()
+    # Cargar datos base crudos
+    raw_assignments = load_raw_assignments()
     all_credentials = load_credentials()
     saved_parcial_config = load_parciales_config()
 
+    # Detectar dinámicamente los tipos de tarea presentes en los datos
+    if not raw_assignments.empty and 'Tipo de tarea' in raw_assignments.columns:
+        unique_task_types = sorted([
+            t for t in raw_assignments['Tipo de tarea'].dropna().astype(str).str.strip().unique()
+            if t
+        ])
+    else:
+        unique_task_types = ['Video', 'Ejercicio', 'Artículo']
+
+    saved_criteria_config = load_criteria_config(unique_task_types)
+
     # --------------------------------------------------------------------------
-    # SECCIÓN 1: CONFIGURACIÓN DE PARCIALES Y CARGA DE ARCHIVOS (EXPANDIBLES)
+    # SECCIÓN 1: CONFIGURACIONES (CRITERIOS, PARCIALES Y CARGA DE ARCHIVOS)
     # --------------------------------------------------------------------------
+    with st.expander("⚙️ Configuración de Criterios de Evaluación", expanded=False):
+        st.caption("Configura en tiempo real los puntajes a tiempo, tardíos, multiplicación por aciertos y límite de intentos libres para cada tipo de tarea detectado en los datos.")
+
+        current_criteria = {}
+        for t_idx, task_type in enumerate(unique_task_types):
+            cfg_t = saved_criteria_config.get(task_type, {})
+            st.markdown(f"##### 📌 Tipo de Tarea: `{task_type}`")
+            c1, c2, c3, c4, c5 = st.columns([1.5, 1.5, 2, 1.8, 1.8])
+            with c1:
+                v_tiempo = st.number_input(
+                    "Valor a tiempo",
+                    min_value=0.0,
+                    value=float(st.session_state.get(f"crit_ot_{task_type}", cfg_t.get('valor_a_tiempo', 1.0))),
+                    step=0.5,
+                    key=f"crit_ot_{task_type}"
+                )
+            with c2:
+                v_tardio = st.number_input(
+                    "Valor tardío",
+                    min_value=0.0,
+                    value=float(st.session_state.get(f"crit_lt_{task_type}", cfg_t.get('valor_tardio', 0.1))),
+                    step=0.05,
+                    key=f"crit_lt_{task_type}"
+                )
+            with c3:
+                st.write("")
+                st.write("")
+                mult = st.checkbox(
+                    "Multiplicar por aciertos",
+                    value=bool(st.session_state.get(f"crit_mult_{task_type}", cfg_t.get('multiplicar_por_aciertos', False))),
+                    key=f"crit_mult_{task_type}",
+                    help="Si se activa, el valor base se multiplica por las preguntas correctas. Si no, es un puntaje fijo (ej. videos o lecturas)."
+                )
+            with c4:
+                st.write("")
+                st.write("")
+                eval_int = st.checkbox(
+                    "Evaluar intentos",
+                    value=bool(st.session_state.get(f"crit_eval_int_{task_type}", cfg_t.get('evaluar_intentos', False))),
+                    key=f"crit_eval_int_{task_type}",
+                    help="Si se activa, se penalizan los intentos que excedan el límite configurado."
+                )
+            with c5:
+                max_int = st.number_input(
+                    "Máx. intentos libres",
+                    min_value=1,
+                    max_value=10,
+                    value=int(st.session_state.get(f"crit_max_int_{task_type}", cfg_t.get('max_intentos', 3))),
+                    step=1,
+                    disabled=not eval_int,
+                    key=f"crit_max_int_{task_type}",
+                    help="Intentos libres permitidos. Cada intento adicional resta 1 acierto. Si es tardía y supera este límite, la nota es 0."
+                )
+
+            current_criteria[task_type] = {
+                'valor_a_tiempo': v_tiempo,
+                'valor_tardio': v_tardio,
+                'multiplicar_por_aciertos': mult,
+                'evaluar_intentos': eval_int,
+                'max_intentos': max_int
+            }
+            if t_idx < len(unique_task_types) - 1:
+                st.divider()
+
+        st.write("")
+        b_col1, b_col2, _ = st.columns([1.5, 1.8, 3])
+        with b_col1:
+            if st.button("💾 Guardar Criterios", type="primary", use_container_width=True, key="save_crit_btn"):
+                save_criteria_config(current_criteria)
+                st.session_state['active_criteria_config'] = current_criteria
+                st.success("✅ Criterios guardados permanentemente en config_criterios.json.")
+                st.rerun()
+        with b_col2:
+            if st.button("🔄 Restablecer Predeterminados", use_container_width=True, key="reset_crit_btn"):
+                defaults = get_default_criteria_config(unique_task_types)
+                save_criteria_config(defaults)
+                for t in unique_task_types:
+                    st.session_state[f"crit_ot_{t}"] = defaults[t]['valor_a_tiempo']
+                    st.session_state[f"crit_lt_{t}"] = defaults[t]['valor_tardio']
+                    st.session_state[f"crit_mult_{t}"] = defaults[t]['multiplicar_por_aciertos']
+                    st.session_state[f"crit_eval_int_{t}"] = defaults[t]['evaluar_intentos']
+                    st.session_state[f"crit_max_int_{t}"] = defaults[t]['max_intentos']
+                st.session_state['active_criteria_config'] = defaults
+                st.info("Valores predeterminados restablecidos.")
+                st.rerun()
+
     col_cfg1, col_cfg2 = st.columns(2)
 
     with col_cfg1:
-        with st.expander("⚙️ Configuración de Parciales (Periodos)", expanded=False):
+        with st.expander("📅 Configuración de Parciales (Periodos)", expanded=False):
             st.write("Define las fechas límite de inicio y fin para cada uno de los 3 Parciales del semestre:")
             with st.form("form_parciales"):
                 cp1_col1, cp1_col2 = st.columns(2)
@@ -1003,12 +1289,19 @@ def render_admin():
     st.markdown("### 📊 Master Dashboard de Calificaciones")
     st.caption("Concentrado de calificaciones por bloques con estatus de desempeño y filtros por Grupo y Parcial.")
 
-    if all_assignments.empty:
+    if raw_assignments.empty:
         st.warning("No hay tareas registradas en la carpeta `datos/`.")
         return
 
+    # Criterios activos (en tiempo real desde widgets o guardados)
+    active_criteria_config = current_criteria if current_criteria else saved_criteria_config
+
+    # Calificación dinámica en tiempo real según los criterios activos
+    all_assignments = apply_dynamic_grading(raw_assignments.copy(), active_criteria_config)
+
     # CRÍTICO: Asignar Parciales vectorialmente comparando .dt.date contra datetime.date
     assignments_tagged = assign_parciales_vectorized(all_assignments.copy(), active_parcial_config)
+
 
     # Grupos disponibles
     available_groups = sorted([g for g in assignments_tagged['Grupo'].dropna().unique() if g])
@@ -1074,9 +1367,9 @@ def render_admin():
     # Columnas de fecha existentes en el pivote
     existing_date_cols = [c for c in date_order if c in pivot_df.columns]
 
-    # Calcular Promedio General del estudiante a través de todos los bloques disponibles
-    numeric_only = pivot_df[existing_date_cols].fillna(0.0)
-    pivot_df['Promedio General'] = numeric_only.mean(axis=1).round(1)
+    # Calcular Promedio General del estudiante a través de todos los bloques disponibles (omitiendo bloques futuros)
+    numeric_only = pivot_df[existing_date_cols]
+    pivot_df['Promedio General'] = numeric_only.mean(axis=1, skipna=True).round(1).fillna(0.0)
 
     # NUEVO: Crear columna 'Estatus' que clasifica al estudiante según su promedio general
     pivot_df['Estatus'] = pivot_df['Promedio General'].apply(classify_student)
@@ -1122,14 +1415,9 @@ def render_admin():
 
     # Formateo de visualización de notas
     display_pivot = pivot_df.copy()
-    if fill_option == "N/A":
-        for col in existing_date_cols:
-            display_pivot[col] = display_pivot[col].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "N/A")
-        display_pivot['Promedio General'] = display_pivot['Promedio General'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "0.0")
-    else:
-        for col in existing_date_cols:
-            display_pivot[col] = display_pivot[col].fillna(0.0).map("{:.1f}".format)
-        display_pivot['Promedio General'] = display_pivot['Promedio General'].fillna(0.0).map("{:.1f}".format)
+    for col in existing_date_cols:
+        display_pivot[col] = display_pivot[col].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "Programada")
+    display_pivot['Promedio General'] = display_pivot['Promedio General'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "0.0")
 
     # Renderizar la tabla pivote con Estatus inmediatamente después del nombre
     st.dataframe(
@@ -1192,9 +1480,10 @@ def render_admin():
     student_tasks_data = assignments_tagged[assignments_tagged['Nombre del estudiante'] == selected_student].copy()
     student_group = student_tasks_data['Grupo'].iloc[0] if not student_tasks_data.empty else "N/A"
 
-    # Calcular promedio del estudiante en todos los bloques
+    # Calcular promedio del estudiante en todos los bloques (omitiendo futuros)
     st_blocks = compute_student_block_grades(student_tasks_data)
-    st_avg = st_blocks['block_grade'].mean() if not st_blocks.empty else 0.0
+    valid_st_blocks = st_blocks['block_grade'].dropna()
+    st_avg = valid_st_blocks.mean() if not valid_st_blocks.empty else 0.0
     st_estatus = classify_student(st_avg)
 
     with drill_col2:
@@ -1211,24 +1500,48 @@ def render_admin():
     # TABLA COMPLETA CON FORMATO CONDICIONAL (.style)
     # --------------------------------------------------------------------------
     st.markdown("#### 📋 Listado Completo de Actividades del Alumno")
-    st.caption("Semáforo de detección rápida: 🟥 **Rojo tenue:** Calificación de 0 puntos (sin entrega o penalizada) | 🟨 **Amarillo tenue:** Actividad realizada con más de 3 intentos.")
+    st.caption("Semáforo de detección rápida: 🟥 **Rojo tenue:** Calificación de 0 puntos (sin entrega o penalizada) | 🟨 **Amarillo tenue:** Actividad realizada con intentos que superan el límite permitido | ⚪ **Gris/Cursiva:** Actividad futura programada.")
 
     # Ordenar por fecha de entrega y nombre
     all_tasks_sorted = student_tasks_data.sort_values(by=['dt_entrega', 'Nombre de la tarea']).copy()
 
-    # Columnas requeridas: 'Nombre de la tarea', 'Parcial', 'Fecha de entrega', 'Número de intentos', 'Puntos Obtenidos'
-    drill_display = pd.DataFrame({
-        'Nombre de la tarea': all_tasks_sorted['Nombre de la tarea'],
-        'Parcial': all_tasks_sorted['Parcial'],
-        'Fecha de entrega': all_tasks_sorted['Fecha de entrega'],
-        'Número de intentos': all_tasks_sorted['Número de intentos'].fillna('0'),
-        'Puntos Obtenidos': all_tasks_sorted['earned_points']
-    })
+    # Columnas requeridas: 'Nombre de la tarea', 'Tipo', 'Parcial', 'Fecha de entrega', 'Número de intentos', 'Puntos Obtenidos'
+    drill_rows = []
+    for _, task_r in all_tasks_sorted.iterrows():
+        is_prog = (task_r.get('status') == 'Programada')
+        if is_prog:
+            pts_display = "Programada"
+            attempts_display = "—"
+        else:
+            pts_display = f"{task_r['earned_points']:.1f}"
+            raw_att = task_r.get('Número de intentos')
+            attempts_display = str(raw_att) if pd.notna(raw_att) and str(raw_att).strip() not in ['', 'En progreso'] else ("1" if task_r.get('is_completed') else "0")
+
+        drill_rows.append({
+            'Nombre de la tarea': task_r['Nombre de la tarea'],
+            'Tipo': task_r['Tipo de tarea'],
+            'Parcial': task_r['Parcial'],
+            'Fecha de entrega': task_r['Fecha de entrega'],
+            'Número de intentos': attempts_display,
+            'Puntos Obtenidos': pts_display,
+            '_status': task_r['status'],
+            '_earned_points': task_r['earned_points'],
+            '_evaluar_intentos': task_r['evaluar_intentos'],
+            '_max_intentos': task_r['max_intentos']
+        })
+
+    drill_display = pd.DataFrame(drill_rows)
 
     # Función de formato condicional con Pandas .style
     def highlight_drilldown_rows(row):
-        score = row.get('Puntos Obtenidos', 0)
+        status = row.get('_status', '')
+        if status == 'Programada':
+            return ['background-color: #f8fafc; color: #64748b; font-style: italic;'] * len(row)
+
+        score = row.get('_earned_points', 0)
         attempts = row.get('Número de intentos', 0)
+        eval_attempts = row.get('_evaluar_intentos', False)
+        max_attempts = row.get('_max_intentos', 3)
         try:
             s_val = float(score)
         except (ValueError, TypeError):
@@ -1238,23 +1551,26 @@ def render_admin():
         except (ValueError, TypeError):
             a_val = 0
 
-        # Rojo tenue para puntaje final de 0
+        # Rojo tenue para puntaje final de 0 en actividades activas
         if s_val == 0.0:
             return ['background-color: #fee2e2; color: #991b1b; font-weight: 500;'] * len(row)
-        # Amarillo tenue para intentos extras (> 3)
-        elif a_val > 3:
+        # Amarillo tenue para intentos extras (> max_intentos) SOLO si la actividad evalúa intentos
+        elif eval_attempts and a_val > max_attempts:
             return ['background-color: #fef9c3; color: #854d0e; font-weight: 500;'] * len(row)
         return [''] * len(row)
 
-    styled_drilldown = drill_display.style.apply(highlight_drilldown_rows, axis=1).format({'Puntos Obtenidos': '{:.1f}'})
+    cols_to_show = ['Nombre de la tarea', 'Tipo', 'Parcial', 'Fecha de entrega', 'Número de intentos', 'Puntos Obtenidos']
+    styled_drilldown = drill_display.style.apply(highlight_drilldown_rows, axis=1)
 
     st.dataframe(
         styled_drilldown,
+        column_order=cols_to_show,
         use_container_width=True,
         hide_index=True,
         height=min(550, 100 + len(drill_display) * 35),
         column_config={
             "Nombre de la tarea": st.column_config.TextColumn("Nombre de la tarea", width="large"),
+            "Tipo": st.column_config.TextColumn("Tipo", width="small"),
             "Parcial": st.column_config.TextColumn("Parcial", width="small"),
             "Fecha de entrega": st.column_config.TextColumn("Fecha de entrega", width="medium"),
             "Número de intentos": st.column_config.TextColumn("Número de intentos", width="small"),
@@ -1266,7 +1582,7 @@ def render_admin():
 
     # Visualización complementaria: Dashboard idéntico con desglose por bloques y filtros
     with st.expander("👁️ Ver Vista Detallada por Bloques (Vista del Estudiante)", expanded=True):
-        render_student_dashboard(selected_student, student_tasks_data, is_admin_drilldown=True)
+        render_student_dashboard(selected_student, student_tasks_data, criteria_config=active_criteria_config, is_admin_drilldown=True)
 
 
 # ==============================================================================
@@ -1276,7 +1592,17 @@ def render_student():
     student_name = st.session_state.get('student_name', '')
     username = st.session_state.get('username', '')
 
-    all_assignments = load_assignments()
+    raw_assignments = load_raw_assignments()
+    if not raw_assignments.empty and 'Tipo de tarea' in raw_assignments.columns:
+        unique_task_types = sorted([
+            t for t in raw_assignments['Tipo de tarea'].dropna().astype(str).str.strip().unique()
+            if t
+        ])
+    else:
+        unique_task_types = ['Video', 'Ejercicio', 'Artículo']
+
+    saved_criteria_config = load_criteria_config(unique_task_types)
+    all_assignments = apply_dynamic_grading(raw_assignments.copy(), saved_criteria_config)
     active_parcial_config = load_parciales_config()
 
     # CRÍTICO: Asignar Parciales vectorialmente comparando .dt.date contra datetime.date
@@ -1304,7 +1630,8 @@ def render_student():
         st.warning("No hay tareas registradas en el sistema. Contacta al docente.")
         return
 
-    render_student_dashboard(student_name, student_tasks, is_admin_drilldown=False)
+    render_student_dashboard(student_name, student_tasks, criteria_config=saved_criteria_config, is_admin_drilldown=False)
+
 
 
 # ==============================================================================
