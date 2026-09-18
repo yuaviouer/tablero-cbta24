@@ -13,7 +13,7 @@ import pandas as pd
 import streamlit as st
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 
 # ==============================================================================
@@ -624,7 +624,7 @@ def get_drive_service():
 
         credentials = service_account.Credentials.from_service_account_info(
             creds_dict,
-            scopes=['https://www.googleapis.com/auth/drive']
+            scopes=['https://www.googleapis.com/auth/drive.readonly']
         )
         return build('drive', 'v3', credentials=credentials)
     except Exception as e:
@@ -632,51 +632,36 @@ def get_drive_service():
         return None
 
 
-def upload_file_to_drive(service, file_bytes, filename, folder_id, mime_type='application/octet-stream'):
+def generate_credentials_template_bytes():
     """
-    Sube un archivo directamente a una subcarpeta de Google Drive en memoria.
-    Si ya existe un archivo con ese nombre en la carpeta, lo actualiza.
-    Si no existe, lo crea. Soporta Unidades Compartidas (supportsAllDrives=True).
+    Genera un archivo Excel (.xlsx) en memoria con la estructura exacta
+    requerida para las credenciales de los alumnos:
+    - Usuario: Nombre de usuario de Khan Academy
+    - Contraseña: Password asignada
+    - Nombre del estudiante: Nombre completo del estudiante (para vincular con los CSVs)
     """
-    if not service or not folder_id or str(folder_id).startswith('PEGA_AQUÍ'):
-        return False, "Google Drive no está conectado o no se especificó la carpeta del docente."
-
-    try:
-        existing = find_drive_item(service, filename, folder_id, is_folder=False)
-        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=True)
-
-        if existing:
-            service.files().update(
-                fileId=existing['id'],
-                media_body=media,
-                supportsAllDrives=True
-            ).execute()
-            return True, f"Archivo '{filename}' actualizado exitosamente en Google Drive."
-        else:
-            file_metadata = {
-                'name': filename,
-                'parents': [folder_id]
-            }
-            service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields='id',
-                supportsAllDrives=True
-            ).execute()
-            return True, f"Archivo '{filename}' guardado exitosamente en Google Drive."
-    except HttpError as e:
-        if "storageQuotaExceeded" in str(e) or e.resp.status == 403:
-            return False, (
-                "⚠️ **Restricción de cuota de Google Drive Personal:**\n\n"
-                "Google no permite que los *Service Accounts* creen archivos directamente en carpetas personales (`@gmail.com`) porque les asigna 0 MB de cuota de almacenamiento propia.\n\n"
-                "**Solución inmediata recomendada:**\n"
-                "1. Abre tu carpeta en [drive.google.com](https://drive.google.com) y arrastra directamente tu archivo CSV o Excel ahí.\n"
-                "2. Regresa a esta pantalla y presiona el botón **'🔄 Sincronizar / Refrescar Datos de Drive'**.\n\n"
-                "*(Nota: Si usas una **Unidad Compartida (Shared Drive)** de Google Workspace institucional, la subida directa desde aquí sí funcionará sin problemas).*"
-            )
-        return False, f"Error al subir '{filename}' a Google Drive: {e}"
-    except Exception as e:
-        return False, f"Error al subir '{filename}' a Google Drive: {e}"
+    sample_data = [
+        {
+            "Usuario": "alboresclementepaulo",
+            "Contraseña": "Alumno2026*",
+            "Nombre del estudiante": "ALBORES CLEMENTE PAULO CESAR"
+        },
+        {
+            "Usuario": "gonzalezmartinezmaria",
+            "Contraseña": "Alumno2026*",
+            "Nombre del estudiante": "GONZÁLEZ MARTÍNEZ MARÍA FERNANDA"
+        },
+        {
+            "Usuario": "hernandezlopezjuan",
+            "Contraseña": "Alumno2026*",
+            "Nombre del estudiante": "HERNÁNDEZ LÓPEZ JUAN PABLO"
+        }
+    ]
+    df_template = pd.DataFrame(sample_data)
+    buff = io.BytesIO()
+    with pd.ExcelWriter(buff, engine='openpyxl') as writer:
+        df_template.to_excel(writer, index=False, sheet_name="Credenciales")
+    return buff.getvalue()
 
 
 def find_drive_item(service, name, parent_id, is_folder=None):
@@ -1634,93 +1619,53 @@ def render_admin():
     active_parcial_config = st.session_state.get('active_parcial_config', saved_parcial_config)
 
     with col_cfg2:
-        with st.expander("☁️ Sincronización y Carga en Google Drive", expanded=False):
-            st.markdown(f"**Carpeta asignada en Google Drive:** `{carpeta_nombre}`")
+        with st.expander("☁️ Sincronización con Google Drive", expanded=True):
+            st.markdown(f"**Carpeta asignada en Google Drive:** `📁 {carpeta_nombre}`")
             if teacher_folder_id:
-                st.success("🟢 Conectado a Google Drive.")
-                st.caption("Los archivos se leen y almacenan directamente en la nube sin guardarse en el servidor.")
+                st.success("🟢 Conexión activa con Google Drive (Lectura en memoria sin almacenamiento en disco).")
             else:
                 st.info("ℹ️ Sesión en modo local/administrador general.")
 
-            if st.button("🔄 Sincronizar / Refrescar Datos de Drive", use_container_width=True, key="admin_refresh_drive_btn"):
+            if st.button("🔄 Sincronizar / Refrescar Datos de Google Drive", use_container_width=True, type="primary", key="admin_refresh_drive_btn"):
                 st.cache_data.clear()
                 st.success("✅ Datos sincronizados directamente desde Google Drive.")
                 st.rerun()
 
-            st.info(
-                "💡 **Recomendación para cuentas personales (`@gmail.com`):**\n\n"
-                "Google no asigna cuota de almacenamiento a los *Service Accounts* en cuentas personales. "
-                "La manera más directa y 100% libre de errores es colocar los CSVs de Khan Academy directamente en tu carpeta de "
-                "[Google Drive (drive.google.com)](https://drive.google.com) y pulsar **'🔄 Sincronizar / Refrescar Datos de Drive'** arriba.\n\n"
-                "*(La subida directa desde el formulario inferior está habilitada para Unidades Compartidas / Shared Drives de Google Workspace)*."
-            )
+            st.markdown("---")
+            st.markdown("##### 📋 Instrucciones para Actualizar Datos en Google Drive")
+            st.markdown(f"""
+            1. **Tareas de Khan Academy:** Descarga los reportes CSV desde Khan Academy y colócalos dentro de la carpeta **`{carpeta_nombre}`** en tu [Google Drive (drive.google.com)](https://drive.google.com).
+            2. **Credenciales de Alumnos:** Guarda tu archivo **`credenciales.xlsx`** dentro de la misma carpeta.
+            3. **Sincronización:** Una vez copiados tus archivos en Google Drive, presiona el botón **'🔄 Sincronizar / Refrescar Datos de Google Drive'** de arriba para recalcular el concentrado y el drill-down al instante.
+            """)
 
             st.markdown("---")
-            st.markdown("##### 📤 Subir Archivos a Google Drive")
-            st.caption("Guarda nuevos archivos directamente en tu carpeta de Google Drive:")
-            tab_up_csv, tab_up_cred = st.tabs(["📊 Subir Tareas CSV", "🔑 Subir Credenciales"])
+            st.markdown("##### 📥 Plantilla de Credenciales (`credenciales.xlsx`)")
+            st.caption("Descarga la plantilla de Excel oficial con el formato exacto requerido por el sistema:")
 
-            with tab_up_csv:
-                up_csvs = st.file_uploader(
-                    "Selecciona CSVs de Khan Academy:",
-                    type=["csv"],
-                    accept_multiple_files=True,
-                    key="drive_csv_uploader"
-                )
-                if up_csvs:
-                    if st.button("☁️ Guardar Tareas en Google Drive", use_container_width=True, key="save_drive_csv_btn"):
-                        service = get_drive_service()
-                        success_count = 0
-                        for f in up_csvs:
-                            if service and teacher_folder_id:
-                                ok, msg = upload_file_to_drive(service, f.getvalue(), f.name, teacher_folder_id, mime_type='text/csv')
-                                if ok:
-                                    success_count += 1
-                                else:
-                                    st.error(msg)
-                            else:
-                                os.makedirs(DATA_DIR, exist_ok=True)
-                                with open(os.path.join(DATA_DIR, f.name), "wb") as out_f:
-                                    out_f.write(f.getbuffer())
-                                success_count += 1
-                        if success_count > 0:
-                            st.cache_data.clear()
-                            st.success(f"✅ Se guardaron {success_count} archivo(s) en Google Drive.")
-                            st.rerun()
+            template_bytes = generate_credentials_template_bytes()
+            st.download_button(
+                label="📥 Descargar Plantilla credenciales.xlsx",
+                data=template_bytes,
+                file_name="credenciales.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="dl_cred_template_btn"
+            )
 
-            with tab_up_cred:
-                up_cred = st.file_uploader(
-                    "Archivo de credenciales (.xlsx o .csv):",
-                    type=["xlsx", "csv"],
-                    accept_multiple_files=False,
-                    key="drive_cred_uploader"
-                )
-                if up_cred:
-                    if st.button("☁️ Guardar Credenciales en Google Drive", use_container_width=True, key="save_drive_cred_btn"):
-                        service = get_drive_service()
-                        file_name = "credenciales.xlsx" if up_cred.name.endswith(".xlsx") else up_cred.name
-                        file_bytes = up_cred.getvalue()
-                        if service and teacher_folder_id:
-                            mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' if file_name.endswith('.xlsx') else 'text/csv'
-                            ok, msg = upload_file_to_drive(service, file_bytes, file_name, teacher_folder_id, mime_type=mime)
-                            if ok:
-                                st.cache_data.clear()
-                                st.success("✅ Credenciales guardadas en Google Drive exitosamente.")
-                                st.rerun()
-                            else:
-                                st.error(msg)
-                        else:
-                            os.makedirs(DATA_DIR, exist_ok=True)
-                            dest = os.path.join(DATA_DIR, "credenciales.xlsx")
-                            if up_cred.name.endswith(".xlsx"):
-                                with open(dest, "wb") as out_f:
-                                    out_f.write(up_cred.getbuffer())
-                            else:
-                                tdf = pd.read_csv(up_cred, encoding='utf-8-sig')
-                                tdf.to_excel(dest, index=False)
-                            st.cache_data.clear()
-                            st.success("✅ Credenciales guardadas localmente.")
-                            st.rerun()
+            with st.popover("👁️ Ver columnas y formato requerido para credenciales"):
+                st.markdown("""
+                El archivo debe llamarse **`credenciales.xlsx`** y contener exactamente las siguientes 3 columnas en la primera fila:
+
+                | Usuario | Contraseña | Nombre del estudiante |
+                | :--- | :--- | :--- |
+                | `alboresclementepaulo` | `Alumno2026*` | `ALBORES CLEMENTE PAULO CESAR` |
+                | `gonzalezmartinezmaria` | `Alumno2026*` | `GONZÁLEZ MARTÍNEZ MARÍA FERNANDA` |
+                | `hernandezlopezjuan` | `Alumno2026*` | `HERNÁNDEZ LÓPEZ JUAN PABLO` |
+
+                > 💡 **Nota Importante:** La columna **`Nombre del estudiante`** debe coincidir exactamente con el nombre con el que el alumno aparece registrado en los archivos CSV de Khan Academy para vincular su información correctamente.
+                """)
+
 
     st.divider()
 
