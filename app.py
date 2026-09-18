@@ -183,31 +183,69 @@ def save_parciales_config(config_dict):
         json.dump(serializable, f, indent=4, ensure_ascii=False)
 
 
+def parse_parciales_dates(parciales_cfg):
+    """
+    Convierte cadenas 'YYYY-MM-DD' o date objects de los parciales en datetime.date válidos.
+    Aplica fallback a las fechas por defecto del ciclo escolar actual si falta o es inválido.
+    """
+    defaults = get_default_parciales_config()
+    result = {}
+    for p in ['Parcial 1', 'Parcial 2', 'Parcial 3']:
+        cfg = parciales_cfg.get(p, {}) if isinstance(parciales_cfg, dict) else {}
+        st_raw = cfg.get('start', defaults[p]['start'])
+        en_raw = cfg.get('end', defaults[p]['end'])
+
+        try:
+            st_d = date.fromisoformat(str(st_raw).strip()) if not isinstance(st_raw, (date, datetime)) else (st_raw.date() if isinstance(st_raw, datetime) else st_raw)
+        except Exception:
+            st_d = date.fromisoformat(defaults[p]['start'])
+
+        try:
+            en_d = date.fromisoformat(str(en_raw).strip()) if not isinstance(en_raw, (date, datetime)) else (en_raw.date() if isinstance(en_raw, datetime) else en_raw)
+        except Exception:
+            en_d = date.fromisoformat(defaults[p]['end'])
+
+        result[p] = {'start': st_d, 'end': en_d}
+    return result
+
+
 def assign_parciales_vectorized(df, parcial_config):
     """
     CRÍTICO: Asigna la etiqueta 'Parcial' a cada actividad extrayendo .dt.date
     de la columna 'dt_entrega' (Timestamp de Pandas) y comparándola directamente
-    contra los objetos datetime.date obtenidos de st.date_input con operadores >= y <=.
+    contra los objetos datetime.date obtenidos de criterios.json con operadores >= y <=.
+    Soporta recibir el diccionario completo de criterios.json o directamente la sección 'parciales'.
+    Si las fechas no están presentes o son inválidas, usa las fechas por defecto del semestre actual.
     """
-    if df.empty or 'dt_entrega' not in df.columns:
-        df['Parcial'] = 'Sin asignar'
+    if df.empty:
         return df
+
+    if 'dt_entrega' not in df.columns or not pd.api.types.is_datetime64_any_dtype(df['dt_entrega']):
+        if 'Fecha de entrega' in df.columns:
+            df['dt_entrega'] = pd.to_datetime(df['Fecha de entrega'], errors='coerce')
+        elif 'dt_entrega' not in df.columns:
+            df['Parcial'] = 'Sin asignar'
+            return df
+
+    if isinstance(parcial_config, dict) and 'parciales' in parcial_config:
+        parciales_dict = parcial_config['parciales']
+    elif isinstance(parcial_config, dict):
+        parciales_dict = parcial_config
+    else:
+        parciales_dict = {}
+
+    parsed_dates = parse_parciales_dates(parciales_dict)
 
     # Extracción explícita de datetime.date desde la columna Timestamp de Pandas
     task_dates = df['dt_entrega'].dt.date
     parcial_series = pd.Series('Sin asignar', index=df.index, dtype='object')
 
     for p_name in ['Parcial 1', 'Parcial 2', 'Parcial 3']:
-        cfg = parcial_config.get(p_name, {})
+        cfg = parsed_dates.get(p_name, {})
         start_d = cfg.get('start')
         end_d = cfg.get('end')
 
         if start_d is not None and end_d is not None:
-            if isinstance(start_d, str):
-                start_d = date.fromisoformat(start_d)
-            if isinstance(end_d, str):
-                end_d = date.fromisoformat(end_d)
-
             # Comparación directa de fechas (datetime.date vs datetime.date)
             mask = (task_dates >= start_d) & (task_dates <= end_d)
             parcial_series[mask] = p_name
@@ -349,7 +387,7 @@ def get_default_criteria_config(unique_task_types=None):
 
 
 def get_default_teacher_criterios(unique_task_types=None, scale=10):
-    """Retorna la configuración por defecto (Escala 10, Peso 100%, Umbrales estándar)."""
+    """Retorna la configuración por defecto (Escala 10, Peso 100%, Umbrales estándar, Fechas de Parciales del ciclo)."""
     scale = 100 if scale == 100 else 10
     if scale == 100:
         thresh = {
@@ -369,6 +407,7 @@ def get_default_teacher_criterios(unique_task_types=None, scale=10):
         'escala_maxima': scale,
         'peso_khan': 100,
         'thresholds': thresh,
+        'parciales': get_default_parciales_config(),
         'task_criteria': get_default_criteria_config(unique_task_types)
     }
 
@@ -378,7 +417,7 @@ def load_teacher_criterios(folder_id, unique_task_types=None):
     """
     Carga la configuración persistente e independiente del docente ('criterios.json')
     desde su subcarpeta en Google Drive.
-    Si no existe, retorna los valores predeterminados (Escala 10, Peso 100%, Exc >= 9.5, etc.).
+    Si no existe o es incompleto, retorna los valores predeterminados (Escala 10, Peso 100%, Parciales por defecto, etc.).
     """
     defaults = get_default_teacher_criterios(unique_task_types, scale=10)
     service = get_drive_service()
@@ -394,6 +433,7 @@ def load_teacher_criterios(folder_id, unique_task_types=None):
                     scale = int(saved.get('escala_maxima', 10))
                     peso = float(saved.get('peso_khan', 100))
                     thresholds = saved.get('thresholds', defaults['thresholds'])
+                    parciales = saved.get('parciales', defaults['parciales'])
                     task_crit = saved.get('task_criteria', saved.get('criterios', {}))
 
                     merged_tasks = get_default_criteria_config(unique_task_types)
@@ -408,6 +448,7 @@ def load_teacher_criterios(folder_id, unique_task_types=None):
                         'escala_maxima': scale,
                         'peso_khan': peso,
                         'thresholds': thresholds,
+                        'parciales': parciales,
                         'task_criteria': merged_tasks
                     }
         except Exception as e:
@@ -422,6 +463,7 @@ def load_teacher_criterios(folder_id, unique_task_types=None):
             scale = int(saved.get('escala_maxima', 10))
             peso = float(saved.get('peso_khan', 100))
             thresholds = saved.get('thresholds', defaults['thresholds'])
+            parciales = saved.get('parciales', defaults['parciales'])
             task_crit = saved.get('task_criteria', saved.get('criterios', {}))
             merged_tasks = get_default_criteria_config(unique_task_types)
             if isinstance(task_crit, dict):
@@ -434,6 +476,7 @@ def load_teacher_criterios(folder_id, unique_task_types=None):
                 'escala_maxima': scale,
                 'peso_khan': peso,
                 'thresholds': thresholds,
+                'parciales': parciales,
                 'task_criteria': merged_tasks
             }
         except Exception:
@@ -448,7 +491,20 @@ def save_teacher_criterios(folder_id, criterios_dict):
     DIRECTAMENTE en su carpeta específica de Google Drive usando MediaIoBaseUpload.
     También mantiene una copia local de respaldo y limpia el caché.
     """
-    json_str = json.dumps(criterios_dict, indent=4, ensure_ascii=False)
+    serializable = dict(criterios_dict)
+    if 'parciales' in serializable and isinstance(serializable['parciales'], dict):
+        p_clean = {}
+        for p_name, p_dates in serializable['parciales'].items():
+            if isinstance(p_dates, dict):
+                p_clean[p_name] = {
+                    'start': p_dates['start'].isoformat() if hasattr(p_dates.get('start'), 'isoformat') else str(p_dates.get('start', '')),
+                    'end': p_dates['end'].isoformat() if hasattr(p_dates.get('end'), 'isoformat') else str(p_dates.get('end', ''))
+                }
+            else:
+                p_clean[p_name] = p_dates
+        serializable['parciales'] = p_clean
+
+    json_str = json.dumps(serializable, indent=4, ensure_ascii=False, default=str)
     json_bytes = json_str.encode('utf-8')
 
     # Guardar en local como respaldo
@@ -1756,7 +1812,6 @@ def render_admin():
     # Cargar datos base crudos aislados de la carpeta del docente
     raw_assignments = load_teacher_raw_assignments(teacher_folder_id)
     all_credentials = load_teacher_credentials(teacher_folder_id)
-    saved_parcial_config = load_parciales_config()
 
     # Detectar dinámicamente los tipos de tarea presentes en los datos
     if not raw_assignments.empty and 'Tipo de tarea' in raw_assignments.columns:
@@ -1773,14 +1828,15 @@ def render_admin():
     active_peso = float(criterios_data.get('peso_khan', 100))
     active_thresholds = criterios_data.get('thresholds', {})
     saved_task_criteria = criterios_data.get('task_criteria', {})
+    saved_parcial_dates = parse_parciales_dates(criterios_data.get('parciales', {}))
 
     # --------------------------------------------------------------------------
     # SECCIÓN 1: CONFIGURACIONES (CRITERIOS, PARCIALES Y CARGA DE ARCHIVOS)
     # --------------------------------------------------------------------------
     with st.expander("⚙️ Configuración de Evaluación y Criterios (criterios.json)", expanded=False):
-        st.caption("Configura de forma persistente e independiente para tu materia la escala máxima, el peso de Khan Academy, los umbrales de rendimiento y los criterios por actividad en tu Google Drive.")
+        st.caption("Configura de forma persistente e independiente para tu materia la escala máxima, el peso de Khan Academy, los periodos de parciales, los umbrales de rendimiento y los criterios por actividad en tu Google Drive.")
 
-        tab_gral, tab_tasks = st.tabs(["🎯 Escala, Peso y Clasificación", "📌 Criterios por Tipo de Tarea"])
+        tab_gral, tab_parciales, tab_tasks = st.tabs(["🎯 Escala, Peso y Clasificación", "📅 Fechas de Parciales", "📌 Criterios por Tipo de Tarea"])
 
         with tab_gral:
             st.markdown("##### 📏 Escala de Calificación y Ponderación")
@@ -1863,6 +1919,46 @@ def render_admin():
                     key=f"th_riesgo_{sel_scale}"
                 )
 
+        with tab_parciales:
+            st.markdown("##### 📅 Periodos de Calificación por Parcial")
+            st.caption("Define el rango de fechas de entrega de Khan Academy que corresponden a cada Parcial:")
+
+            p_col1, p_col2 = st.columns(2)
+            with p_col1:
+                st.markdown("###### Fechas de Inicio")
+                p1_start = st.date_input(
+                    "Inicio Parcial 1",
+                    value=saved_parcial_dates['Parcial 1']['start'],
+                    key="cfg_p1_start"
+                )
+                p2_start = st.date_input(
+                    "Inicio Parcial 2",
+                    value=saved_parcial_dates['Parcial 2']['start'],
+                    key="cfg_p2_start"
+                )
+                p3_start = st.date_input(
+                    "Inicio Parcial 3",
+                    value=saved_parcial_dates['Parcial 3']['start'],
+                    key="cfg_p3_start"
+                )
+            with p_col2:
+                st.markdown("###### Fechas de Fin")
+                p1_end = st.date_input(
+                    "Fin Parcial 1",
+                    value=saved_parcial_dates['Parcial 1']['end'],
+                    key="cfg_p1_end"
+                )
+                p2_end = st.date_input(
+                    "Fin Parcial 2",
+                    value=saved_parcial_dates['Parcial 2']['end'],
+                    key="cfg_p2_end"
+                )
+                p3_end = st.date_input(
+                    "Fin Parcial 3",
+                    value=saved_parcial_dates['Parcial 3']['end'],
+                    key="cfg_p3_end"
+                )
+
         with tab_tasks:
             st.markdown("##### 📌 Criterios de Calificación por Tipo de Tarea")
             current_task_criteria = {}
@@ -1930,163 +2026,226 @@ def render_admin():
         b_col1, b_col2, _ = st.columns([2.5, 2.2, 2.5])
         with b_col1:
             if st.button("💾 Guardar Configuración en Google Drive", type="primary", use_container_width=True, key="save_teacher_crit_btn"):
+                # 1. Crear explícitamente el diccionario de configuración con todos los ajustes
                 updated_criterios = {
-                    'escala_maxima': sel_scale,
-                    'peso_khan': sel_peso,
+                    'escala_maxima': int(sel_scale),
+                    'peso_khan': float(sel_peso),
                     'thresholds': {
-                        'excelente': th_input_exc,
-                        'bien': th_input_bien,
-                        'regular': th_input_reg,
-                        'en_riesgo': th_input_riesgo
+                        'excelente': float(th_input_exc),
+                        'bien': float(th_input_bien),
+                        'regular': float(th_input_reg),
+                        'en_riesgo': float(th_input_riesgo)
+                    },
+                    'parciales': {
+                        'Parcial 1': {
+                            'start': p1_start.isoformat() if hasattr(p1_start, 'isoformat') else str(p1_start),
+                            'end': p1_end.isoformat() if hasattr(p1_end, 'isoformat') else str(p1_end)
+                        },
+                        'Parcial 2': {
+                            'start': p2_start.isoformat() if hasattr(p2_start, 'isoformat') else str(p2_start),
+                            'end': p2_end.isoformat() if hasattr(p2_end, 'isoformat') else str(p2_end)
+                        },
+                        'Parcial 3': {
+                            'start': p3_start.isoformat() if hasattr(p3_start, 'isoformat') else str(p3_start),
+                            'end': p3_end.isoformat() if hasattr(p3_end, 'isoformat') else str(p3_end)
+                        }
                     },
                     'task_criteria': current_task_criteria
                 }
-                save_teacher_criterios(teacher_folder_id, updated_criterios)
+
+                # 2. Convertir explícitamente a cadena JSON formateada
+                json_data = json.dumps(updated_criterios, indent=4, ensure_ascii=False)
+                json_bytes = json_data.encode('utf-8')
+
+                # 3. Guardar copia local de respaldo
+                try:
+                    os.makedirs(DATA_DIR, exist_ok=True)
+                    local_path = os.path.join(DATA_DIR, "criterios.json")
+                    with open(local_path, "w", encoding="utf-8") as f:
+                        f.write(json_data)
+                except Exception:
+                    pass
+
+                # 4. Subir directamente a la carpeta de Google Drive del docente usando MediaIoBaseUpload
+                service = get_drive_service()
+                drive_uploaded = False
+                if service and teacher_folder_id and not str(teacher_folder_id).startswith('PEGA_AQUÍ'):
+                    try:
+                        existing = find_drive_item(service, "criterios.json", teacher_folder_id, is_folder=False)
+                        media = MediaIoBaseUpload(io.BytesIO(json_bytes), mimetype='application/json', resumable=True)
+                        if existing:
+                            service.files().update(
+                                fileId=existing['id'],
+                                media_body=media,
+                                supportsAllDrives=True
+                            ).execute()
+                        else:
+                            file_metadata = {
+                                'name': 'criterios.json',
+                                'parents': [teacher_folder_id]
+                            }
+                            service.files().create(
+                                body=file_metadata,
+                                media_body=media,
+                                supportsAllDrives=True
+                            ).execute()
+                        drive_uploaded = True
+                    except HttpError as e:
+                        if 'storage quota' in str(e).lower() or (getattr(e, 'resp', None) and e.resp.status == 403):
+                            st.warning("⚠️ Nota: Tu cuenta de Google Drive no cuenta con cuota de escritura para Service Accounts institucionales. La configuración se ha guardado localmente en el servidor.")
+                        elif getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
+                            st.error("⚠️ El servidor de Google Drive está experimentando alto tráfico. Por favor, intenta de nuevo en unos momentos.")
+                        else:
+                            st.error(f"Error al subir criterios.json a Google Drive: {e}")
+                    except Exception as e:
+                        st.error(f"Error inesperado al subir criterios.json a Google Drive: {e}")
+
                 st.cache_data.clear()
-                st.success("✅ Configuración guardada exitosamente en Google Drive (criterios.json).")
+                if drive_uploaded:
+                    st.success("✅ Configuración y fechas de Parciales guardadas exitosamente en Google Drive (criterios.json).")
+                else:
+                    st.success("✅ Configuración guardada localmente (criterios.json).")
                 st.rerun()
 
         with b_col2:
             if st.button("🔄 Restablecer Predeterminados", use_container_width=True, key="reset_teacher_crit_btn"):
                 def_crit = get_default_teacher_criterios(unique_task_types, scale=sel_scale)
-                save_teacher_criterios(teacher_folder_id, def_crit)
+                json_data = json.dumps(def_crit, indent=4, ensure_ascii=False, default=str)
+                json_bytes = json_data.encode('utf-8')
+                try:
+                    os.makedirs(DATA_DIR, exist_ok=True)
+                    local_path = os.path.join(DATA_DIR, "criterios.json")
+                    with open(local_path, "w", encoding="utf-8") as f:
+                        f.write(json_data)
+                except Exception:
+                    pass
+
+                service = get_drive_service()
+                if service and teacher_folder_id and not str(teacher_folder_id).startswith('PEGA_AQUÍ'):
+                    try:
+                        existing = find_drive_item(service, "criterios.json", teacher_folder_id, is_folder=False)
+                        media = MediaIoBaseUpload(io.BytesIO(json_bytes), mimetype='application/json', resumable=True)
+                        if existing:
+                            service.files().update(
+                                fileId=existing['id'],
+                                media_body=media,
+                                supportsAllDrives=True
+                            ).execute()
+                        else:
+                            file_metadata = {
+                                'name': 'criterios.json',
+                                'parents': [teacher_folder_id]
+                            }
+                            service.files().create(
+                                body=file_metadata,
+                                media_body=media,
+                                supportsAllDrives=True
+                            ).execute()
+                    except Exception:
+                        pass
                 st.cache_data.clear()
                 st.info("Configuración restablecida a los valores predeterminados.")
                 st.rerun()
 
-    col_cfg1, col_cfg2 = st.columns(2)
+    with st.expander("☁️ Sincronización con Google Drive", expanded=True):
+        st.markdown(f"**Carpeta asignada en Google Drive:** `📁 {carpeta_nombre}`")
+        if teacher_email:
+            st.markdown(f"**Acceso exclusivo asignado a:** `📧 {teacher_email}`")
 
-    with col_cfg1:
-        with st.expander("📅 Configuración de Parciales (Periodos)", expanded=False):
-            st.write("Define las fechas límite de inicio y fin para cada uno de los 3 Parciales del semestre:")
-            with st.form("form_parciales"):
-                cp1_col1, cp1_col2 = st.columns(2)
-                with cp1_col1:
-                    p1_s = st.date_input("Inicio Parcial 1", value=saved_parcial_config['Parcial 1']['start'])
-                    p2_s = st.date_input("Inicio Parcial 2", value=saved_parcial_config['Parcial 2']['start'])
-                    p3_s = st.date_input("Inicio Parcial 3", value=saved_parcial_config['Parcial 3']['start'])
-                with cp1_col2:
-                    p1_e = st.date_input("Fin Parcial 1", value=saved_parcial_config['Parcial 1']['end'])
-                    p2_e = st.date_input("Fin Parcial 2", value=saved_parcial_config['Parcial 2']['end'])
-                    p3_e = st.date_input("Fin Parcial 3", value=saved_parcial_config['Parcial 3']['end'])
+        if teacher_folder_id:
+            drive_folder_url = f"https://drive.google.com/drive/folders/{teacher_folder_id}"
+            st.success("🟢 Conexión activa con Google Drive (Lectura en memoria sin almacenamiento en disco).")
+            st.link_button(f"📂 Abrir Carpeta '{carpeta_nombre}' en Google Drive", drive_folder_url, use_container_width=True)
+        else:
+            drive_folder_url = "https://drive.google.com"
+            st.info("ℹ️ Sesión en modo local/administrador general.")
 
-                save_p_btn = st.form_submit_button("💾 Guardar Fechas de Parciales", type="primary")
-                if save_p_btn:
-                    new_cfg = {
-                        'Parcial 1': {'start': p1_s, 'end': p1_e},
-                        'Parcial 2': {'start': p2_s, 'end': p2_e},
-                        'Parcial 3': {'start': p3_s, 'end': p3_e}
-                    }
-                    save_parciales_config(new_cfg)
-                    st.session_state['active_parcial_config'] = new_cfg
+        if st.button("🔄 Sincronizar / Refrescar Datos de Google Drive", use_container_width=True, type="primary", key="admin_refresh_drive_btn"):
+            st.cache_data.clear()
+            st.success("✅ Datos sincronizados directamente desde Google Drive.")
+            st.rerun()
+
+        st.markdown("---")
+        st.markdown("##### 📋 Instrucciones para Actualizar Datos en Google Drive")
+        st.markdown(f"""
+        1. **Tareas de Khan Academy:** Descarga los reportes CSV desde Khan Academy y colócalos directamente dentro de tu carpeta **[{carpeta_nombre}]({drive_folder_url})** en Google Drive.
+        2. **Credenciales de Alumnos:** Guarda tu archivo **`credenciales.xlsx`** dentro de la misma carpeta.
+        3. **Sincronización:** Una vez copiados tus archivos en Google Drive, presiona el botón **'🔄 Sincronizar / Refrescar Datos de Google Drive'** de arriba para recalcular el concentrado y el drill-down al instante.
+        """)
+
+        if teacher_email:
+            st.info(f"🔒 **Seguridad y Acceso Restringido:** El enlace anterior conduce de forma directa a tu carpeta. Solo la cuenta de Google registrada (**{teacher_email}**) tiene permisos para acceder y editar los documentos de esta carpeta. Cualquier otra persona que intente abrir este enlace tendrá el acceso denegado por Google Drive.")
+
+        st.markdown("---")
+        st.markdown("##### 📤 Subir Archivo al Sistema (CSV de Khan Academy o credenciales.xlsx)")
+        uploaded_file = st.file_uploader(
+            "Selecciona un reporte CSV de Khan Academy o un archivo credenciales.xlsx:",
+            type=["csv", "xlsx"],
+            key="admin_upload_drive_file"
+        )
+        if uploaded_file is not None:
+            if st.button(f"⬆️ Subir '{uploaded_file.name}'", type="primary", use_container_width=True, key="admin_btn_process_upload"):
+                upload_success = False
+                service = get_drive_service()
+                if teacher_folder_id and service:
+                    try:
+                        media = MediaIoBaseUpload(io.BytesIO(uploaded_file.getvalue()), mimetype=uploaded_file.type or 'application/octet-stream', resumable=True)
+                        file_metadata = {
+                            'name': uploaded_file.name,
+                            'parents': [teacher_folder_id]
+                        }
+                        service.files().create(body=file_metadata, media_body=media, supportsAllDrives=True).execute()
+                        upload_success = True
+                    except HttpError as e:
+                        if 'storage quota' in str(e).lower() or (getattr(e, 'resp', None) and e.resp.status == 403):
+                            st.warning(f"⚠️ Tu cuenta de Google Drive no permite subir directamente vía API por cuota de Service Account institucional. Por favor, coloca el archivo en tu carpeta de Drive usando el botón **'📂 Abrir Carpeta en Google Drive'** y luego presiona **'🔄 Sincronizar'**.")
+                        elif getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
+                            st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
+                        else:
+                            st.error(f"Error al subir a Google Drive: {e}")
+                    except Exception as e:
+                        st.error(f"Error de conexión al subir a Google Drive: {e}")
+                else:
+                    try:
+                        os.makedirs(DATA_DIR, exist_ok=True)
+                        dest_path = os.path.join(DATA_DIR, uploaded_file.name)
+                        with open(dest_path, "wb") as f:
+                            f.write(uploaded_file.getvalue())
+                        upload_success = True
+                    except Exception as e:
+                        st.error(f"Error al guardar archivo localmente: {e}")
+
+                if upload_success:
                     st.cache_data.clear()
-                    st.success("✅ Fechas de Parciales guardadas exitosamente.")
+                    st.success(f"✅ Archivo '{uploaded_file.name}' subido exitosamente a Google Drive.")
                     st.rerun()
 
-    # Configuración de parciales activa (session_state o guardada)
-    active_parcial_config = st.session_state.get('active_parcial_config', saved_parcial_config)
+        st.markdown("---")
+        st.markdown("##### 📥 Plantilla de Credenciales (`credenciales.xlsx`)")
+        st.caption("Descarga la plantilla de Excel oficial con el formato exacto requerido por el sistema:")
 
-    with col_cfg2:
-        with st.expander("☁️ Sincronización con Google Drive", expanded=True):
-            st.markdown(f"**Carpeta asignada en Google Drive:** `📁 {carpeta_nombre}`")
-            if teacher_email:
-                st.markdown(f"**Acceso exclusivo asignado a:** `📧 {teacher_email}`")
+        template_bytes = generate_credentials_template_bytes()
+        st.download_button(
+            label="📥 Descargar Plantilla credenciales.xlsx",
+            data=template_bytes,
+            file_name="credenciales.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="dl_cred_template_btn"
+        )
 
-            if teacher_folder_id:
-                drive_folder_url = f"https://drive.google.com/drive/folders/{teacher_folder_id}"
-                st.success("🟢 Conexión activa con Google Drive (Lectura en memoria sin almacenamiento en disco).")
-                st.link_button(f"📂 Abrir Carpeta '{carpeta_nombre}' en Google Drive", drive_folder_url, use_container_width=True)
-            else:
-                drive_folder_url = "https://drive.google.com"
-                st.info("ℹ️ Sesión en modo local/administrador general.")
+        with st.popover("👁️ Ver columnas y formato requerido para credenciales"):
+            st.markdown("""
+            El archivo debe llamarse **`credenciales.xlsx`** y contener exactamente las siguientes 3 columnas en la primera fila:
 
-            if st.button("🔄 Sincronizar / Refrescar Datos de Google Drive", use_container_width=True, type="primary", key="admin_refresh_drive_btn"):
-                st.cache_data.clear()
-                st.success("✅ Datos sincronizados directamente desde Google Drive.")
-                st.rerun()
+            | Usuario | Contraseña | Nombre del estudiante |
+            | :--- | :--- | :--- |
+            | `alboresclementepaulo` | `Alumno2026*` | `ALBORES CLEMENTE PAULO CESAR` |
+            | `gonzalezmartinezmaria` | `Alumno2026*` | `GONZÁLEZ MARTÍNEZ MARÍA FERNANDA` |
+            | `hernandezlopezjuan` | `Alumno2026*` | `HERNÁNDEZ LÓPEZ JUAN PABLO` |
 
-            st.markdown("---")
-            st.markdown("##### 📋 Instrucciones para Actualizar Datos en Google Drive")
-            st.markdown(f"""
-            1. **Tareas de Khan Academy:** Descarga los reportes CSV desde Khan Academy y colócalos directamente dentro de tu carpeta **[{carpeta_nombre}]({drive_folder_url})** en Google Drive.
-            2. **Credenciales de Alumnos:** Guarda tu archivo **`credenciales.xlsx`** dentro de la misma carpeta.
-            3. **Sincronización:** Una vez copiados tus archivos en Google Drive, presiona el botón **'🔄 Sincronizar / Refrescar Datos de Google Drive'** de arriba para recalcular el concentrado y el drill-down al instante.
+            > 💡 **Nota Importante:** La columna **`Nombre del estudiante`** debe coincidir exactamente con el nombre con el que el alumno aparece registrado en los archivos CSV de Khan Academy para vincular su información correctamente.
             """)
-
-            if teacher_email:
-                st.info(f"🔒 **Seguridad y Acceso Restringido:** El enlace anterior conduce de forma directa a tu carpeta. Solo la cuenta de Google registrada (**{teacher_email}**) tiene permisos para acceder y editar los documentos de esta carpeta. Cualquier otra persona que intente abrir este enlace tendrá el acceso denegado por Google Drive.")
-
-            st.markdown("---")
-            st.markdown("##### 📤 Subir Archivo al Sistema (CSV de Khan Academy o credenciales.xlsx)")
-            uploaded_file = st.file_uploader(
-                "Selecciona un reporte CSV de Khan Academy o un archivo credenciales.xlsx:",
-                type=["csv", "xlsx"],
-                key="admin_upload_drive_file"
-            )
-            if uploaded_file is not None:
-                if st.button(f"⬆️ Subir '{uploaded_file.name}'", type="primary", use_container_width=True, key="admin_btn_process_upload"):
-                    upload_success = False
-                    service = get_drive_service()
-                    if teacher_folder_id and service:
-                        try:
-                            media = MediaIoBaseUpload(io.BytesIO(uploaded_file.getvalue()), mimetype=uploaded_file.type or 'application/octet-stream', resumable=True)
-                            file_metadata = {
-                                'name': uploaded_file.name,
-                                'parents': [teacher_folder_id]
-                            }
-                            service.files().create(body=file_metadata, media_body=media, supportsAllDrives=True).execute()
-                            upload_success = True
-                        except HttpError as e:
-                            if 'storage quota' in str(e).lower() or (getattr(e, 'resp', None) and e.resp.status == 403):
-                                st.warning(f"⚠️ Tu cuenta de Google Drive no permite subir directamente vía API por cuota de Service Account institucional. Por favor, coloca el archivo en tu carpeta de Drive usando el botón **'📂 Abrir Carpeta en Google Drive'** y luego presiona **'🔄 Sincronizar'**.")
-                            elif getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
-                                st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
-                            else:
-                                st.error(f"Error al subir a Google Drive: {e}")
-                        except Exception as e:
-                            st.error(f"Error de conexión al subir a Google Drive: {e}")
-                    else:
-                        try:
-                            os.makedirs(DATA_DIR, exist_ok=True)
-                            dest_path = os.path.join(DATA_DIR, uploaded_file.name)
-                            with open(dest_path, "wb") as f:
-                                f.write(uploaded_file.getvalue())
-                            upload_success = True
-                        except Exception as e:
-                            st.error(f"Error al guardar archivo localmente: {e}")
-
-                    if upload_success:
-                        st.cache_data.clear()
-                        st.success(f"✅ Archivo '{uploaded_file.name}' subido exitosamente a Google Drive.")
-                        st.rerun()
-
-            st.markdown("---")
-            st.markdown("##### 📥 Plantilla de Credenciales (`credenciales.xlsx`)")
-            st.caption("Descarga la plantilla de Excel oficial con el formato exacto requerido por el sistema:")
-
-            template_bytes = generate_credentials_template_bytes()
-            st.download_button(
-                label="📥 Descargar Plantilla credenciales.xlsx",
-                data=template_bytes,
-                file_name="credenciales.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key="dl_cred_template_btn"
-            )
-
-            with st.popover("👁️ Ver columnas y formato requerido para credenciales"):
-                st.markdown("""
-                El archivo debe llamarse **`credenciales.xlsx`** y contener exactamente las siguientes 3 columnas en la primera fila:
-
-                | Usuario | Contraseña | Nombre del estudiante |
-                | :--- | :--- | :--- |
-                | `alboresclementepaulo` | `Alumno2026*` | `ALBORES CLEMENTE PAULO CESAR` |
-                | `gonzalezmartinezmaria` | `Alumno2026*` | `GONZÁLEZ MARTÍNEZ MARÍA FERNANDA` |
-                | `hernandezlopezjuan` | `Alumno2026*` | `HERNÁNDEZ LÓPEZ JUAN PABLO` |
-
-                > 💡 **Nota Importante:** La columna **`Nombre del estudiante`** debe coincidir exactamente con el nombre con el que el alumno aparece registrado en los archivos CSV de Khan Academy para vincular su información correctamente.
-                """)
-
 
     st.divider()
 
@@ -2110,14 +2269,19 @@ def render_admin():
             'regular': th_input_reg,
             'en_riesgo': th_input_riesgo
         },
+        'parciales': {
+            'Parcial 1': {'start': p1_start, 'end': p1_end},
+            'Parcial 2': {'start': p2_start, 'end': p2_end},
+            'Parcial 3': {'start': p3_start, 'end': p3_end}
+        },
         'task_criteria': current_task_criteria
     }
 
     # Calificación dinámica en tiempo real según los criterios activos
     all_assignments = apply_dynamic_grading(raw_assignments.copy(), active_criteria_config)
 
-    # CRÍTICO: Asignar Parciales vectorialmente comparando .dt.date contra datetime.date
-    assignments_tagged = assign_parciales_vectorized(all_assignments.copy(), active_parcial_config)
+    # CRÍTICO: Asignar Parciales vectorialmente comparando .dt.date contra datetime.date de la configuración activa
+    assignments_tagged = assign_parciales_vectorized(all_assignments.copy(), active_criteria_config)
 
 
     # Grupos disponibles
@@ -2421,10 +2585,9 @@ def render_student():
 
     criterios_data = load_teacher_criterios(teacher_folder_id, unique_task_types)
     all_assignments = apply_dynamic_grading(raw_assignments.copy(), criterios_data)
-    active_parcial_config = load_parciales_config()
 
-    # CRÍTICO: Asignar Parciales vectorialmente comparando .dt.date contra datetime.date
-    assignments_tagged = assign_parciales_vectorized(all_assignments.copy(), active_parcial_config)
+    # CRÍTICO: Asignar Parciales vectorialmente comparando .dt.date contra datetime.date de criterios.json del docente
+    assignments_tagged = assign_parciales_vectorized(all_assignments.copy(), criterios_data)
 
     student_tasks = assignments_tagged[assignments_tagged['Nombre del estudiante'].str.strip() == student_name.strip()]
     student_group = student_tasks['Grupo'].iloc[0] if not student_tasks.empty else ""
