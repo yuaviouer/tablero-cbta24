@@ -1,6 +1,6 @@
 """
-Portal de Calificaciones Khan Academy - TSM II
-CBTA 24 - Temas Selectos de Matemáticas II
+Portal de Calificaciones Khan Academy - CBTA 24
+Sincronización con Google Drive API & Gestión Multimateria
 """
 
 import os
@@ -11,18 +11,25 @@ import re
 from datetime import date, datetime
 import pandas as pd
 import streamlit as st
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.errors import HttpError
 
 # ==============================================================================
 # CONFIGURACIÓN GENERAL Y ESTILOS
 # ==============================================================================
 st.set_page_config(
-    page_title="Portal de Calificaciones - TSM II",
+    page_title="Portal de Calificaciones - CBTA 24",
     page_icon="📐",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# Credenciales de administrador por defecto
+# Constante del directorio raíz en Google Drive
+ROOT_FOLDER_ID = 'PEGA_AQUÍ_EL_ID_DE_LA_CARPETA_DEL_PASO_2_PUNTO_6'
+
+# Credenciales de administrador por defecto (fallback maestro)
 ADMIN_USERNAME = os.environ.get("ADMIN_USER", "javier_admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASS", "admin_password")
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datos")
@@ -596,86 +603,239 @@ def classify_student(score):
 
 
 # ==============================================================================
-# CARGA Y CACHÉ DE DATOS
+# INTEGRACIÓN CON GOOGLE DRIVE API (SERVICE ACCOUNT & MEMORY PROCESSING)
 # ==============================================================================
-@st.cache_data
-def load_credentials():
-    """Carga credenciales desde datos/credenciales.xlsx o fallback CSVs."""
+@st.cache_resource
+def get_drive_service():
+    """
+    Inicializa y cachea el cliente de Google Drive API v3 usando
+    las credenciales del Service Account en st.secrets['gcp_service_account'].
+    """
+    if 'gcp_service_account' not in st.secrets:
+        return None
+    raw_creds = st.secrets['gcp_service_account']
+    try:
+        if isinstance(raw_creds, str):
+            creds_dict = json.loads(raw_creds)
+        elif isinstance(raw_creds, dict):
+            creds_dict = raw_creds
+        else:
+            creds_dict = dict(raw_creds)
+
+        credentials = service_account.Credentials.from_service_account_info(
+            creds_dict,
+            scopes=['https://www.googleapis.com/auth/drive.readonly']
+        )
+        return build('drive', 'v3', credentials=credentials)
+    except Exception as e:
+        st.error(f"Error al inicializar las credenciales de Google Drive: {e}")
+        return None
+
+
+def find_drive_item(service, name, parent_id, is_folder=None):
+    """
+    Busca un archivo o carpeta por nombre exacto dentro de una carpeta padre en Drive.
+    """
+    if not service or not parent_id or str(parent_id).startswith('PEGA_AQUÍ'):
+        return None
+
+    query_parts = [
+        f"'{parent_id}' in parents",
+        f"name = '{name}'",
+        "trashed = false"
+    ]
+    if is_folder is True:
+        query_parts.append("mimeType = 'application/vnd.google-apps.folder'")
+    elif is_folder is False:
+        query_parts.append("mimeType != 'application/vnd.google-apps.folder'")
+
+    query = " and ".join(query_parts)
+    try:
+        results = service.files().list(
+            q=query,
+            spaces='drive',
+            fields='files(id, name, mimeType)',
+            pageSize=10
+        ).execute()
+        files = results.get('files', [])
+        if files:
+            return files[0]
+        return None
+    except Exception as e:
+        st.error(f"Error al buscar '{name}' en Google Drive: {e}")
+        return None
+
+
+def download_drive_bytes(service, file_id):
+    """
+    Descarga el contenido de un archivo de Drive en memoria usando io.BytesIO.
+    NO escribe nada en disco local (Zero Local Disk Storage).
+    """
+    if not service or not file_id:
+        return None
+    try:
+        request = service.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        return fh.getvalue()
+    except Exception as e:
+        st.error(f"Error al descargar archivo de Google Drive (ID: {file_id}): {e}")
+        return None
+
+
+def read_drive_excel(service, file_id):
+    """Lee un archivo Excel desde Google Drive directamente en un DataFrame en memoria."""
+    content = download_drive_bytes(service, file_id)
+    if content:
+        try:
+            return pd.read_excel(io.BytesIO(content))
+        except Exception as e:
+            st.error(f"Error al procesar archivo Excel desde Drive: {e}")
+    return pd.DataFrame()
+
+
+def read_drive_csv(service, file_id):
+    """Lee un archivo CSV desde Google Drive directamente en un DataFrame en memoria."""
+    content = download_drive_bytes(service, file_id)
+    if not content:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(io.BytesIO(content), encoding='utf-8-sig')
+    except Exception:
+        try:
+            return pd.read_csv(io.BytesIO(content), encoding='latin-1')
+        except Exception as e:
+            st.error(f"Error al decodificar CSV desde Drive: {e}")
+            return pd.DataFrame()
+
+
+def list_drive_csvs(service, folder_id):
+    """
+    Lista los archivos CSV de tareas dentro de una carpeta de Drive,
+    excluyendo credenciales y carpetas.
+    """
+    if not service or not folder_id or str(folder_id).startswith('PEGA_AQUÍ'):
+        return []
+    query = f"'{folder_id}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false"
+    try:
+        results = service.files().list(
+            q=query,
+            spaces='drive',
+            fields='files(id, name, mimeType)',
+            pageSize=100
+        ).execute()
+        files = results.get('files', [])
+        csv_files = [
+            f for f in files
+            if f.get('name', '').lower().endswith('.csv') and 'credencial' not in f.get('name', '').lower()
+        ]
+        return csv_files
+    except Exception as e:
+        st.error(f"Error al listar archivos CSV en Google Drive: {e}")
+        return []
+
+
+@st.cache_data(ttl=120)
+def load_docentes_master():
+    """
+    Carga el archivo maestro docentes.xlsx ubicado en la carpeta raíz de Drive.
+    Columnas requeridas: 'usuario_docente', 'password', 'asignatura', 'carpeta_nombre'.
+    """
+    service = get_drive_service()
+    if not service or str(ROOT_FOLDER_ID).startswith('PEGA_AQUÍ'):
+        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre'])
+
+    doc_file = find_drive_item(service, "docentes.xlsx", ROOT_FOLDER_ID, is_folder=False)
+    if not doc_file:
+        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre'])
+
+    df = read_drive_excel(service, doc_file['id'])
+    if df.empty:
+        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre'])
+
+    df.columns = [str(c).strip() for c in df.columns]
+    rename_map = {}
+    for col in df.columns:
+        cl = col.lower()
+        if 'usuario' in cl:
+            rename_map[col] = 'usuario_docente'
+        elif 'pass' in cl or 'contrase' in cl:
+            rename_map[col] = 'password'
+        elif 'asig' in cl or 'materia' in cl:
+            rename_map[col] = 'asignatura'
+        elif 'carpeta' in cl:
+            rename_map[col] = 'carpeta_nombre'
+    df = df.rename(columns=rename_map)
+
+    for req in ['usuario_docente', 'password', 'asignatura', 'carpeta_nombre']:
+        if req not in df.columns:
+            df[req] = ''
+        else:
+            df[req] = df[req].astype(str).str.strip()
+
+    return df[['usuario_docente', 'password', 'asignatura', 'carpeta_nombre']]
+
+
+def normalize_credentials_df(df):
+    """Normaliza las columnas de un dataframe de credenciales a ['Usuario', 'Contraseña', 'Nombre del estudiante']."""
+    if df.empty:
+        return pd.DataFrame(columns=['Usuario', 'Contraseña', 'Nombre del estudiante'])
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    rename_map = {}
+    for col in df.columns:
+        col_clean = col.lower()
+        if 'usuario' in col_clean:
+            rename_map[col] = 'Usuario'
+        elif 'contrase' in col_clean:
+            rename_map[col] = 'Contraseña'
+        elif 'estudiante' in col_clean or 'nombre' in col_clean:
+            rename_map[col] = 'Nombre del estudiante'
+    df = df.rename(columns=rename_map)
+    if {'Usuario', 'Contraseña', 'Nombre del estudiante'}.issubset(df.columns):
+        df['Usuario'] = df['Usuario'].astype(str).str.strip()
+        df['Contraseña'] = df['Contraseña'].astype(str).str.strip()
+        df['Nombre del estudiante'] = df['Nombre del estudiante'].astype(str).str.strip()
+        return df[['Usuario', 'Contraseña', 'Nombre del estudiante']].drop_duplicates(subset=['Usuario'])
+    return pd.DataFrame(columns=['Usuario', 'Contraseña', 'Nombre del estudiante'])
+
+
+def load_credentials_local_fallback():
+    """Fallback local para lectura de credenciales si Drive no está configurado."""
     os.makedirs(DATA_DIR, exist_ok=True)
     excel_path = os.path.join(DATA_DIR, "credenciales.xlsx")
-
     if os.path.exists(excel_path):
         try:
             df = pd.read_excel(excel_path)
-            cols = {c: c.strip() for c in df.columns}
-            df = df.rename(columns=cols)
-            rename_map = {}
-            for col in df.columns:
-                col_clean = col.lower()
-                if 'usuario' in col_clean:
-                    rename_map[col] = 'Usuario'
-                elif 'contrase' in col_clean:
-                    rename_map[col] = 'Contraseña'
-                elif 'estudiante' in col_clean or 'nombre' in col_clean:
-                    rename_map[col] = 'Nombre del estudiante'
-            df = df.rename(columns=rename_map)
-            if {'Usuario', 'Contraseña', 'Nombre del estudiante'}.issubset(df.columns):
-                df['Usuario'] = df['Usuario'].astype(str).str.strip()
-                df['Contraseña'] = df['Contraseña'].astype(str).str.strip()
-                df['Nombre del estudiante'] = df['Nombre del estudiante'].astype(str).str.strip()
-                return df[['Usuario', 'Contraseña', 'Nombre del estudiante']]
-        except Exception as e:
-            st.warning(f"Aviso al leer {excel_path}: {e}")
-
+            return normalize_credentials_df(df)
+        except Exception:
+            pass
     csv_files = glob.glob(os.path.join(DATA_DIR, "*redencial*.csv"))
     if csv_files:
         dfs = []
         for cf in csv_files:
             try:
-                temp_df = pd.read_csv(cf, encoding='utf-8-sig')
-                rename_map = {}
-                for col in temp_df.columns:
-                    col_clean = col.lower()
-                    if 'usuario' in col_clean:
-                        rename_map[col] = 'Usuario'
-                    elif 'contrase' in col_clean:
-                        rename_map[col] = 'Contraseña'
-                    elif 'estudiante' in col_clean:
-                        rename_map[col] = 'Nombre del estudiante'
-                temp_df = temp_df.rename(columns=rename_map)
-                if {'Usuario', 'Contraseña', 'Nombre del estudiante'}.issubset(temp_df.columns):
-                    dfs.append(temp_df[['Usuario', 'Contraseña', 'Nombre del estudiante']])
+                tdf = pd.read_csv(cf, encoding='utf-8-sig')
+                ndf = normalize_credentials_df(tdf)
+                if not ndf.empty:
+                    dfs.append(ndf)
             except Exception:
                 continue
-
         if dfs:
-            combined = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=['Usuario'])
-            combined['Usuario'] = combined['Usuario'].astype(str).str.strip()
-            combined['Contraseña'] = combined['Contraseña'].astype(str).str.strip()
-            combined['Nombre del estudiante'] = combined['Nombre del estudiante'].astype(str).str.strip()
-            try:
-                combined.to_excel(excel_path, index=False)
-            except Exception:
-                pass
-            return combined
-
+            return pd.concat(dfs, ignore_index=True).drop_duplicates(subset=['Usuario'])
     return pd.DataFrame(columns=['Usuario', 'Contraseña', 'Nombre del estudiante'])
 
 
-@st.cache_data
-def load_raw_assignments():
-    """
-    Lee todos los archivos CSV en la carpeta datos/ (exceptuando credenciales),
-    extrae el Grupo de cada archivo, y limpia y parsea fechas de Khan Academy.
-    Retorna el DataFrame sin calificaciones fijas para permitir recalcular en tiempo real.
-    """
+def load_raw_assignments_local_fallback():
+    """Fallback local para lectura de tareas si Drive no está configurado."""
     os.makedirs(DATA_DIR, exist_ok=True)
     csv_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
     assignment_files = [f for f in csv_files if "credencial" not in os.path.basename(f).lower()]
-
     if not assignment_files:
         return pd.DataFrame()
-
     dfs = []
     for filepath in assignment_files:
         try:
@@ -689,14 +849,93 @@ def load_raw_assignments():
                 df['Archivo_Origen'] = os.path.basename(filepath)
                 df['Grupo'] = extract_group(filepath)
                 dfs.append(df)
-            except Exception as e:
-                st.error(f"Error al leer archivo {os.path.basename(filepath)}: {e}")
+            except Exception:
+                continue
+    if not dfs:
+        return pd.DataFrame()
+    all_data = pd.concat(dfs, ignore_index=True)
+    all_data.columns = [c.strip() for c in all_data.columns]
+    if 'Nombre del estudiante' in all_data.columns:
+        all_data['Nombre del estudiante'] = all_data['Nombre del estudiante'].astype(str).str.strip()
+    if 'Tipo de tarea' in all_data.columns:
+        all_data['Tipo de tarea'] = all_data['Tipo de tarea'].astype(str).str.strip()
+    all_data['dt_entrega'] = all_data['Fecha de entrega'].apply(parse_khan_date) if 'Fecha de entrega' in all_data.columns else pd.NaT
+    all_data['dt_terminacion'] = all_data['Última fecha de terminación'].apply(parse_khan_date) if 'Última fecha de terminación' in all_data.columns else pd.NaT
+    all_data['dt_inicio'] = all_data['Fecha de inicio'].apply(parse_khan_date) if 'Fecha de inicio' in all_data.columns else pd.NaT
+    return all_data
+
+
+@st.cache_data(ttl=300)
+def load_teacher_credentials(folder_id):
+    """
+    Carga las credenciales de los estudiantes desde la subcarpeta del docente en Google Drive.
+    Busca 'credenciales.xlsx' o archivos que contengan 'credencial' (.xlsx o .csv) en memoria.
+    """
+    service = get_drive_service()
+    if not service or not folder_id or str(folder_id).startswith('PEGA_AQUÍ'):
+        return load_credentials_local_fallback()
+
+    # 1. Intentar credenciales.xlsx
+    cred_file = find_drive_item(service, "credenciales.xlsx", folder_id, is_folder=False)
+    if cred_file:
+        df = read_drive_excel(service, cred_file['id'])
+        norm_df = normalize_credentials_df(df)
+        if not norm_df.empty:
+            return norm_df
+
+    # 2. Buscar otros archivos con 'credencial'
+    query = f"'{folder_id}' in parents and trashed = false"
+    try:
+        results = service.files().list(q=query, fields='files(id, name, mimeType)').execute()
+        files = results.get('files', [])
+        for f in files:
+            fname = f.get('name', '').lower()
+            if 'credencial' in fname:
+                if fname.endswith('.xlsx'):
+                    df = read_drive_excel(service, f['id'])
+                elif fname.endswith('.csv'):
+                    df = read_drive_csv(service, f['id'])
+                else:
+                    continue
+                norm_df = normalize_credentials_df(df)
+                if not norm_df.empty:
+                    return norm_df
+    except Exception as e:
+        st.error(f"Error al buscar credenciales en la carpeta de Drive: {e}")
+
+    return pd.DataFrame(columns=['Usuario', 'Contraseña', 'Nombre del estudiante'])
+
+
+@st.cache_data(ttl=300)
+def load_teacher_raw_assignments(folder_id):
+    """
+    Descarga en memoria todos los CSVs de Khan Academy en la subcarpeta del docente en Google Drive,
+    extrae el Grupo de cada archivo, y limpia y parsea fechas de Khan Academy.
+    NO guarda nada en disco local.
+    """
+    service = get_drive_service()
+    if not service or not folder_id or str(folder_id).startswith('PEGA_AQUÍ'):
+        return load_raw_assignments_local_fallback()
+
+    csv_items = list_drive_csvs(service, folder_id)
+    if not csv_items:
+        return pd.DataFrame()
+
+    dfs = []
+    for item in csv_items:
+        file_id = item['id']
+        file_name = item.get('name', 'asignacion.csv')
+        df = read_drive_csv(service, file_id)
+        if not df.empty:
+            df['Archivo_Origen'] = file_name
+            df['Grupo'] = extract_group(file_name)
+            dfs.append(df)
 
     if not dfs:
         return pd.DataFrame()
 
     all_data = pd.concat(dfs, ignore_index=True)
-    all_data.columns = [c.strip() for c in all_data.columns]
+    all_data.columns = [str(c).strip() for c in all_data.columns]
 
     if 'Nombre del estudiante' in all_data.columns:
         all_data['Nombre del estudiante'] = all_data['Nombre del estudiante'].astype(str).str.strip()
@@ -704,7 +943,6 @@ def load_raw_assignments():
     if 'Tipo de tarea' in all_data.columns:
         all_data['Tipo de tarea'] = all_data['Tipo de tarea'].astype(str).str.strip()
 
-    # Parsear fechas usando regla limpia y dinámica de Khan Academy
     if 'Fecha de entrega' in all_data.columns:
         all_data['dt_entrega'] = all_data['Fecha de entrega'].apply(parse_khan_date)
     else:
@@ -723,17 +961,18 @@ def load_raw_assignments():
     return all_data
 
 
-def load_assignments(criteria_config=None):
+def load_teacher_assignments(folder_id, criteria_config=None):
     """
-    Carga los datos crudos y les aplica la calificación dinámica según criteria_config.
+    Carga las asignaciones del docente y les aplica la calificación dinámica según criteria_config.
     """
-    raw_df = load_raw_assignments()
+    raw_df = load_teacher_raw_assignments(folder_id)
     if raw_df.empty:
         return raw_df
     if criteria_config is None:
         unique_types = sorted([t for t in raw_df['Tipo de tarea'].dropna().unique() if t]) if 'Tipo de tarea' in raw_df.columns else []
         criteria_config = load_criteria_config(unique_types)
     return apply_dynamic_grading(raw_df.copy(), criteria_config)
+
 
 
 
@@ -1026,74 +1265,175 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
 
 
 # ==============================================================================
-# VISTA: INICIO DE SESIÓN
+# VISTA: INICIO DE SESIÓN CON ENRUTAMIENTO DINÁMICO (GOOGLE DRIVE)
 # ==============================================================================
 def render_login():
     st.markdown("""
     <div class="main-header" style="text-align: center;">
-        <h1>📐 Portal de Calificaciones - TSM II</h1>
-        <p>Centro de Bachillerato Tecnológico Agropecuario No. 24 | Temas Selectos de Matemáticas II</p>
+        <h1>📐 Portal de Calificaciones - CBTA 24</h1>
+        <p>Centro de Bachillerato Tecnológico Agropecuario No. 24 | Control y Seguimiento de Khan Academy</p>
     </div>
     """, unsafe_allow_html=True)
 
-    col1, col2, col3 = st.columns([1, 2, 1])
+    service = get_drive_service()
+    drive_ready = (service is not None) and (not str(ROOT_FOLDER_ID).startswith('PEGA_AQUÍ'))
+
+    if not drive_ready:
+        st.warning(
+            "⚠️ **Aviso de Integración con Google Drive:**\n\n"
+            "- Define `ROOT_FOLDER_ID` con el ID de la carpeta compartida en `app.py`.\n"
+            "- Configura `st.secrets['gcp_service_account']` con las credenciales JSON del Service Account.\n"
+            "- *Modo de contingencia:* Si existen datos de prueba en la carpeta `datos/`, el sistema se ejecutará en modo local temporal."
+        )
+
+    # Cargar archivo maestro de docentes desde Drive
+    docentes_df = load_docentes_master()
+
+    col1, col2, col3 = st.columns([1, 2.4, 1])
     with col2:
-        st.markdown("### Iniciar Sesión")
-        st.caption("Ingresa con tu usuario y contraseña institucional de Khan Academy, o como Administrador.")
+        st.markdown("### Acceso al Portal")
+        tab_student, tab_teacher = st.tabs(["🎓 Acceso Estudiantes", "🛡️ Acceso Docentes"])
 
-        with st.form("login_form", clear_on_submit=False):
-            username_input = st.text_input("Usuario", placeholder="ej. alboresclementepaulo o javier_admin").strip()
-            password_input = st.text_input("Contraseña", type="password", placeholder="••••••••").strip()
-            submit_btn = st.form_submit_button("Ingresar al Portal", use_container_width=True, type="primary")
+        # ----------------------------------------------------------------------
+        # 1. ACCESO ESTUDIANTES (AISLAMIENTO POR ASIGNATURA / DOCENTE)
+        # ----------------------------------------------------------------------
+        with tab_student:
+            st.caption("Selecciona tu asignatura e ingresa con tu usuario y contraseña de Khan Academy:")
 
-            if submit_btn:
-                if not username_input or not password_input:
-                    st.error("Por favor completa ambos campos.")
-                    return
+            # Opciones de asignaturas disponibles desde docentes.xlsx
+            if not docentes_df.empty and 'asignatura' in docentes_df.columns:
+                available_asigs = sorted([a for a in docentes_df['asignatura'].unique() if str(a).strip()])
+            else:
+                available_asigs = ["Temas Selectos de Matemáticas II"]
 
-                # 1. Administrador
-                if username_input == ADMIN_USERNAME and password_input == ADMIN_PASSWORD:
-                    st.session_state['logged_in'] = True
-                    st.session_state['role'] = 'admin'
-                    st.session_state['username'] = ADMIN_USERNAME
-                    st.session_state['student_name'] = "Profesor / Administrador"
-                    st.success("Acceso concedido como Administrador.")
-                    st.rerun()
+            selected_asig = st.selectbox(
+                "Asignatura / Materia:",
+                options=available_asigs,
+                key="student_asig_selector"
+            )
 
-                # 2. Estudiante
-                creds_df = load_credentials()
-                if not creds_df.empty:
-                    matched = creds_df[
-                        (creds_df['Usuario'].str.lower() == username_input.lower()) &
-                        (creds_df['Contraseña'] == password_input)
-                    ]
-                    if not matched.empty:
-                        student_name = matched.iloc[0]['Nombre del estudiante']
-                        st.session_state['logged_in'] = True
-                        st.session_state['role'] = 'student'
-                        st.session_state['username'] = username_input
-                        st.session_state['student_name'] = student_name
-                        st.success(f"Bienvenido(a), {student_name}")
-                        st.rerun()
+            with st.form("student_login_form", clear_on_submit=False):
+                username_input = st.text_input("Usuario Khan Academy", placeholder="ej. alboresclementepaulo", key="login_st_user").strip()
+                password_input = st.text_input("Contraseña", type="password", placeholder="••••••••", key="login_st_pass").strip()
+                submit_st_btn = st.form_submit_button("Ingresar como Estudiante", use_container_width=True, type="primary")
+
+                if submit_st_btn:
+                    if not username_input or not password_input:
+                        st.error("Por favor completa tu usuario y contraseña.")
                     else:
-                        st.error("Usuario o contraseña incorrectos. Verifica tus datos.")
-                else:
-                    st.error("No se encontró el archivo de credenciales. Contacta al docente.")
+                        folder_id = None
+                        folder_name = ""
+                        if not docentes_df.empty:
+                            matched_asig = docentes_df[docentes_df['asignatura'] == selected_asig]
+                            if not matched_asig.empty:
+                                folder_name = matched_asig.iloc[0]['carpeta_nombre']
+                                if service and not str(ROOT_FOLDER_ID).startswith('PEGA_AQUÍ'):
+                                    t_item = find_drive_item(service, folder_name, ROOT_FOLDER_ID, is_folder=True)
+                                    if t_item:
+                                        folder_id = t_item['id']
+                                    else:
+                                        st.error(f"No se localizó la subcarpeta '{folder_name}' en Google Drive para la materia seleccionada.")
+                                        return
 
-        st.info("💡 **Estudiantes:** Utilicen el usuario y contraseña asignados para Khan Academy.\n\n"
-                "🛡️ **Docente:** Inicia sesión con tus credenciales de Administrador.")
+                        creds_df = load_teacher_credentials(folder_id)
+                        if not creds_df.empty:
+                            matched = creds_df[
+                                (creds_df['Usuario'].str.lower() == username_input.lower()) &
+                                (creds_df['Contraseña'] == password_input)
+                            ]
+                            if not matched.empty:
+                                student_name = matched.iloc[0]['Nombre del estudiante']
+                                st.session_state['logged_in'] = True
+                                st.session_state['role'] = 'student'
+                                st.session_state['username'] = username_input
+                                st.session_state['student_name'] = student_name
+                                st.session_state['asignatura'] = selected_asig
+                                st.session_state['carpeta_nombre'] = folder_name
+                                st.session_state['teacher_folder_id'] = folder_id
+                                st.success(f"Bienvenido(a), {student_name}")
+                                st.rerun()
+                            else:
+                                st.error("Usuario o contraseña incorrectos para la asignatura seleccionada.")
+                        else:
+                            st.error(f"No se encontraron credenciales para la asignatura '{selected_asig}'. Contacta al docente.")
+
+        # ----------------------------------------------------------------------
+        # 2. ACCESO DOCENTES (ENRUTAMIENTO MAESTRO)
+        # ----------------------------------------------------------------------
+        with tab_teacher:
+            st.caption("Ingresa con tu usuario y contraseña de docente registrados en docentes.xlsx:")
+
+            with st.form("teacher_login_form", clear_on_submit=False):
+                doc_user_input = st.text_input("Usuario Docente", placeholder="ej. docente_tsm o javier_admin", key="login_doc_user").strip()
+                doc_pass_input = st.text_input("Contraseña", type="password", placeholder="••••••••", key="login_doc_pass").strip()
+                submit_doc_btn = st.form_submit_button("Ingresar al Panel Docente", use_container_width=True, type="primary")
+
+                if submit_doc_btn:
+                    if not doc_user_input or not doc_pass_input:
+                        st.error("Por favor completa ambos campos.")
+                    else:
+                        matched_doc = pd.DataFrame()
+                        if not docentes_df.empty:
+                            matched_doc = docentes_df[
+                                (docentes_df['usuario_docente'].str.lower() == doc_user_input.lower()) &
+                                (docentes_df['password'] == doc_pass_input)
+                            ]
+
+                        if not matched_doc.empty:
+                            doc_row = matched_doc.iloc[0]
+                            folder_name = doc_row['carpeta_nombre']
+                            asig_name = doc_row['asignatura']
+                            folder_id = None
+                            if service and not str(ROOT_FOLDER_ID).startswith('PEGA_AQUÍ'):
+                                t_item = find_drive_item(service, folder_name, ROOT_FOLDER_ID, is_folder=True)
+                                if t_item:
+                                    folder_id = t_item['id']
+                                else:
+                                    st.error(f"No se encontró la subcarpeta '{folder_name}' en Google Drive para este docente.")
+                                    return
+
+                            st.session_state['logged_in'] = True
+                            st.session_state['role'] = 'admin'
+                            st.session_state['username'] = doc_row['usuario_docente']
+                            st.session_state['student_name'] = f"Prof. {doc_row['usuario_docente']}"
+                            st.session_state['asignatura'] = asig_name
+                            st.session_state['carpeta_nombre'] = folder_name
+                            st.session_state['teacher_folder_id'] = folder_id
+                            st.success(f"Bienvenido(a), Prof. {doc_row['usuario_docente']}")
+                            st.rerun()
+
+                        elif doc_user_input == ADMIN_USERNAME and doc_pass_input == ADMIN_PASSWORD:
+                            st.session_state['logged_in'] = True
+                            st.session_state['role'] = 'admin'
+                            st.session_state['username'] = ADMIN_USERNAME
+                            st.session_state['student_name'] = "Profesor / Administrador General"
+                            st.session_state['asignatura'] = "Temas Selectos de Matemáticas II"
+                            st.session_state['carpeta_nombre'] = "datos (Local)"
+                            st.session_state['teacher_folder_id'] = None
+                            st.success("Acceso concedido como Administrador Maestro.")
+                            st.rerun()
+
+                        else:
+                            st.error("Credenciales de docente no válidas.")
+
+        st.info("💡 **Estudiantes:** Seleccionen su materia y utilicen su cuenta de Khan Academy.\n\n"
+                "🛡️ **Docentes:** Inicien sesión con sus credenciales maestras.")
 
 
 # ==============================================================================
-# VISTA: PANEL DE ADMINISTRADOR
+# VISTA: PANEL DE ADMINISTRADOR / DOCENTE
 # ==============================================================================
 def render_admin():
+    teacher_folder_id = st.session_state.get('teacher_folder_id')
+    asignatura = st.session_state.get('asignatura', 'Temas Selectos de Matemáticas II')
+    carpeta_nombre = st.session_state.get('carpeta_nombre', 'Google Drive')
+
     header_col1, header_col2 = st.columns([5, 1])
     with header_col1:
-        st.markdown("""
+        st.markdown(f"""
         <div class="main-header" style="background: linear-gradient(135deg, #0f172a 0%, #334155 100%);">
-            <h1>🛡️ Panel de Administración - Control Escolar TSM II</h1>
-            <p>Monitoreo por grupos, concentrado master, configuración de parciales y drill-down individual</p>
+            <h1>🛡️ Panel Docente - {asignatura}</h1>
+            <p>Docente: <strong>{st.session_state.get('username', 'Profesor')}</strong> | Carpeta Drive: <code>{carpeta_nombre}</code> | Sincronización en memoria</p>
         </div>
         """, unsafe_allow_html=True)
     with header_col2:
@@ -1103,9 +1443,9 @@ def render_admin():
             st.session_state.clear()
             st.rerun()
 
-    # Cargar datos base crudos
-    raw_assignments = load_raw_assignments()
-    all_credentials = load_credentials()
+    # Cargar datos base crudos aislados de la carpeta del docente
+    raw_assignments = load_teacher_raw_assignments(teacher_folder_id)
+    all_credentials = load_teacher_credentials(teacher_folder_id)
     saved_parcial_config = load_parciales_config()
 
     # Detectar dinámicamente los tipos de tarea presentes en los datos
@@ -1118,6 +1458,7 @@ def render_admin():
         unique_task_types = ['Video', 'Ejercicio', 'Artículo']
 
     saved_criteria_config = load_criteria_config(unique_task_types)
+
 
     # --------------------------------------------------------------------------
     # SECCIÓN 1: CONFIGURACIONES (CRITERIOS, PARCIALES Y CARGA DE ARCHIVOS)
@@ -1241,45 +1582,18 @@ def render_admin():
     active_parcial_config = st.session_state.get('active_parcial_config', saved_parcial_config)
 
     with col_cfg2:
-        with st.expander("📂 Carga de Archivos (CSV y Credenciales)", expanded=False):
-            st.write("Sube nuevos archivos de Khan Academy o credenciales a la carpeta `datos/`:")
-            tab_up1, tab_up2 = st.tabs(["📊 Subir CSVs Tareas", "🔑 Subir Credenciales"])
+        with st.expander("☁️ Sincronización con Google Drive", expanded=False):
+            st.markdown(f"**Carpeta asignada en Google Drive:** `{carpeta_nombre}`")
+            if teacher_folder_id:
+                st.success("🟢 Conexión activa con Google Drive (Modo Solo Lectura en memoria).")
+                st.caption("Los archivos CSV y credenciales se leen automáticamente en memoria sin almacenarse en el disco local.")
+            else:
+                st.info("ℹ️ Sesión en modo local/administrador general.")
 
-            with tab_up1:
-                uploaded_csvs = st.file_uploader(
-                    "Selecciona archivos CSV de tareas:",
-                    type=["csv"],
-                    accept_multiple_files=True,
-                    key="admin_csv_uploader"
-                )
-                if uploaded_csvs:
-                    if st.button("💾 Guardar CSVs", key="save_csv_btn"):
-                        for f in uploaded_csvs:
-                            with open(os.path.join(DATA_DIR, f.name), "wb") as out_file:
-                                out_file.write(f.getbuffer())
-                        st.cache_data.clear()
-                        st.success(f"✅ Se guardaron {len(uploaded_csvs)} archivo(s) CSV.")
-                        st.rerun()
-
-            with tab_up2:
-                uploaded_cred = st.file_uploader(
-                    "Selecciona archivo credenciales (.xlsx o .csv):",
-                    type=["xlsx", "csv"],
-                    accept_multiple_files=False,
-                    key="admin_cred_uploader"
-                )
-                if uploaded_cred:
-                    if st.button("💾 Guardar Credenciales", key="save_cred_btn"):
-                        dest_path = os.path.join(DATA_DIR, "credenciales.xlsx")
-                        if uploaded_cred.name.endswith(".xlsx"):
-                            with open(dest_path, "wb") as out_file:
-                                out_file.write(uploaded_cred.getbuffer())
-                        else:
-                            temp_df = pd.read_csv(uploaded_cred, encoding='utf-8-sig')
-                            temp_df.to_excel(dest_path, index=False)
-                        st.cache_data.clear()
-                        st.success("✅ Credenciales actualizadas.")
-                        st.rerun()
+            if st.button("🔄 Sincronizar / Refrescar Datos de Google Drive", use_container_width=True, key="admin_refresh_drive_btn"):
+                st.cache_data.clear()
+                st.success("✅ Datos sincronizados directamente desde Google Drive.")
+                st.rerun()
 
     st.divider()
 
@@ -1591,8 +1905,11 @@ def render_admin():
 def render_student():
     student_name = st.session_state.get('student_name', '')
     username = st.session_state.get('username', '')
+    asignatura = st.session_state.get('asignatura', 'Temas Selectos de Matemáticas II')
+    teacher_folder_id = st.session_state.get('teacher_folder_id')
 
-    raw_assignments = load_raw_assignments()
+    # Cargar datos crudos exclusivamente de la carpeta de la asignatura/docente en Drive
+    raw_assignments = load_teacher_raw_assignments(teacher_folder_id)
     if not raw_assignments.empty and 'Tipo de tarea' in raw_assignments.columns:
         unique_task_types = sorted([
             t for t in raw_assignments['Tipo de tarea'].dropna().astype(str).str.strip().unique()
@@ -1616,7 +1933,7 @@ def render_student():
         st.markdown(f"""
         <div class="main-header">
             <h1>🎓 Calificaciones: {student_name}</h1>
-            <p>Grupo: <strong>{student_group}</strong> | Usuario: <code>{username}</code> | Materia: Temas Selectos de Matemáticas II</p>
+            <p>Grupo: <strong>{student_group}</strong> | Usuario: <code>{username}</code> | Asignatura: <strong>{asignatura}</strong></p>
         </div>
         """, unsafe_allow_html=True)
     with header_col2:
@@ -1627,7 +1944,7 @@ def render_student():
             st.rerun()
 
     if all_assignments.empty:
-        st.warning("No hay tareas registradas en el sistema. Contacta al docente.")
+        st.warning("No hay tareas registradas en el sistema para esta asignatura. Contacta al docente.")
         return
 
     render_student_dashboard(student_name, student_tasks, criteria_config=saved_criteria_config, is_admin_drilldown=False)
@@ -1643,6 +1960,9 @@ def main():
         st.session_state['role'] = None
         st.session_state['username'] = None
         st.session_state['student_name'] = None
+        st.session_state['asignatura'] = None
+        st.session_state['carpeta_nombre'] = None
+        st.session_state['teacher_folder_id'] = None
 
     if not st.session_state['logged_in']:
         render_login()
@@ -1651,6 +1971,7 @@ def main():
             render_admin()
         else:
             render_student()
+
 
 
 if __name__ == "__main__":
