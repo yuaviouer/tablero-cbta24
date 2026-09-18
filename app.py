@@ -9,6 +9,7 @@ import json
 import glob
 import re
 from datetime import date, datetime
+import time
 import pandas as pd
 import streamlit as st
 from google.oauth2 import service_account
@@ -299,7 +300,7 @@ def parse_khan_date(val, default_year=None):
 # ==============================================================================
 # GESTIÓN Y CONFIGURACIÓN DINÁMICA DE CRITERIOS DE EVALUACIÓN
 # ==============================================================================
-def get_default_criteria_config(unique_task_types):
+def get_default_criteria_config(unique_task_types=None):
     """
     Genera criterios de evaluación predeterminados para los tipos de tareas detectados:
     - Ejercicios / Pruebas / Cuestionarios: multiplicados por aciertos, evalúan intentos (máx 3 libres).
@@ -307,6 +308,8 @@ def get_default_criteria_config(unique_task_types):
     - Videos: 1.0 pto a tiempo, 0.1 tardío, puntaje plano, sin evaluación de intentos.
     - Otros: 1.0 pto a tiempo, 0.1 tardío, puntaje plano, sin evaluación de intentos.
     """
+    if not unique_task_types:
+        unique_task_types = ['Video', 'Ejercicio', 'Artículo']
     defaults = {}
     for t in unique_task_types:
         t_clean = t.lower()
@@ -345,55 +348,179 @@ def get_default_criteria_config(unique_task_types):
     return defaults
 
 
-def load_criteria_config(unique_task_types):
-    """
-    Carga la configuración de criterios desde config_criterios.json.
-    Si faltan tipos de tarea presentes en los datos, los completa con los valores predeterminados.
-    """
-    os.makedirs(DATA_DIR, exist_ok=True)
-    defaults = get_default_criteria_config(unique_task_types)
+def get_default_teacher_criterios(unique_task_types=None, scale=10):
+    """Retorna la configuración por defecto (Escala 10, Peso 100%, Umbrales estándar)."""
+    scale = 100 if scale == 100 else 10
+    if scale == 100:
+        thresh = {
+            'excelente': 95.0,
+            'bien': 80.0,
+            'regular': 60.0,
+            'en_riesgo': 60.0
+        }
+    else:
+        thresh = {
+            'excelente': 9.5,
+            'bien': 8.0,
+            'regular': 6.0,
+            'en_riesgo': 6.0
+        }
+    return {
+        'escala_maxima': scale,
+        'peso_khan': 100,
+        'thresholds': thresh,
+        'task_criteria': get_default_criteria_config(unique_task_types)
+    }
 
-    if os.path.exists(CONFIG_CRITERIOS_PATH):
+
+@st.cache_data(ttl=3600)
+def load_teacher_criterios(folder_id, unique_task_types=None):
+    """
+    Carga la configuración persistente e independiente del docente ('criterios.json')
+    desde su subcarpeta en Google Drive.
+    Si no existe, retorna los valores predeterminados (Escala 10, Peso 100%, Exc >= 9.5, etc.).
+    """
+    defaults = get_default_teacher_criterios(unique_task_types, scale=10)
+    service = get_drive_service()
+
+    # 1. Intentar cargar desde Google Drive si hay carpeta y servicio
+    if service and folder_id and not str(folder_id).startswith('PEGA_AQUÍ'):
         try:
-            with open(CONFIG_CRITERIOS_PATH, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            config = {}
-            for t in unique_task_types:
-                if t in saved:
-                    config[t] = {
-                        'valor_a_tiempo': float(saved[t].get('valor_a_tiempo', 1.0)),
-                        'valor_tardio': float(saved[t].get('valor_tardio', 0.1)),
-                        'multiplicar_por_aciertos': bool(saved[t].get('multiplicar_por_aciertos', False)),
-                        'evaluar_intentos': bool(saved[t].get('evaluar_intentos', False)),
-                        'max_intentos': int(saved[t].get('max_intentos', 3))
+            item = find_drive_item(service, "criterios.json", folder_id, is_folder=False)
+            if item:
+                content = download_drive_bytes(service, item['id'])
+                if content:
+                    saved = json.loads(content.decode('utf-8'))
+                    scale = int(saved.get('escala_maxima', 10))
+                    peso = float(saved.get('peso_khan', 100))
+                    thresholds = saved.get('thresholds', defaults['thresholds'])
+                    task_crit = saved.get('task_criteria', saved.get('criterios', {}))
+
+                    merged_tasks = get_default_criteria_config(unique_task_types)
+                    if isinstance(task_crit, dict):
+                        for t, vals in task_crit.items():
+                            if t in merged_tasks and isinstance(vals, dict):
+                                merged_tasks[t].update(vals)
+                            else:
+                                merged_tasks[t] = vals
+
+                    return {
+                        'escala_maxima': scale,
+                        'peso_khan': peso,
+                        'thresholds': thresholds,
+                        'task_criteria': merged_tasks
                     }
-                else:
-                    config[t] = defaults.get(t, {
-                        'valor_a_tiempo': 1.0,
-                        'valor_tardio': 0.1,
-                        'multiplicar_por_aciertos': False,
-                        'evaluar_intentos': False,
-                        'max_intentos': 1
-                    })
-            return config
+        except Exception as e:
+            st.warning(f"No se pudo leer criterios.json desde Google Drive (se usarán valores por defecto): {e}")
+
+    # 2. Fallback local en DATA_DIR
+    local_path = os.path.join(DATA_DIR, "criterios.json")
+    if os.path.exists(local_path):
+        try:
+            with open(local_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            scale = int(saved.get('escala_maxima', 10))
+            peso = float(saved.get('peso_khan', 100))
+            thresholds = saved.get('thresholds', defaults['thresholds'])
+            task_crit = saved.get('task_criteria', saved.get('criterios', {}))
+            merged_tasks = get_default_criteria_config(unique_task_types)
+            if isinstance(task_crit, dict):
+                for t, vals in task_crit.items():
+                    if t in merged_tasks and isinstance(vals, dict):
+                        merged_tasks[t].update(vals)
+                    else:
+                        merged_tasks[t] = vals
+            return {
+                'escala_maxima': scale,
+                'peso_khan': peso,
+                'thresholds': thresholds,
+                'task_criteria': merged_tasks
+            }
         except Exception:
             pass
 
-    save_criteria_config(defaults)
     return defaults
 
 
-def save_criteria_config(config_dict):
-    """Guarda la configuración de criterios en formato JSON."""
+def save_teacher_criterios(folder_id, criterios_dict):
+    """
+    Serializa la configuración del docente a JSON (criterios.json) y la guarda/sobrescribe
+    DIRECTAMENTE en su carpeta específica de Google Drive usando MediaIoBaseUpload.
+    También mantiene una copia local de respaldo y limpia el caché.
+    """
+    json_str = json.dumps(criterios_dict, indent=4, ensure_ascii=False)
+    json_bytes = json_str.encode('utf-8')
+
+    # Guardar en local como respaldo
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(CONFIG_CRITERIOS_PATH, "w", encoding="utf-8") as f:
-        json.dump(config_dict, f, indent=4, ensure_ascii=False)
+    local_path = os.path.join(DATA_DIR, "criterios.json")
+    try:
+        with open(local_path, "w", encoding="utf-8") as f:
+            f.write(json_str)
+    except Exception:
+        pass
+
+    # Guardar / Sobrescribir en Google Drive
+    service = get_drive_service()
+    if service and folder_id and not str(folder_id).startswith('PEGA_AQUÍ'):
+        try:
+            existing = find_drive_item(service, "criterios.json", folder_id, is_folder=False)
+            media = MediaIoBaseUpload(io.BytesIO(json_bytes), mimetype='application/json', resumable=True)
+            if existing:
+                service.files().update(
+                    fileId=existing['id'],
+                    media_body=media,
+                    supportsAllDrives=True
+                ).execute()
+            else:
+                meta = {
+                    'name': 'criterios.json',
+                    'parents': [folder_id]
+                }
+                service.files().create(
+                    body=meta,
+                    media_body=media,
+                    supportsAllDrives=True
+                ).execute()
+        except HttpError as e:
+            if 'storage quota' in str(e).lower() or (getattr(e, 'resp', None) and e.resp.status == 403):
+                st.warning("⚠️ Nota: Tu cuenta de Google Drive no cuenta con cuota de escritura para Service Accounts institucionales. La configuración se ha guardado localmente en el servidor.")
+            elif getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
+                st.error("⚠️ El servidor de Google Drive está experimentando alto tráfico. Por favor, intenta de nuevo en unos momentos.")
+            else:
+                st.error(f"Error al guardar criterios.json en Google Drive: {e}")
+        except Exception as e:
+            st.error(f"Error inesperado al guardar criterios.json en Google Drive: {e}")
+
+    st.cache_data.clear()
+
+
+def load_criteria_config(unique_task_types, folder_id=None):
+    """Compatibilidad: Carga task_criteria desde teacher_criterios."""
+    criterios = load_teacher_criterios(folder_id, unique_task_types)
+    return criterios.get('task_criteria', {})
+
+
+def save_criteria_config(config_dict, folder_id=None):
+    """Compatibilidad: Guarda la configuración en criterios.json."""
+    current = load_teacher_criterios(folder_id)
+    current['task_criteria'] = config_dict
+    save_teacher_criterios(folder_id, current)
 
 
 def render_criteria_explanation(criteria_config):
     """Genera texto dinámico en formato Markdown explicando los criterios activos."""
+    if isinstance(criteria_config, dict) and 'task_criteria' in criteria_config:
+        task_crit = criteria_config['task_criteria']
+        scale = criteria_config.get('escala_maxima', 10)
+        weight = criteria_config.get('peso_khan', 100)
+    else:
+        task_crit = criteria_config if isinstance(criteria_config, dict) else {}
+        scale = 10
+        weight = 100
+
     md = ["### Sistema de Criterios de Evaluación Vigente\n"]
-    for t_name, cfg in criteria_config.items():
+    for t_name, cfg in task_crit.items():
         v_ot = cfg.get('valor_a_tiempo', 1.0)
         v_lt = cfg.get('valor_tardio', 0.1)
         mult = cfg.get('multiplicar_por_aciertos', False)
@@ -412,7 +539,8 @@ def render_criteria_explanation(criteria_config):
 
         md.append(f"- **{t_name}:** {rule_pts}. {rule_int}")
 
-    md.append("\n- **Calificación del Bloque:** $\\left( \\frac{\\sum \\text{Puntos Ganados}}{\\sum \\text{Puntos Posibles}} \\right) \\times 10$, redondeado a 1 decimal.")
+    md.append(f"\n- **Escala Máxima:** **{scale}** | **Ponderación de Khan Academy:** **{weight:g}%**")
+    md.append(f"- **Fórmula del Bloque:** $\\left( \\frac{{\\sum \\text{{Puntos Ganados}}}}{{\\sum \\text{{Puntos Posibles}}}} \\right) \\times {scale} \\times \\left( \\frac{{{weight:g}}}{{100}} \\right)$, redondeado a 1 decimal.")
     return "\n".join(md)
 
 
@@ -422,23 +550,18 @@ def render_criteria_explanation(criteria_config):
 def apply_dynamic_grading(df, criteria_config):
     """
     Aplica las reglas de calificación y penalización dinámicamente según criteria_config,
-    sin recurrir a cadenas fijas ('Video', 'Artículo', etc.):
-    - Busca la configuración del 'Tipo de tarea' correspondiente.
-    - Si evaluar_intentos es True: penaliza cada intento > max_intentos restando 1 acierto.
-      Si la entrega es tardía Y los intentos > max_intentos, califica con 0 puntos.
-    - Si evaluar_intentos es False: no penaliza intentos.
-    - Si multiplicar_por_aciertos es True:
-        max_points = valor_a_tiempo * total_questions
-        earned_points = min(valor_elegido * effective_correct, valor_elegido * total_questions)
-    - Si multiplicar_por_aciertos es False:
-        max_points = valor_a_tiempo
-        earned_points = valor_elegido (si completado y no anulado)
+    sin recurrir a cadenas fijas ('Video', 'Artículo', etc.).
     """
     if df.empty:
         return df
 
+    if isinstance(criteria_config, dict) and 'task_criteria' in criteria_config:
+        cfg_dict = criteria_config['task_criteria']
+    else:
+        cfg_dict = criteria_config if isinstance(criteria_config, dict) else {}
+
     graded_rows = []
-    cfg_lookup = {k.strip().lower(): v for k, v in criteria_config.items()}
+    cfg_lookup = {str(k).strip().lower(): v for k, v in cfg_dict.items()}
 
     for _, row in df.iterrows():
         raw_type = str(row.get('Tipo de tarea', '')).strip()
@@ -574,14 +697,14 @@ def apply_dynamic_grading(df, criteria_config):
 # ==============================================================================
 # CLASIFICACIÓN DE RENDIMIENTO DEL ESTUDIANTE (ESTATUS)
 # ==============================================================================
-def classify_student(score):
+def classify_student(score, thresholds=None, scale=10):
     """
-    Clasifica el rendimiento del estudiante según su promedio general:
-    - 'Excelente': >= 9.5
-    - 'Bien': 8.5 a 9.49
-    - 'Regular': 7.0 a 8.49
-    - 'Mal': 6.0 a 6.99
-    - 'En riesgo': < 6.0
+    Clasifica el rendimiento del estudiante según su promedio general
+    usando los umbrales configurados por el docente:
+    - 'Excelente': >= min_excelente
+    - 'Bien': >= min_bien
+    - 'Regular': >= min_regular
+    - 'En riesgo': < min_regular
     """
     if pd.isna(score):
         return 'En riesgo'
@@ -590,14 +713,22 @@ def classify_student(score):
     except (ValueError, TypeError):
         return 'En riesgo'
 
-    if val >= 9.5:
+    scale = int(scale) if scale else 10
+    if thresholds and isinstance(thresholds, dict):
+        th_exc = float(thresholds.get('excelente', 9.5 if scale == 10 else 95.0))
+        th_bien = float(thresholds.get('bien', 8.0 if scale == 10 else 80.0))
+        th_reg = float(thresholds.get('regular', 6.0 if scale == 10 else 60.0))
+    else:
+        th_exc = 9.5 if scale == 10 else 95.0
+        th_bien = 8.0 if scale == 10 else 80.0
+        th_reg = 6.0 if scale == 10 else 60.0
+
+    if val >= th_exc:
         return 'Excelente'
-    elif val >= 8.5:
+    elif val >= th_bien:
         return 'Bien'
-    elif val >= 7.0:
+    elif val >= th_reg:
         return 'Regular'
-    elif val >= 6.0:
-        return 'Mal'
     else:
         return 'En riesgo'
 
@@ -703,6 +834,26 @@ def find_drive_item(service, name, parent_id, is_folder=None):
         return None
     except Exception as e:
         st.error(f"Error al buscar '{name}' en Google Drive: {e}")
+        return None
+
+
+@st.cache_data(ttl=3600)
+def get_cached_folder_id(folder_name):
+    """
+    Busca y cachea el ID de la subcarpeta del docente en Google Drive por 1 hora.
+    Previene llamadas repetidas a Drive API durante la selección de docentes o el inicio de sesión.
+    """
+    if not folder_name or str(ROOT_FOLDER_ID).startswith('PEGA_AQUÍ'):
+        return None
+    try:
+        service = get_drive_service()
+        if not service:
+            return None
+        folder_item = find_drive_item(service, folder_name, ROOT_FOLDER_ID, is_folder=True)
+        if folder_item:
+            return folder_item['id']
+        return None
+    except Exception:
         return None
 
 
@@ -1080,22 +1231,28 @@ def load_teacher_assignments(folder_id, criteria_config=None):
         return raw_df
     if criteria_config is None:
         unique_types = sorted([t for t in raw_df['Tipo de tarea'].dropna().unique() if t]) if 'Tipo de tarea' in raw_df.columns else []
-        criteria_config = load_criteria_config(unique_types)
+        criteria_config = load_teacher_criterios(folder_id, unique_types)
     return apply_dynamic_grading(raw_df.copy(), criteria_config)
 
 
 
 
-def compute_student_block_grades(assignments_df):
+def compute_student_block_grades(assignments_df, criterios_config=None):
     """
     Calcula la calificación por bloque (Fecha de entrega) para cada estudiante y grupo:
-    Block Grade = (Sum(Puntos Ganados) / Sum(Puntos Posibles)) * 10
+    Block Grade = (Sum(Puntos Ganados) / Sum(Puntos Posibles)) * scale * (weight / 100.0)
     Redondeado a 1 decimal.
     Si todas las tareas del bloque son futuras (status == 'Programada' y max_points == 0),
     la calificación del bloque se marca como NaN para no afectar el promedio del estudiante.
     """
     if assignments_df.empty:
         return pd.DataFrame()
+
+    scale = 10.0
+    weight = 100.0
+    if criterios_config and isinstance(criterios_config, dict):
+        scale = float(criterios_config.get('escala_maxima', 10))
+        weight = float(criterios_config.get('peso_khan', 100))
 
     block_summary = assignments_df.groupby(
         ['Grupo', 'Nombre del estudiante', 'Fecha de entrega'],
@@ -1110,7 +1267,8 @@ def compute_student_block_grades(assignments_df):
 
     def calc_grade(r):
         if r['max_sum'] > 0:
-            return round((r['earned_sum'] / r['max_sum'] * 10.0), 1)
+            raw_grade = (r['earned_sum'] / r['max_sum']) * scale * (weight / 100.0)
+            return round(raw_grade, 1)
         elif r.get('all_future', False):
             return float('nan')
         else:
@@ -1140,7 +1298,12 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
     ]) if 'Tipo de tarea' in student_data.columns else []
 
     if criteria_config is None:
-        criteria_config = load_criteria_config(available_types)
+        criteria_config = load_teacher_criterios(None, available_types)
+
+    scale = int(criteria_config.get('escala_maxima', 10)) if isinstance(criteria_config, dict) else 10
+    weight = float(criteria_config.get('peso_khan', 100)) if isinstance(criteria_config, dict) else 100.0
+    thresholds = criteria_config.get('thresholds', {}) if isinstance(criteria_config, dict) else {}
+    min_pass = float(thresholds.get('regular', 6.0 if scale == 10 else 60.0))
 
     # --------------------------------------------------------------------------
     # Filtros superiores (Parcial y Tipo de Actividad dinámico)
@@ -1184,7 +1347,7 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
     ontime_tasks = completed_tasks - late_tasks
 
     # Promedio del estudiante para el filtro activo (excluyendo bloques futuros)
-    active_blocks = compute_student_block_grades(active_data)
+    active_blocks = compute_student_block_grades(active_data, criteria_config)
     valid_blocks = active_blocks['block_grade'].dropna()
     overall_avg = valid_blocks.mean() if not valid_blocks.empty else 0.0
 
@@ -1194,7 +1357,7 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
         st.markdown(f"""
         <div class="stat-card">
             <div class="stat-title">{title_avg}</div>
-            <div class="stat-val" style="color: {'#16a34a' if overall_avg >= 7.0 else '#dc2626'};">{overall_avg:.1f} <span style="font-size: 1rem; color: #64748b;">/ 10</span></div>
+            <div class="stat-val" style="color: {'#16a34a' if overall_avg >= min_pass else '#dc2626'};">{overall_avg:.1f} <span style="font-size: 1rem; color: #64748b;">/ {scale}</span></div>
         </div>
         """, unsafe_allow_html=True)
     with kpi_col2:
@@ -1256,12 +1419,12 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
         is_block_all_future = (block_df['status'] == 'Programada').all() if not block_df.empty else False
 
         if block_max_total > 0:
-            block_grade = round((block_earned_total / block_max_total * 10.0), 1)
+            block_grade = round((block_earned_total / block_max_total) * scale * (weight / 100.0), 1)
             grade_str = f"{block_grade:.1f}"
-            grade_color = '#16a34a' if block_grade >= 7.0 else '#dc2626'
-            progress_val = min(1.0, max(0.0, block_grade / 10.0))
+            grade_color = '#16a34a' if block_grade >= min_pass else '#dc2626'
+            progress_val = min(1.0, max(0.0, block_grade / float(scale)))
             pts_display = f"<strong>{block_earned_total:.1f} / {block_max_total:.1f}</strong>"
-            grade_suffix = "<span style='font-size: 0.95rem; color: #64748b;'> / 10</span>"
+            grade_suffix = f"<span style='font-size: 0.95rem; color: #64748b;'> / {scale}</span>"
         elif is_block_all_future:
             block_grade = None
             grade_str = "Programada"
@@ -1275,7 +1438,7 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
             grade_color = '#dc2626'
             progress_val = 0.0
             pts_display = f"<strong>{block_earned_total:.1f} / {block_max_total:.1f}</strong>"
-            grade_suffix = "<span style='font-size: 0.95rem; color: #64748b;'> / 10</span>"
+            grade_suffix = f"<span style='font-size: 0.95rem; color: #64748b;'> / {scale}</span>"
 
         # Filtrar solo para visualización en tabla si seleccionó tipo
         if tipo_filtro != "Todas las actividades":
@@ -1439,34 +1602,36 @@ def render_login():
             else:
                 selected_asig = "Temas Selectos de Matemáticas II"
 
+            # Pre-resolver la subcarpeta y pre-cargar credenciales en memoria
+            # para garantizar CERO llamadas a Google Drive API al presionar el botón
+            matched_teacher_asig = teacher_df[teacher_df['asignatura'] == selected_asig] if not teacher_df.empty else pd.DataFrame()
+            folder_name = matched_teacher_asig.iloc[0]['carpeta_nombre'] if not matched_teacher_asig.empty else ""
+            cached_folder_id = get_cached_folder_id(folder_name) if folder_name else None
+            cached_creds_df = load_teacher_credentials(cached_folder_id)
+
             with st.form("student_login_form", clear_on_submit=False):
                 username_input = st.text_input("Usuario Khan Academy", placeholder="ej. alboresclementepaulo", key="login_st_user").strip()
                 password_input = st.text_input("Contraseña", type="password", placeholder="••••••••", key="login_st_pass").strip()
                 submit_st_btn = st.form_submit_button("Ingresar como Estudiante", use_container_width=True, type="primary")
 
                 if submit_st_btn:
+                    # Debounce contra clics rápidos / spam del botón
+                    now_ts = time.time()
+                    last_click_ts = st.session_state.get('last_student_login_ts', 0)
+                    if now_ts - last_click_ts < 0.5:
+                        time.sleep(0.5)
+                    st.session_state['last_student_login_ts'] = time.time()
+
                     if not username_input or not password_input:
                         st.error("Por favor completa tu usuario y contraseña.")
                     else:
-                        folder_id = None
-                        folder_name = ""
-                        if not teacher_df.empty:
-                            matched_teacher_asig = teacher_df[teacher_df['asignatura'] == selected_asig]
-                            if not matched_teacher_asig.empty:
-                                folder_name = matched_teacher_asig.iloc[0]['carpeta_nombre']
-                                if service and not str(ROOT_FOLDER_ID).startswith('PEGA_AQUÍ'):
-                                    t_item = find_drive_item(service, folder_name, ROOT_FOLDER_ID, is_folder=True)
-                                    if t_item:
-                                        folder_id = t_item['id']
-                                    else:
-                                        st.error(f"No se localizó la subcarpeta '{folder_name}' en Google Drive para el docente y materia seleccionados.")
-                                        return
-
-                        creds_df = load_teacher_credentials(folder_id)
-                        if not creds_df.empty:
-                            matched = creds_df[
-                                (creds_df['Usuario'].str.lower() == username_input.lower()) &
-                                (creds_df['Contraseña'] == password_input)
+                        # Autenticación estrictamente en memoria contra el dataframe ya cargado en RAM
+                        if cached_creds_df.empty:
+                            st.error(f"No se encontraron credenciales para la asignatura '{selected_asig}' del docente '{selected_teacher}'. Contacta al docente.")
+                        else:
+                            matched = cached_creds_df[
+                                (cached_creds_df['Usuario'].str.lower() == username_input.lower()) &
+                                (cached_creds_df['Contraseña'] == password_input)
                             ]
                             if not matched.empty:
                                 student_name = matched.iloc[0]['Nombre del estudiante']
@@ -1479,13 +1644,11 @@ def render_login():
                                 st.session_state['teacher_email'] = teacher_email
                                 st.session_state['asignatura'] = selected_asig
                                 st.session_state['carpeta_nombre'] = folder_name
-                                st.session_state['teacher_folder_id'] = folder_id
+                                st.session_state['teacher_folder_id'] = cached_folder_id
                                 st.success(f"Bienvenido(a), {student_name}")
                                 st.rerun()
                             else:
                                 st.error(f"Usuario o contraseña incorrectos para el docente '{selected_teacher}'.")
-                        else:
-                            st.error(f"No se encontraron credenciales para la asignatura '{selected_asig}' del docente '{selected_teacher}'. Contacta al docente.")
 
         # ----------------------------------------------------------------------
         # 2. ACCESO DOCENTES (ENRUTAMIENTO MAESTRO)
@@ -1499,6 +1662,13 @@ def render_login():
                 submit_doc_btn = st.form_submit_button("Ingresar al Panel Docente", use_container_width=True, type="primary")
 
                 if submit_doc_btn:
+                    # Debounce contra clics repetidos
+                    now_ts = time.time()
+                    last_click_ts = st.session_state.get('last_teacher_login_ts', 0)
+                    if now_ts - last_click_ts < 0.5:
+                        time.sleep(0.5)
+                    st.session_state['last_teacher_login_ts'] = time.time()
+
                     if not doc_user_input or not doc_pass_input:
                         st.error("Por favor completa ambos campos.")
                     else:
@@ -1515,14 +1685,7 @@ def render_login():
                             asig_name = doc_row['asignatura']
                             teacher_full_name = doc_row.get('Nombre del Docente', doc_row['usuario_docente'])
                             teacher_email = doc_row.get('e_mail', '')
-                            folder_id = None
-                            if service and not str(ROOT_FOLDER_ID).startswith('PEGA_AQUÍ'):
-                                t_item = find_drive_item(service, folder_name, ROOT_FOLDER_ID, is_folder=True)
-                                if t_item:
-                                    folder_id = t_item['id']
-                                else:
-                                    st.error(f"No se encontró la subcarpeta '{folder_name}' en Google Drive para este docente.")
-                                    return
+                            folder_id = get_cached_folder_id(folder_name) if folder_name else None
 
                             st.session_state['logged_in'] = True
                             st.session_state['role'] = 'admin'
@@ -1604,96 +1767,191 @@ def render_admin():
     else:
         unique_task_types = ['Video', 'Ejercicio', 'Artículo']
 
-    saved_criteria_config = load_criteria_config(unique_task_types)
-
+    # Cargar configuración persistente e independiente del docente desde Google Drive (criterios.json)
+    criterios_data = load_teacher_criterios(teacher_folder_id, unique_task_types)
+    active_scale = int(criterios_data.get('escala_maxima', 10))
+    active_peso = float(criterios_data.get('peso_khan', 100))
+    active_thresholds = criterios_data.get('thresholds', {})
+    saved_task_criteria = criterios_data.get('task_criteria', {})
 
     # --------------------------------------------------------------------------
     # SECCIÓN 1: CONFIGURACIONES (CRITERIOS, PARCIALES Y CARGA DE ARCHIVOS)
     # --------------------------------------------------------------------------
-    with st.expander("⚙️ Configuración de Criterios de Evaluación", expanded=False):
-        st.caption("Configura en tiempo real los puntajes a tiempo, tardíos, multiplicación por aciertos y límite de intentos libres para cada tipo de tarea detectado en los datos.")
+    with st.expander("⚙️ Configuración de Evaluación y Criterios (criterios.json)", expanded=False):
+        st.caption("Configura de forma persistente e independiente para tu materia la escala máxima, el peso de Khan Academy, los umbrales de rendimiento y los criterios por actividad en tu Google Drive.")
 
-        current_criteria = {}
-        for t_idx, task_type in enumerate(unique_task_types):
-            cfg_t = saved_criteria_config.get(task_type, {})
-            st.markdown(f"##### 📌 Tipo de Tarea: `{task_type}`")
-            c1, c2, c3, c4, c5 = st.columns([1.5, 1.5, 2, 1.8, 1.8])
-            with c1:
-                v_tiempo = st.number_input(
-                    "Valor a tiempo",
-                    min_value=0.0,
-                    value=float(st.session_state.get(f"crit_ot_{task_type}", cfg_t.get('valor_a_tiempo', 1.0))),
-                    step=0.5,
-                    key=f"crit_ot_{task_type}"
+        tab_gral, tab_tasks = st.tabs(["🎯 Escala, Peso y Clasificación", "📌 Criterios por Tipo de Tarea"])
+
+        with tab_gral:
+            st.markdown("##### 📏 Escala de Calificación y Ponderación")
+            cg1, cg2 = st.columns(2)
+            with cg1:
+                sel_scale = st.radio(
+                    "Escala Máxima:",
+                    options=[10, 100],
+                    index=0 if active_scale == 10 else 1,
+                    horizontal=True,
+                    help="Define si la escala final de evaluación es de 0 a 10 o de 0 a 100.",
+                    key="cfg_escala_maxima"
                 )
-            with c2:
-                v_tardio = st.number_input(
-                    "Valor tardío",
-                    min_value=0.0,
-                    value=float(st.session_state.get(f"crit_lt_{task_type}", cfg_t.get('valor_tardio', 0.1))),
-                    step=0.05,
-                    key=f"crit_lt_{task_type}"
-                )
-            with c3:
-                st.write("")
-                st.write("")
-                mult = st.checkbox(
-                    "Multiplicar por aciertos",
-                    value=bool(st.session_state.get(f"crit_mult_{task_type}", cfg_t.get('multiplicar_por_aciertos', False))),
-                    key=f"crit_mult_{task_type}",
-                    help="Si se activa, el valor base se multiplica por las preguntas correctas. Si no, es un puntaje fijo (ej. videos o lecturas)."
-                )
-            with c4:
-                st.write("")
-                st.write("")
-                eval_int = st.checkbox(
-                    "Evaluar intentos",
-                    value=bool(st.session_state.get(f"crit_eval_int_{task_type}", cfg_t.get('evaluar_intentos', False))),
-                    key=f"crit_eval_int_{task_type}",
-                    help="Si se activa, se penalizan los intentos que excedan el límite configurado."
-                )
-            with c5:
-                max_int = st.number_input(
-                    "Máx. intentos libres",
-                    min_value=1,
-                    max_value=10,
-                    value=int(st.session_state.get(f"crit_max_int_{task_type}", cfg_t.get('max_intentos', 3))),
-                    step=1,
-                    disabled=not eval_int,
-                    key=f"crit_max_int_{task_type}",
-                    help="Intentos libres permitidos. Cada intento adicional resta 1 acierto. Si es tardía y supera este límite, la nota es 0."
+            with cg2:
+                sel_peso = st.slider(
+                    "Ponderación de Khan Academy (%):",
+                    min_value=0,
+                    max_value=100,
+                    value=int(active_peso),
+                    step=5,
+                    help="Porcentaje con el que las tareas de Khan Academy contribuyen a la calificación final (ej. si es 80%, la calificación máxima en Khan Academy es el 80% de la escala).",
+                    key="cfg_peso_khan"
                 )
 
-            current_criteria[task_type] = {
-                'valor_a_tiempo': v_tiempo,
-                'valor_tardio': v_tardio,
-                'multiplicar_por_aciertos': mult,
-                'evaluar_intentos': eval_int,
-                'max_intentos': max_int
-            }
-            if t_idx < len(unique_task_types) - 1:
-                st.divider()
+            perfect_khan_score = round(sel_scale * (sel_peso / 100.0), 1)
+            st.info(f"💡 **Cálculo de Ponderación:** Con una escala de **{sel_scale}** y peso del **{sel_peso}%**, un alumno con puntaje perfecto (100%) en Khan Academy obtendrá **{perfect_khan_score:.1f} / {sel_scale}**.")
+
+            st.markdown("---")
+            st.markdown("##### 🏆 Clasificación de Rendimiento Académico (Umbrales)")
+            st.caption("Define el puntaje mínimo o de corte para clasificar a los estudiantes en el concentrado:")
+
+            th_defaults = get_default_teacher_criterios(scale=sel_scale)['thresholds']
+            cur_th = active_thresholds if active_thresholds else th_defaults
+
+            def_exc = float(cur_th.get('excelente', th_defaults['excelente']))
+            def_bien = float(cur_th.get('bien', th_defaults['bien']))
+            def_reg = float(cur_th.get('regular', th_defaults['regular']))
+            def_riesgo = float(cur_th.get('en_riesgo', th_defaults['en_riesgo']))
+
+            if sel_scale == 100 and def_exc <= 10.0:
+                def_exc, def_bien, def_reg, def_riesgo = 95.0, 80.0, 60.0, 60.0
+            elif sel_scale == 10 and def_exc > 10.0:
+                def_exc, def_bien, def_reg, def_riesgo = 9.5, 8.0, 6.0, 6.0
+
+            u_col1, u_col2, u_col3, u_col4 = st.columns(4)
+            with u_col1:
+                th_input_exc = st.number_input(
+                    "🌟 'Excelente' (Mínimo)",
+                    min_value=0.0,
+                    max_value=float(sel_scale),
+                    value=def_exc,
+                    step=0.5 if sel_scale == 10 else 1.0,
+                    key=f"th_exc_{sel_scale}"
+                )
+            with u_col2:
+                th_input_bien = st.number_input(
+                    "👍 'Bien' (Mínimo)",
+                    min_value=0.0,
+                    max_value=float(sel_scale),
+                    value=def_bien,
+                    step=0.5 if sel_scale == 10 else 1.0,
+                    key=f"th_bien_{sel_scale}"
+                )
+            with u_col3:
+                th_input_reg = st.number_input(
+                    "👌 'Regular' (Mínimo)",
+                    min_value=0.0,
+                    max_value=float(sel_scale),
+                    value=def_reg,
+                    step=0.5 if sel_scale == 10 else 1.0,
+                    key=f"th_reg_{sel_scale}"
+                )
+            with u_col4:
+                th_input_riesgo = st.number_input(
+                    "🚨 'En riesgo' (Menor a)",
+                    min_value=0.0,
+                    max_value=float(sel_scale),
+                    value=def_riesgo,
+                    step=0.5 if sel_scale == 10 else 1.0,
+                    key=f"th_riesgo_{sel_scale}"
+                )
+
+        with tab_tasks:
+            st.markdown("##### 📌 Criterios de Calificación por Tipo de Tarea")
+            current_task_criteria = {}
+            for t_idx, task_type in enumerate(unique_task_types):
+                cfg_t = saved_task_criteria.get(task_type, {})
+                st.markdown(f"###### Actividad: `{task_type}`")
+                c1, c2, c3, c4, c5 = st.columns([1.5, 1.5, 2, 1.8, 1.8])
+                with c1:
+                    v_tiempo = st.number_input(
+                        "Valor a tiempo",
+                        min_value=0.0,
+                        value=float(cfg_t.get('valor_a_tiempo', 1.0)),
+                        step=0.5,
+                        key=f"crit_ot_{task_type}"
+                    )
+                with c2:
+                    v_tardio = st.number_input(
+                        "Valor tardío",
+                        min_value=0.0,
+                        value=float(cfg_t.get('valor_tardio', 0.1)),
+                        step=0.05,
+                        key=f"crit_lt_{task_type}"
+                    )
+                with c3:
+                    st.write("")
+                    st.write("")
+                    mult = st.checkbox(
+                        "Multiplicar por aciertos",
+                        value=bool(cfg_t.get('multiplicar_por_aciertos', False)),
+                        key=f"crit_mult_{task_type}",
+                        help="Si se activa, el valor base se multiplica por las preguntas correctas. Si no, es un puntaje fijo (ej. videos o lecturas)."
+                    )
+                with c4:
+                    st.write("")
+                    st.write("")
+                    eval_int = st.checkbox(
+                        "Evaluar intentos",
+                        value=bool(cfg_t.get('evaluar_intentos', False)),
+                        key=f"crit_eval_int_{task_type}",
+                        help="Si se activa, se penalizan los intentos que excedan el límite configurado."
+                    )
+                with c5:
+                    max_int = st.number_input(
+                        "Máx. intentos libres",
+                        min_value=1,
+                        max_value=10,
+                        value=int(cfg_t.get('max_intentos', 3)),
+                        step=1,
+                        disabled=not eval_int,
+                        key=f"crit_max_int_{task_type}",
+                        help="Intentos libres permitidos. Cada intento adicional resta 1 acierto. Si es tardía y supera este límite, la nota es 0."
+                    )
+
+                current_task_criteria[task_type] = {
+                    'valor_a_tiempo': v_tiempo,
+                    'valor_tardio': v_tardio,
+                    'multiplicar_por_aciertos': mult,
+                    'evaluar_intentos': eval_int,
+                    'max_intentos': max_int
+                }
+                if t_idx < len(unique_task_types) - 1:
+                    st.divider()
 
         st.write("")
-        b_col1, b_col2, _ = st.columns([1.5, 1.8, 3])
+        b_col1, b_col2, _ = st.columns([2.5, 2.2, 2.5])
         with b_col1:
-            if st.button("💾 Guardar Criterios", type="primary", use_container_width=True, key="save_crit_btn"):
-                save_criteria_config(current_criteria)
-                st.session_state['active_criteria_config'] = current_criteria
-                st.success("✅ Criterios guardados permanentemente en config_criterios.json.")
+            if st.button("💾 Guardar Configuración en Google Drive", type="primary", use_container_width=True, key="save_teacher_crit_btn"):
+                updated_criterios = {
+                    'escala_maxima': sel_scale,
+                    'peso_khan': sel_peso,
+                    'thresholds': {
+                        'excelente': th_input_exc,
+                        'bien': th_input_bien,
+                        'regular': th_input_reg,
+                        'en_riesgo': th_input_riesgo
+                    },
+                    'task_criteria': current_task_criteria
+                }
+                save_teacher_criterios(teacher_folder_id, updated_criterios)
+                st.cache_data.clear()
+                st.success("✅ Configuración guardada exitosamente en Google Drive (criterios.json).")
                 st.rerun()
+
         with b_col2:
-            if st.button("🔄 Restablecer Predeterminados", use_container_width=True, key="reset_crit_btn"):
-                defaults = get_default_criteria_config(unique_task_types)
-                save_criteria_config(defaults)
-                for t in unique_task_types:
-                    st.session_state[f"crit_ot_{t}"] = defaults[t]['valor_a_tiempo']
-                    st.session_state[f"crit_lt_{t}"] = defaults[t]['valor_tardio']
-                    st.session_state[f"crit_mult_{t}"] = defaults[t]['multiplicar_por_aciertos']
-                    st.session_state[f"crit_eval_int_{t}"] = defaults[t]['evaluar_intentos']
-                    st.session_state[f"crit_max_int_{t}"] = defaults[t]['max_intentos']
-                st.session_state['active_criteria_config'] = defaults
-                st.info("Valores predeterminados restablecidos.")
+            if st.button("🔄 Restablecer Predeterminados", use_container_width=True, key="reset_teacher_crit_btn"):
+                def_crit = get_default_teacher_criterios(unique_task_types, scale=sel_scale)
+                save_teacher_criterios(teacher_folder_id, def_crit)
+                st.cache_data.clear()
+                st.info("Configuración restablecida a los valores predeterminados.")
                 st.rerun()
 
     col_cfg1, col_cfg2 = st.columns(2)
@@ -1842,8 +2100,18 @@ def render_admin():
         st.warning("No hay tareas registradas en la carpeta `datos/`.")
         return
 
-    # Criterios activos (en tiempo real desde widgets o guardados)
-    active_criteria_config = current_criteria if current_criteria else saved_criteria_config
+    # Criterios activos completos en tiempo real
+    active_criteria_config = {
+        'escala_maxima': sel_scale,
+        'peso_khan': sel_peso,
+        'thresholds': {
+            'excelente': th_input_exc,
+            'bien': th_input_bien,
+            'regular': th_input_reg,
+            'en_riesgo': th_input_riesgo
+        },
+        'task_criteria': current_task_criteria
+    }
 
     # Calificación dinámica en tiempo real según los criterios activos
     all_assignments = apply_dynamic_grading(raw_assignments.copy(), active_criteria_config)
@@ -1892,8 +2160,8 @@ def render_admin():
         st.warning("No se encontraron registros para los filtros seleccionados.")
         return
 
-    # Calcular bloques para los datos filtrados
-    block_summary = compute_student_block_grades(active_master)
+    # Calcular bloques para los datos filtrados con la escala y peso activos
+    block_summary = compute_student_block_grades(active_master, active_criteria_config)
 
     # Orden cronológico de las columnas de fecha
     date_order = (
@@ -1920,8 +2188,10 @@ def render_admin():
     numeric_only = pivot_df[existing_date_cols]
     pivot_df['Promedio General'] = numeric_only.mean(axis=1, skipna=True).round(1).fillna(0.0)
 
-    # NUEVO: Crear columna 'Estatus' que clasifica al estudiante según su promedio general
-    pivot_df['Estatus'] = pivot_df['Promedio General'].apply(classify_student)
+    # Clasificación de rendimiento (Estatus) usando la escala y umbrales configurados
+    pivot_df['Estatus'] = pivot_df['Promedio General'].apply(
+        lambda s: classify_student(s, active_criteria_config['thresholds'], active_criteria_config['escala_maxima'])
+    )
 
     # Organizar columnas: 'Estatus' al lado del nombre del estudiante
     column_arrangement = ['Grupo', 'Nombre del estudiante', 'Estatus'] + existing_date_cols + ['Promedio General']
@@ -1932,33 +2202,29 @@ def render_admin():
         pivot_df = pivot_df[pivot_df['Nombre del estudiante'].str.contains(search_student, case=False, na=False)]
 
     # --------------------------------------------------------------------------
-    # MÉTRICAS Y RESUMEN RÁPIDO DE LAS 5 CATEGORÍAS DE RENDIMIENTO
+    # MÉTRICAS Y RESUMEN RÁPIDO DE RENDIMIENTO ACADÉMICO
     # --------------------------------------------------------------------------
     st.markdown("#### 🎯 Distribución de Rendimiento Académico")
     estatus_counts = pivot_df['Estatus'].value_counts()
     c_exc = int(estatus_counts.get('Excelente', 0))
     c_bien = int(estatus_counts.get('Bien', 0))
     c_reg = int(estatus_counts.get('Regular', 0))
-    c_mal = int(estatus_counts.get('Mal', 0))
     c_riesgo = int(estatus_counts.get('En riesgo', 0))
     total_st = len(pivot_df)
 
-    col_e1, col_e2, col_e3, col_e4, col_e5 = st.columns(5)
+    col_e1, col_e2, col_e3, col_e4 = st.columns(4)
     with col_e1:
         pct = (c_exc / total_st * 100) if total_st else 0
-        st.metric("🌟 Excelente (≥ 9.5)", f"{c_exc}", f"{pct:.0f}% alumnos")
+        st.metric(f"🌟 Excelente (≥ {th_input_exc:.1f})", f"{c_exc}", f"{pct:.0f}% alumnos")
     with col_e2:
         pct = (c_bien / total_st * 100) if total_st else 0
-        st.metric("👍 Bien (8.5 - 9.4)", f"{c_bien}", f"{pct:.0f}% alumnos")
+        st.metric(f"👍 Bien (≥ {th_input_bien:.1f})", f"{c_bien}", f"{pct:.0f}% alumnos")
     with col_e3:
         pct = (c_reg / total_st * 100) if total_st else 0
-        st.metric("👌 Regular (7.0 - 8.4)", f"{c_reg}", f"{pct:.0f}% alumnos")
+        st.metric(f"👌 Regular (≥ {th_input_reg:.1f})", f"{c_reg}", f"{pct:.0f}% alumnos")
     with col_e4:
-        pct = (c_mal / total_st * 100) if total_st else 0
-        st.metric("⚠️ Mal (6.0 - 6.9)", f"{c_mal}", f"{pct:.0f}% alumnos")
-    with col_e5:
         pct = (c_riesgo / total_st * 100) if total_st else 0
-        st.metric("🚨 En riesgo (< 6.0)", f"{c_riesgo}", f"{pct:.0f}% alumnos")
+        st.metric(f"🚨 En riesgo (< {th_input_riesgo:.1f})", f"{c_riesgo}", f"{pct:.0f}% alumnos")
 
     st.write("")
 
@@ -2030,10 +2296,10 @@ def render_admin():
     student_group = student_tasks_data['Grupo'].iloc[0] if not student_tasks_data.empty else "N/A"
 
     # Calcular promedio del estudiante en todos los bloques (omitiendo futuros)
-    st_blocks = compute_student_block_grades(student_tasks_data)
+    st_blocks = compute_student_block_grades(student_tasks_data, active_criteria_config)
     valid_st_blocks = st_blocks['block_grade'].dropna()
     st_avg = valid_st_blocks.mean() if not valid_st_blocks.empty else 0.0
-    st_estatus = classify_student(st_avg)
+    st_estatus = classify_student(st_avg, active_criteria_config['thresholds'], active_criteria_config['escala_maxima'])
 
     with drill_col2:
         st.write("")
@@ -2153,8 +2419,8 @@ def render_student():
     else:
         unique_task_types = ['Video', 'Ejercicio', 'Artículo']
 
-    saved_criteria_config = load_criteria_config(unique_task_types)
-    all_assignments = apply_dynamic_grading(raw_assignments.copy(), saved_criteria_config)
+    criterios_data = load_teacher_criterios(teacher_folder_id, unique_task_types)
+    all_assignments = apply_dynamic_grading(raw_assignments.copy(), criterios_data)
     active_parcial_config = load_parciales_config()
 
     # CRÍTICO: Asignar Parciales vectorialmente comparando .dt.date contra datetime.date
@@ -2183,7 +2449,7 @@ def render_student():
         st.warning("No hay tareas registradas en el sistema para esta asignatura. Contacta al docente.")
         return
 
-    render_student_dashboard(student_name, student_tasks, criteria_config=saved_criteria_config, is_admin_drilldown=False)
+    render_student_dashboard(student_name, student_tasks, criteria_config=criterios_data, is_admin_drilldown=False)
 
 
 
