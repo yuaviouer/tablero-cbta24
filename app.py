@@ -783,15 +783,15 @@ def load_docentes_master():
     """
     service = get_drive_service()
     if not service or str(ROOT_FOLDER_ID).startswith('PEGA_AQUÍ'):
-        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente'])
+        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail'])
 
     doc_file = find_drive_item(service, "docentes.xlsx", ROOT_FOLDER_ID, is_folder=False)
     if not doc_file:
-        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente'])
+        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail'])
 
     df = read_drive_excel(service, doc_file['id'])
     if df.empty:
-        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente'])
+        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail'])
 
     df.columns = [str(c).strip() for c in df.columns]
     rename_map = {}
@@ -809,12 +809,16 @@ def load_docentes_master():
             rename_map[col] = 'Nombre del Docente'
         elif 'docente' in cl or 'profesor' in cl or 'maestro' in cl:
             rename_map[col] = 'Nombre del Docente'
+        elif 'mail' in cl or 'correo' in cl:
+            rename_map[col] = 'e_mail'
     df = df.rename(columns=rename_map)
 
     if 'Nombre del Docente' not in df.columns:
         df['Nombre del Docente'] = df.get('usuario_docente', 'Docente')
+    if 'e_mail' not in df.columns:
+        df['e_mail'] = ''
 
-    for req in ['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente']:
+    for req in ['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail']:
         if req not in df.columns:
             df[req] = ''
         else:
@@ -825,7 +829,7 @@ def load_docentes_master():
         axis=1
     )
 
-    return df[['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente']]
+    return df[['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail']]
 
 
 def normalize_credentials_df(df):
@@ -1409,11 +1413,13 @@ def render_login():
                             ]
                             if not matched.empty:
                                 student_name = matched.iloc[0]['Nombre del estudiante']
+                                teacher_email = matched_teacher_asig.iloc[0].get('e_mail', '') if not matched_teacher_asig.empty else ''
                                 st.session_state['logged_in'] = True
                                 st.session_state['role'] = 'student'
                                 st.session_state['username'] = username_input
                                 st.session_state['student_name'] = student_name
                                 st.session_state['teacher_name'] = selected_teacher
+                                st.session_state['teacher_email'] = teacher_email
                                 st.session_state['asignatura'] = selected_asig
                                 st.session_state['carpeta_nombre'] = folder_name
                                 st.session_state['teacher_folder_id'] = folder_id
@@ -1451,6 +1457,7 @@ def render_login():
                             folder_name = doc_row['carpeta_nombre']
                             asig_name = doc_row['asignatura']
                             teacher_full_name = doc_row.get('Nombre del Docente', doc_row['usuario_docente'])
+                            teacher_email = doc_row.get('e_mail', '')
                             folder_id = None
                             if service and not str(ROOT_FOLDER_ID).startswith('PEGA_AQUÍ'):
                                 t_item = find_drive_item(service, folder_name, ROOT_FOLDER_ID, is_folder=True)
@@ -1464,6 +1471,7 @@ def render_login():
                             st.session_state['role'] = 'admin'
                             st.session_state['username'] = doc_row['usuario_docente']
                             st.session_state['teacher_name'] = teacher_full_name
+                            st.session_state['teacher_email'] = teacher_email
                             st.session_state['student_name'] = f"Prof. {teacher_full_name}"
                             st.session_state['asignatura'] = asig_name
                             st.session_state['carpeta_nombre'] = folder_name
@@ -1476,6 +1484,7 @@ def render_login():
                             st.session_state['role'] = 'admin'
                             st.session_state['username'] = ADMIN_USERNAME
                             st.session_state['teacher_name'] = "Administrador General"
+                            st.session_state['teacher_email'] = ""
                             st.session_state['student_name'] = "Profesor / Administrador General"
                             st.session_state['asignatura'] = "Temas Selectos de Matemáticas II"
                             st.session_state['carpeta_nombre'] = "datos (Local)"
@@ -1499,12 +1508,22 @@ def render_admin():
     carpeta_nombre = st.session_state.get('carpeta_nombre', 'Google Drive')
 
     teacher_name = st.session_state.get('teacher_name', st.session_state.get('username', 'Profesor'))
+    teacher_email = st.session_state.get('teacher_email', '')
+    if not teacher_email:
+        docentes_df = load_docentes_master()
+        if not docentes_df.empty and 'usuario_docente' in docentes_df.columns:
+            m = docentes_df[docentes_df['usuario_docente'].str.lower() == str(st.session_state.get('username', '')).lower()]
+            if not m.empty:
+                teacher_email = m.iloc[0].get('e_mail', '')
+                st.session_state['teacher_email'] = teacher_email
+
+    email_display = f" | Correo: <code>{teacher_email}</code>" if teacher_email else ""
     header_col1, header_col2 = st.columns([5, 1])
     with header_col1:
         st.markdown(f"""
         <div class="main-header" style="background: linear-gradient(135deg, #0f172a 0%, #334155 100%);">
             <h1>🛡️ Panel Docente - {asignatura}</h1>
-            <p>Docente: <strong>{teacher_name}</strong> | Carpeta Drive: <code>{carpeta_nombre}</code> | Sincronización en memoria</p>
+            <p>Docente: <strong>{teacher_name}</strong>{email_display} | Carpeta Drive: <code>{carpeta_nombre}</code> | Sincronización en memoria</p>
         </div>
         """, unsafe_allow_html=True)
     with header_col2:
@@ -1655,9 +1674,15 @@ def render_admin():
     with col_cfg2:
         with st.expander("☁️ Sincronización con Google Drive", expanded=True):
             st.markdown(f"**Carpeta asignada en Google Drive:** `📁 {carpeta_nombre}`")
+            if teacher_email:
+                st.markdown(f"**Acceso exclusivo asignado a:** `📧 {teacher_email}`")
+
             if teacher_folder_id:
+                drive_folder_url = f"https://drive.google.com/drive/folders/{teacher_folder_id}"
                 st.success("🟢 Conexión activa con Google Drive (Lectura en memoria sin almacenamiento en disco).")
+                st.link_button(f"📂 Abrir Carpeta '{carpeta_nombre}' en Google Drive", drive_folder_url, use_container_width=True)
             else:
+                drive_folder_url = "https://drive.google.com"
                 st.info("ℹ️ Sesión en modo local/administrador general.")
 
             if st.button("🔄 Sincronizar / Refrescar Datos de Google Drive", use_container_width=True, type="primary", key="admin_refresh_drive_btn"):
@@ -1668,10 +1693,13 @@ def render_admin():
             st.markdown("---")
             st.markdown("##### 📋 Instrucciones para Actualizar Datos en Google Drive")
             st.markdown(f"""
-            1. **Tareas de Khan Academy:** Descarga los reportes CSV desde Khan Academy y colócalos dentro de la carpeta **`{carpeta_nombre}`** en tu [Google Drive (drive.google.com)](https://drive.google.com).
+            1. **Tareas de Khan Academy:** Descarga los reportes CSV desde Khan Academy y colócalos directamente dentro de tu carpeta **[{carpeta_nombre}]({drive_folder_url})** en Google Drive.
             2. **Credenciales de Alumnos:** Guarda tu archivo **`credenciales.xlsx`** dentro de la misma carpeta.
             3. **Sincronización:** Una vez copiados tus archivos en Google Drive, presiona el botón **'🔄 Sincronizar / Refrescar Datos de Google Drive'** de arriba para recalcular el concentrado y el drill-down al instante.
             """)
+
+            if teacher_email:
+                st.info(f"🔒 **Seguridad y Acceso Restringido:** El enlace anterior conduce de forma directa a tu carpeta. Solo la cuenta de Google registrada (**{teacher_email}**) tiene permisos para acceder y editar los documentos de esta carpeta. Cualquier otra persona que intente abrir este enlace tendrá el acceso denegado por Google Drive.")
 
             st.markdown("---")
             st.markdown("##### 📥 Plantilla de Credenciales (`credenciales.xlsx`)")
@@ -2068,6 +2096,7 @@ def main():
         st.session_state['username'] = None
         st.session_state['student_name'] = None
         st.session_state['teacher_name'] = None
+        st.session_state['teacher_email'] = None
         st.session_state['asignatura'] = None
         st.session_state['carpeta_nombre'] = None
         st.session_state['teacher_folder_id'] = None
