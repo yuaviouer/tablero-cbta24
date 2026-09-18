@@ -13,7 +13,7 @@ import pandas as pd
 import streamlit as st
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from googleapiclient.errors import HttpError
 
 # ==============================================================================
@@ -624,7 +624,7 @@ def get_drive_service():
 
         credentials = service_account.Credentials.from_service_account_info(
             creds_dict,
-            scopes=['https://www.googleapis.com/auth/drive.readonly']
+            scopes=['https://www.googleapis.com/auth/drive']
         )
         return build('drive', 'v3', credentials=credentials)
     except Exception as e:
@@ -695,6 +695,12 @@ def find_drive_item(service, name, parent_id, is_folder=None):
         if files:
             return files[0]
         return None
+    except HttpError as e:
+        if getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
+            st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
+        else:
+            st.error(f"Error de Google Drive API al buscar '{name}': {e}")
+        return None
     except Exception as e:
         st.error(f"Error al buscar '{name}' en Google Drive: {e}")
         return None
@@ -715,36 +721,52 @@ def download_drive_bytes(service, file_id):
         while not done:
             status, done = downloader.next_chunk()
         return fh.getvalue()
+    except HttpError as e:
+        if getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
+            st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
+        else:
+            st.error(f"Error de Google Drive API al descargar archivo: {e}")
+        return None
     except Exception as e:
-        st.error(f"Error al descargar archivo de Google Drive (ID: {file_id}): {e}")
+        st.error(f"Error al descargar archivo de Google Drive: {e}")
         return None
 
 
 
 def read_drive_excel(service, file_id):
     """Lee un archivo Excel desde Google Drive directamente en un DataFrame en memoria."""
-    content = download_drive_bytes(service, file_id)
-    if content:
-        try:
+    try:
+        content = download_drive_bytes(service, file_id)
+        if content:
             return pd.read_excel(io.BytesIO(content))
-        except Exception as e:
-            st.error(f"Error al procesar archivo Excel desde Drive: {e}")
+    except HttpError as e:
+        if getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
+            st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
+        else:
+            st.error(f"Error al leer Excel de Drive: {e}")
+    except Exception as e:
+        st.error(f"Error al procesar archivo Excel desde Drive: {e}")
     return pd.DataFrame()
 
 
 def read_drive_csv(service, file_id):
     """Lee un archivo CSV desde Google Drive directamente en un DataFrame en memoria."""
-    content = download_drive_bytes(service, file_id)
-    if not content:
-        return pd.DataFrame()
     try:
-        return pd.read_csv(io.BytesIO(content), encoding='utf-8-sig')
-    except Exception:
-        try:
-            return pd.read_csv(io.BytesIO(content), encoding='latin-1')
-        except Exception as e:
-            st.error(f"Error al decodificar CSV desde Drive: {e}")
+        content = download_drive_bytes(service, file_id)
+        if not content:
             return pd.DataFrame()
+        try:
+            return pd.read_csv(io.BytesIO(content), encoding='utf-8-sig')
+        except Exception:
+            return pd.read_csv(io.BytesIO(content), encoding='latin-1')
+    except HttpError as e:
+        if getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
+            st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
+        else:
+            st.error(f"Error al leer CSV de Drive: {e}")
+    except Exception as e:
+        st.error(f"Error al procesar archivo CSV desde Drive: {e}")
+    return pd.DataFrame()
 
 
 def list_drive_csvs(service, folder_id):
@@ -770,66 +792,83 @@ def list_drive_csvs(service, folder_id):
             if f.get('name', '').lower().endswith('.csv') and 'credencial' not in f.get('name', '').lower()
         ]
         return csv_files
+    except HttpError as e:
+        if getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
+            st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
+        else:
+            st.error(f"Error de Google Drive API al listar archivos (Código {e.resp.status}): {e}")
+        return []
     except Exception as e:
         st.error(f"Error al listar archivos CSV en Google Drive: {e}")
         return []
 
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=3600)
 def load_docentes_master():
     """
     Carga el archivo maestro docentes.xlsx ubicado en la carpeta raíz de Drive.
-    Columnas requeridas: 'usuario_docente', 'password', 'asignatura', 'carpeta_nombre'.
+    Columnas requeridas: 'usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail'.
     """
-    service = get_drive_service()
-    if not service or str(ROOT_FOLDER_ID).startswith('PEGA_AQUÍ'):
-        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail'])
+    default_empty = pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail'])
+    try:
+        service = get_drive_service()
+        if not service or str(ROOT_FOLDER_ID).startswith('PEGA_AQUÍ'):
+            return default_empty
 
-    doc_file = find_drive_item(service, "docentes.xlsx", ROOT_FOLDER_ID, is_folder=False)
-    if not doc_file:
-        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail'])
+        doc_file = find_drive_item(service, "docentes.xlsx", ROOT_FOLDER_ID, is_folder=False)
+        if not doc_file:
+            return default_empty
 
-    df = read_drive_excel(service, doc_file['id'])
-    if df.empty:
-        return pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail'])
+        df = read_drive_excel(service, doc_file['id'])
+        if df.empty:
+            return default_empty
 
-    df.columns = [str(c).strip() for c in df.columns]
-    rename_map = {}
-    for col in df.columns:
-        cl = col.lower().strip()
-        if 'usuario' in cl:
-            rename_map[col] = 'usuario_docente'
-        elif 'pass' in cl or 'contrase' in cl:
-            rename_map[col] = 'password'
-        elif 'asig' in cl or 'materia' in cl:
-            rename_map[col] = 'asignatura'
-        elif 'carpeta' in cl:
-            rename_map[col] = 'carpeta_nombre'
-        elif 'nombre' in cl and ('docente' in cl or 'profesor' in cl or 'maestro' in cl):
-            rename_map[col] = 'Nombre del Docente'
-        elif 'docente' in cl or 'profesor' in cl or 'maestro' in cl:
-            rename_map[col] = 'Nombre del Docente'
-        elif 'mail' in cl or 'correo' in cl:
-            rename_map[col] = 'e_mail'
-    df = df.rename(columns=rename_map)
+        df.columns = [str(c).strip() for c in df.columns]
+        rename_map = {}
+        for col in df.columns:
+            cl = col.lower().strip()
+            if 'usuario' in cl:
+                rename_map[col] = 'usuario_docente'
+            elif 'pass' in cl or 'contrase' in cl:
+                rename_map[col] = 'password'
+            elif 'asig' in cl or 'materia' in cl:
+                rename_map[col] = 'asignatura'
+            elif 'carpeta' in cl:
+                rename_map[col] = 'carpeta_nombre'
+            elif 'nombre' in cl and ('docente' in cl or 'profesor' in cl or 'maestro' in cl):
+                rename_map[col] = 'Nombre del Docente'
+            elif 'docente' in cl or 'profesor' in cl or 'maestro' in cl:
+                rename_map[col] = 'Nombre del Docente'
+            elif 'mail' in cl or 'correo' in cl:
+                rename_map[col] = 'e_mail'
+        df = df.rename(columns=rename_map)
 
-    if 'Nombre del Docente' not in df.columns:
-        df['Nombre del Docente'] = df.get('usuario_docente', 'Docente')
-    if 'e_mail' not in df.columns:
-        df['e_mail'] = ''
+        if 'Nombre del Docente' not in df.columns:
+            df['Nombre del Docente'] = df.get('usuario_docente', 'Docente')
+        if 'e_mail' not in df.columns:
+            df['e_mail'] = ''
 
-    for req in ['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail']:
-        if req not in df.columns:
-            df[req] = ''
+        for req in ['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail']:
+            if req not in df.columns:
+                df[req] = ''
+            else:
+                df[req] = df[req].astype(str).str.strip()
+
+        df['Nombre del Docente'] = df.apply(
+            lambda r: r['Nombre del Docente'] if r['Nombre del Docente'].strip() else r['usuario_docente'],
+            axis=1
+        )
+
+        return df[['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail']]
+    except HttpError as e:
+        if getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
+            st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
         else:
-            df[req] = df[req].astype(str).str.strip()
-
-    df['Nombre del Docente'] = df.apply(
-        lambda r: r['Nombre del Docente'] if r['Nombre del Docente'].strip() else r['usuario_docente'],
-        axis=1
-    )
-
-    return df[['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail']]
+            st.error(f"Error al cargar docentes desde Google Drive: {e}")
+        return default_empty
+    except Exception as e:
+        st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
+        return default_empty
 
 
 def normalize_credentials_df(df):
@@ -918,27 +957,28 @@ def load_raw_assignments_local_fallback():
     return all_data
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600)
 def load_teacher_credentials(folder_id):
     """
     Carga las credenciales de los estudiantes desde la subcarpeta del docente en Google Drive.
     Busca 'credenciales.xlsx' o archivos que contengan 'credencial' (.xlsx o .csv) en memoria.
     """
-    service = get_drive_service()
-    if not service or not folder_id or str(folder_id).startswith('PEGA_AQUÍ'):
-        return load_credentials_local_fallback()
-
-    # 1. Intentar credenciales.xlsx
-    cred_file = find_drive_item(service, "credenciales.xlsx", folder_id, is_folder=False)
-    if cred_file:
-        df = read_drive_excel(service, cred_file['id'])
-        norm_df = normalize_credentials_df(df)
-        if not norm_df.empty:
-            return norm_df
-
-    # 2. Buscar otros archivos con 'credencial'
-    query = f"'{folder_id}' in parents and trashed = false"
+    empty_creds = pd.DataFrame(columns=['Usuario', 'Contraseña', 'Nombre del estudiante'])
     try:
+        service = get_drive_service()
+        if not service or not folder_id or str(folder_id).startswith('PEGA_AQUÍ'):
+            return load_credentials_local_fallback()
+
+        # 1. Intentar credenciales.xlsx
+        cred_file = find_drive_item(service, "credenciales.xlsx", folder_id, is_folder=False)
+        if cred_file:
+            df = read_drive_excel(service, cred_file['id'])
+            norm_df = normalize_credentials_df(df)
+            if not norm_df.empty:
+                return norm_df
+
+        # 2. Buscar otros archivos con 'credencial'
+        query = f"'{folder_id}' in parents and trashed = false"
         results = service.files().list(q=query, fields='files(id, name, mimeType)').execute()
         files = results.get('files', [])
         for f in files:
@@ -953,65 +993,82 @@ def load_teacher_credentials(folder_id):
                 norm_df = normalize_credentials_df(df)
                 if not norm_df.empty:
                     return norm_df
+
+        return empty_creds
+    except HttpError as e:
+        if getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
+            st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
+        else:
+            st.error(f"Error de Google Drive API al obtener credenciales: {e}")
+        return empty_creds
     except Exception as e:
-        st.error(f"Error al buscar credenciales en la carpeta de Drive: {e}")
+        st.error("⚠️ El servidor está experimentando alto tráfico o error de conexión. Por favor, recarga la página en unos segundos.")
+        return empty_creds
 
-    return pd.DataFrame(columns=['Usuario', 'Contraseña', 'Nombre del estudiante'])
 
-
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600)
 def load_teacher_raw_assignments(folder_id):
     """
     Descarga en memoria todos los CSVs de Khan Academy en la subcarpeta del docente en Google Drive,
     extrae el Grupo de cada archivo, y limpia y parsea fechas de Khan Academy.
     NO guarda nada en disco local.
     """
-    service = get_drive_service()
-    if not service or not folder_id or str(folder_id).startswith('PEGA_AQUÍ'):
-        return load_raw_assignments_local_fallback()
+    try:
+        service = get_drive_service()
+        if not service or not folder_id or str(folder_id).startswith('PEGA_AQUÍ'):
+            return load_raw_assignments_local_fallback()
 
-    csv_items = list_drive_csvs(service, folder_id)
-    if not csv_items:
+        csv_items = list_drive_csvs(service, folder_id)
+        if not csv_items:
+            return pd.DataFrame()
+
+        dfs = []
+        for item in csv_items:
+            file_id = item['id']
+            file_name = item.get('name', 'asignacion.csv')
+            df = read_drive_csv(service, file_id)
+            if not df.empty:
+                df['Archivo_Origen'] = file_name
+                df['Grupo'] = extract_group(file_name)
+                dfs.append(df)
+
+        if not dfs:
+            return pd.DataFrame()
+
+        all_data = pd.concat(dfs, ignore_index=True)
+        all_data.columns = [str(c).strip() for c in all_data.columns]
+
+        if 'Nombre del estudiante' in all_data.columns:
+            all_data['Nombre del estudiante'] = all_data['Nombre del estudiante'].astype(str).str.strip()
+
+        if 'Tipo de tarea' in all_data.columns:
+            all_data['Tipo de tarea'] = all_data['Tipo de tarea'].astype(str).str.strip()
+
+        if 'Fecha de entrega' in all_data.columns:
+            all_data['dt_entrega'] = all_data['Fecha de entrega'].apply(parse_khan_date)
+        else:
+            all_data['dt_entrega'] = pd.NaT
+
+        if 'Última fecha de terminación' in all_data.columns:
+            all_data['dt_terminacion'] = all_data['Última fecha de terminación'].apply(parse_khan_date)
+        else:
+            all_data['dt_terminacion'] = pd.NaT
+
+        if 'Fecha de inicio' in all_data.columns:
+            all_data['dt_inicio'] = all_data['Fecha de inicio'].apply(parse_khan_date)
+        else:
+            all_data['dt_inicio'] = pd.NaT
+
+        return all_data
+    except HttpError as e:
+        if getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
+            st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
+        else:
+            st.error(f"Error de Google Drive API al obtener tareas: {e}")
         return pd.DataFrame()
-
-    dfs = []
-    for item in csv_items:
-        file_id = item['id']
-        file_name = item.get('name', 'asignacion.csv')
-        df = read_drive_csv(service, file_id)
-        if not df.empty:
-            df['Archivo_Origen'] = file_name
-            df['Grupo'] = extract_group(file_name)
-            dfs.append(df)
-
-    if not dfs:
+    except Exception as e:
+        st.error("⚠️ El servidor está experimentando alto tráfico o error de conexión. Por favor, recarga la página en unos segundos.")
         return pd.DataFrame()
-
-    all_data = pd.concat(dfs, ignore_index=True)
-    all_data.columns = [str(c).strip() for c in all_data.columns]
-
-    if 'Nombre del estudiante' in all_data.columns:
-        all_data['Nombre del estudiante'] = all_data['Nombre del estudiante'].astype(str).str.strip()
-
-    if 'Tipo de tarea' in all_data.columns:
-        all_data['Tipo de tarea'] = all_data['Tipo de tarea'].astype(str).str.strip()
-
-    if 'Fecha de entrega' in all_data.columns:
-        all_data['dt_entrega'] = all_data['Fecha de entrega'].apply(parse_khan_date)
-    else:
-        all_data['dt_entrega'] = pd.NaT
-
-    if 'Última fecha de terminación' in all_data.columns:
-        all_data['dt_terminacion'] = all_data['Última fecha de terminación'].apply(parse_khan_date)
-    else:
-        all_data['dt_terminacion'] = pd.NaT
-
-    if 'Fecha de inicio' in all_data.columns:
-        all_data['dt_inicio'] = all_data['Fecha de inicio'].apply(parse_khan_date)
-    else:
-        all_data['dt_inicio'] = pd.NaT
-
-    return all_data
 
 
 def load_teacher_assignments(folder_id, criteria_config=None):
@@ -1700,6 +1757,50 @@ def render_admin():
 
             if teacher_email:
                 st.info(f"🔒 **Seguridad y Acceso Restringido:** El enlace anterior conduce de forma directa a tu carpeta. Solo la cuenta de Google registrada (**{teacher_email}**) tiene permisos para acceder y editar los documentos de esta carpeta. Cualquier otra persona que intente abrir este enlace tendrá el acceso denegado por Google Drive.")
+
+            st.markdown("---")
+            st.markdown("##### 📤 Subir Archivo al Sistema (CSV de Khan Academy o credenciales.xlsx)")
+            uploaded_file = st.file_uploader(
+                "Selecciona un reporte CSV de Khan Academy o un archivo credenciales.xlsx:",
+                type=["csv", "xlsx"],
+                key="admin_upload_drive_file"
+            )
+            if uploaded_file is not None:
+                if st.button(f"⬆️ Subir '{uploaded_file.name}'", type="primary", use_container_width=True, key="admin_btn_process_upload"):
+                    upload_success = False
+                    service = get_drive_service()
+                    if teacher_folder_id and service:
+                        try:
+                            media = MediaIoBaseUpload(io.BytesIO(uploaded_file.getvalue()), mimetype=uploaded_file.type or 'application/octet-stream', resumable=True)
+                            file_metadata = {
+                                'name': uploaded_file.name,
+                                'parents': [teacher_folder_id]
+                            }
+                            service.files().create(body=file_metadata, media_body=media, supportsAllDrives=True).execute()
+                            upload_success = True
+                        except HttpError as e:
+                            if 'storage quota' in str(e).lower() or (getattr(e, 'resp', None) and e.resp.status == 403):
+                                st.warning(f"⚠️ Tu cuenta de Google Drive no permite subir directamente vía API por cuota de Service Account institucional. Por favor, coloca el archivo en tu carpeta de Drive usando el botón **'📂 Abrir Carpeta en Google Drive'** y luego presiona **'🔄 Sincronizar'**.")
+                            elif getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
+                                st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
+                            else:
+                                st.error(f"Error al subir a Google Drive: {e}")
+                        except Exception as e:
+                            st.error(f"Error de conexión al subir a Google Drive: {e}")
+                    else:
+                        try:
+                            os.makedirs(DATA_DIR, exist_ok=True)
+                            dest_path = os.path.join(DATA_DIR, uploaded_file.name)
+                            with open(dest_path, "wb") as f:
+                                f.write(uploaded_file.getvalue())
+                            upload_success = True
+                        except Exception as e:
+                            st.error(f"Error al guardar archivo localmente: {e}")
+
+                    if upload_success:
+                        st.cache_data.clear()
+                        st.success(f"✅ Archivo '{uploaded_file.name}' subido exitosamente a Google Drive.")
+                        st.rerun()
 
             st.markdown("---")
             st.markdown("##### 📥 Plantilla de Credenciales (`credenciales.xlsx`)")
