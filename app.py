@@ -13,7 +13,7 @@ import pandas as pd
 import streamlit as st
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from googleapiclient.errors import HttpError
 
 # ==============================================================================
@@ -624,12 +624,46 @@ def get_drive_service():
 
         credentials = service_account.Credentials.from_service_account_info(
             creds_dict,
-            scopes=['https://www.googleapis.com/auth/drive.readonly']
+            scopes=['https://www.googleapis.com/auth/drive']
         )
         return build('drive', 'v3', credentials=credentials)
     except Exception as e:
         st.error(f"Error al inicializar las credenciales de Google Drive: {e}")
         return None
+
+
+def upload_file_to_drive(service, file_bytes, filename, folder_id, mime_type='application/octet-stream'):
+    """
+    Sube un archivo directamente a una subcarpeta de Google Drive en memoria.
+    Si ya existe un archivo con ese nombre en la carpeta, lo actualiza.
+    Si no existe, lo crea. NO escribe nada en disco local.
+    """
+    if not service or not folder_id or str(folder_id).startswith('PEGA_AQUÍ'):
+        return False, "Google Drive no está conectado o no se especificó la carpeta del docente."
+
+    try:
+        existing = find_drive_item(service, filename, folder_id, is_folder=False)
+        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=True)
+
+        if existing:
+            service.files().update(
+                fileId=existing['id'],
+                media_body=media
+            ).execute()
+            return True, f"Archivo '{filename}' actualizado exitosamente en Google Drive."
+        else:
+            file_metadata = {
+                'name': filename,
+                'parents': [folder_id]
+            }
+            service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id'
+            ).execute()
+            return True, f"Archivo '{filename}' guardado exitosamente en Google Drive."
+    except Exception as e:
+        return False, f"Error al subir '{filename}' a Google Drive: {e}"
 
 
 def find_drive_item(service, name, parent_id, is_folder=None):
@@ -1582,18 +1616,85 @@ def render_admin():
     active_parcial_config = st.session_state.get('active_parcial_config', saved_parcial_config)
 
     with col_cfg2:
-        with st.expander("☁️ Sincronización con Google Drive", expanded=False):
+        with st.expander("☁️ Sincronización y Carga en Google Drive", expanded=False):
             st.markdown(f"**Carpeta asignada en Google Drive:** `{carpeta_nombre}`")
             if teacher_folder_id:
-                st.success("🟢 Conexión activa con Google Drive (Modo Solo Lectura en memoria).")
-                st.caption("Los archivos CSV y credenciales se leen automáticamente en memoria sin almacenarse en el disco local.")
+                st.success("🟢 Conectado a Google Drive.")
+                st.caption("Los archivos se leen y almacenan directamente en la nube sin guardarse en el servidor.")
             else:
                 st.info("ℹ️ Sesión en modo local/administrador general.")
 
-            if st.button("🔄 Sincronizar / Refrescar Datos de Google Drive", use_container_width=True, key="admin_refresh_drive_btn"):
+            if st.button("🔄 Sincronizar / Refrescar Datos de Drive", use_container_width=True, key="admin_refresh_drive_btn"):
                 st.cache_data.clear()
                 st.success("✅ Datos sincronizados directamente desde Google Drive.")
                 st.rerun()
+
+            st.markdown("---")
+            st.markdown("##### 📤 Subir Archivos a Google Drive")
+            st.caption("Guarda nuevos archivos directamente en tu carpeta de Google Drive:")
+            tab_up_csv, tab_up_cred = st.tabs(["📊 Subir Tareas CSV", "🔑 Subir Credenciales"])
+
+            with tab_up_csv:
+                up_csvs = st.file_uploader(
+                    "Selecciona CSVs de Khan Academy:",
+                    type=["csv"],
+                    accept_multiple_files=True,
+                    key="drive_csv_uploader"
+                )
+                if up_csvs:
+                    if st.button("☁️ Guardar Tareas en Google Drive", use_container_width=True, key="save_drive_csv_btn"):
+                        service = get_drive_service()
+                        success_count = 0
+                        for f in up_csvs:
+                            if service and teacher_folder_id:
+                                ok, msg = upload_file_to_drive(service, f.getvalue(), f.name, teacher_folder_id, mime_type='text/csv')
+                                if ok:
+                                    success_count += 1
+                                else:
+                                    st.error(msg)
+                            else:
+                                os.makedirs(DATA_DIR, exist_ok=True)
+                                with open(os.path.join(DATA_DIR, f.name), "wb") as out_f:
+                                    out_f.write(f.getbuffer())
+                                success_count += 1
+                        if success_count > 0:
+                            st.cache_data.clear()
+                            st.success(f"✅ Se guardaron {success_count} archivo(s) en Google Drive.")
+                            st.rerun()
+
+            with tab_up_cred:
+                up_cred = st.file_uploader(
+                    "Archivo de credenciales (.xlsx o .csv):",
+                    type=["xlsx", "csv"],
+                    accept_multiple_files=False,
+                    key="drive_cred_uploader"
+                )
+                if up_cred:
+                    if st.button("☁️ Guardar Credenciales en Google Drive", use_container_width=True, key="save_drive_cred_btn"):
+                        service = get_drive_service()
+                        file_name = "credenciales.xlsx" if up_cred.name.endswith(".xlsx") else up_cred.name
+                        file_bytes = up_cred.getvalue()
+                        if service and teacher_folder_id:
+                            mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' if file_name.endswith('.xlsx') else 'text/csv'
+                            ok, msg = upload_file_to_drive(service, file_bytes, file_name, teacher_folder_id, mime_type=mime)
+                            if ok:
+                                st.cache_data.clear()
+                                st.success("✅ Credenciales guardadas en Google Drive exitosamente.")
+                                st.rerun()
+                            else:
+                                st.error(msg)
+                        else:
+                            os.makedirs(DATA_DIR, exist_ok=True)
+                            dest = os.path.join(DATA_DIR, "credenciales.xlsx")
+                            if up_cred.name.endswith(".xlsx"):
+                                with open(dest, "wb") as out_f:
+                                    out_f.write(up_cred.getbuffer())
+                            else:
+                                tdf = pd.read_csv(up_cred, encoding='utf-8-sig')
+                                tdf.to_excel(dest, index=False)
+                            st.cache_data.clear()
+                            st.success("✅ Credenciales guardadas localmente.")
+                            st.rerun()
 
     st.divider()
 
