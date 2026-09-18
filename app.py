@@ -27,7 +27,7 @@ st.set_page_config(
 )
 
 # Constante del directorio raíz en Google Drive
-ROOT_FOLDER_ID = 'PEGA_AQUÍ_EL_ID_DE_LA_CARPETA_DEL_PASO_2_PUNTO_6'
+ROOT_FOLDER_ID = '1vXexz6nj_fa5lUtWOaFMqvCv3uRJyORJ'
 
 # Credenciales de administrador por defecto (fallback maestro)
 ADMIN_USERNAME = os.environ.get("ADMIN_USER", "javier_admin")
