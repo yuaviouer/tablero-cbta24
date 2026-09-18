@@ -636,7 +636,7 @@ def upload_file_to_drive(service, file_bytes, filename, folder_id, mime_type='ap
     """
     Sube un archivo directamente a una subcarpeta de Google Drive en memoria.
     Si ya existe un archivo con ese nombre en la carpeta, lo actualiza.
-    Si no existe, lo crea. NO escribe nada en disco local.
+    Si no existe, lo crea. Soporta Unidades Compartidas (supportsAllDrives=True).
     """
     if not service or not folder_id or str(folder_id).startswith('PEGA_AQUÍ'):
         return False, "Google Drive no está conectado o no se especificó la carpeta del docente."
@@ -648,7 +648,8 @@ def upload_file_to_drive(service, file_bytes, filename, folder_id, mime_type='ap
         if existing:
             service.files().update(
                 fileId=existing['id'],
-                media_body=media
+                media_body=media,
+                supportsAllDrives=True
             ).execute()
             return True, f"Archivo '{filename}' actualizado exitosamente en Google Drive."
         else:
@@ -659,9 +660,21 @@ def upload_file_to_drive(service, file_bytes, filename, folder_id, mime_type='ap
             service.files().create(
                 body=file_metadata,
                 media_body=media,
-                fields='id'
+                fields='id',
+                supportsAllDrives=True
             ).execute()
             return True, f"Archivo '{filename}' guardado exitosamente en Google Drive."
+    except HttpError as e:
+        if "storageQuotaExceeded" in str(e) or e.resp.status == 403:
+            return False, (
+                "⚠️ **Restricción de cuota de Google Drive Personal:**\n\n"
+                "Google no permite que los *Service Accounts* creen archivos directamente en carpetas personales (`@gmail.com`) porque les asigna 0 MB de cuota de almacenamiento propia.\n\n"
+                "**Solución inmediata recomendada:**\n"
+                "1. Abre tu carpeta en [drive.google.com](https://drive.google.com) y arrastra directamente tu archivo CSV o Excel ahí.\n"
+                "2. Regresa a esta pantalla y presiona el botón **'🔄 Sincronizar / Refrescar Datos de Drive'**.\n\n"
+                "*(Nota: Si usas una **Unidad Compartida (Shared Drive)** de Google Workspace institucional, la subida directa desde aquí sí funcionará sin problemas).*"
+            )
+        return False, f"Error al subir '{filename}' a Google Drive: {e}"
     except Exception as e:
         return False, f"Error al subir '{filename}' a Google Drive: {e}"
 
@@ -689,7 +702,9 @@ def find_drive_item(service, name, parent_id, is_folder=None):
             q=query,
             spaces='drive',
             fields='files(id, name, mimeType)',
-            pageSize=10
+            pageSize=10,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
         ).execute()
         files = results.get('files', [])
         if files:
@@ -708,7 +723,7 @@ def download_drive_bytes(service, file_id):
     if not service or not file_id:
         return None
     try:
-        request = service.files().get_media(fileId=file_id)
+        request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
         fh = io.BytesIO()
         downloader = MediaIoBaseDownload(fh, request)
         done = False
@@ -718,6 +733,7 @@ def download_drive_bytes(service, file_id):
     except Exception as e:
         st.error(f"Error al descargar archivo de Google Drive (ID: {file_id}): {e}")
         return None
+
 
 
 def read_drive_excel(service, file_id):
@@ -759,7 +775,9 @@ def list_drive_csvs(service, folder_id):
             q=query,
             spaces='drive',
             fields='files(id, name, mimeType)',
-            pageSize=100
+            pageSize=100,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
         ).execute()
         files = results.get('files', [])
         csv_files = [
@@ -1628,6 +1646,14 @@ def render_admin():
                 st.cache_data.clear()
                 st.success("✅ Datos sincronizados directamente desde Google Drive.")
                 st.rerun()
+
+            st.info(
+                "💡 **Recomendación para cuentas personales (`@gmail.com`):**\n\n"
+                "Google no asigna cuota de almacenamiento a los *Service Accounts* en cuentas personales. "
+                "La manera más directa y 100% libre de errores es colocar los CSVs de Khan Academy directamente en tu carpeta de "
+                "[Google Drive (drive.google.com)](https://drive.google.com) y pulsar **'🔄 Sincronizar / Refrescar Datos de Drive'** arriba.\n\n"
+                "*(La subida directa desde el formulario inferior está habilitada para Unidades Compartidas / Shared Drives de Google Workspace)*."
+            )
 
             st.markdown("---")
             st.markdown("##### 📤 Subir Archivos a Google Drive")
