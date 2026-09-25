@@ -7,10 +7,8 @@ import os
 import io
 import json
 import glob
-import html
 import re
 from datetime import date, datetime
-from zoneinfo import ZoneInfo
 import time
 import pandas as pd
 import streamlit as st
@@ -32,33 +30,12 @@ st.set_page_config(
 # Constante del directorio raíz en Google Drive
 ROOT_FOLDER_ID = '1vXexz6nj_fa5lUtWOaFMqvCv3uRJyORJ'
 
+# Credenciales de administrador por defecto (fallback maestro)
+ADMIN_USERNAME = os.environ.get("ADMIN_USER", "javier_admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASS", "admin_password")
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datos")
-
-# Zona horaria del plantel: el servidor (p. ej. Streamlit Cloud) corre en UTC,
-# lo que desfasaba 6 horas la detección de tareas "Programadas".
-LOCAL_TZ = ZoneInfo("America/Mexico_City")
-
-
-def now_local():
-    """Fecha y hora actual en la zona horaria del plantel (sin tzinfo, igual que las fechas de Khan)."""
-    return datetime.now(LOCAL_TZ).replace(tzinfo=None)
-
-
-def get_secret(key, default=None):
-    """Lee un valor de st.secrets sin fallar si no existe secrets.toml."""
-    try:
-        if key in st.secrets:
-            return st.secrets[key]
-    except Exception:
-        pass
-    return default
-
-
-# Credenciales del administrador maestro: se leen de st.secrets o variables de entorno.
-# Si no están configuradas, el acceso de administrador maestro queda deshabilitado
-# (antes existía una contraseña por defecto pública en el código).
-ADMIN_USERNAME = get_secret("ADMIN_USER") or os.environ.get("ADMIN_USER", "")
-ADMIN_PASSWORD = get_secret("ADMIN_PASS") or os.environ.get("ADMIN_PASS", "")
+CONFIG_PARCIALES_PATH = os.path.join(DATA_DIR, "config_parciales.json")
+CONFIG_CRITERIOS_PATH = os.path.join(DATA_DIR, "config_criterios.json")
 
 # Diccionario de traducción de meses en español a inglés
 SPANISH_TO_ENGLISH_MONTHS = {
@@ -147,15 +124,63 @@ st.markdown("""
 # ==============================================================================
 def get_default_parciales_config():
     """Configuración predeterminada de fechas dinámicas para los 3 Parciales del ciclo."""
-    now = now_local()
-    # En enero seguimos dentro del semestre agosto-enero que inició el año anterior
-    now_year = now.year - 1 if now.month == 1 else now.year
+    now_year = datetime.now().year
     next_year = now_year + 1
     return {
         'Parcial 1': {'start': f'{now_year}-08-15', 'end': f'{now_year}-10-03'},
         'Parcial 2': {'start': f'{now_year}-10-04', 'end': f'{now_year}-11-21'},
         'Parcial 3': {'start': f'{now_year}-11-22', 'end': f'{next_year}-01-23'}
     }
+
+
+def load_parciales_config():
+    """Carga la configuración de fechas de Parciales desde archivo JSON o default dinámico."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    defaults = get_default_parciales_config()
+    now_year = datetime.now().year
+
+    if os.path.exists(CONFIG_PARCIALES_PATH):
+        try:
+            with open(CONFIG_PARCIALES_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                parsed = {}
+                for p_name in ['Parcial 1', 'Parcial 2', 'Parcial 3']:
+                    if p_name in data:
+                        parsed[p_name] = {
+                            'start': date.fromisoformat(data[p_name]['start']),
+                            'end': date.fromisoformat(data[p_name]['end'])
+                        }
+                if len(parsed) == 3:
+                    # Si el archivo tiene un año inferior al actual, migrar automáticamente al ciclo actual
+                    if parsed['Parcial 1']['start'].year < now_year:
+                        parsed = {
+                            k: {'start': date.fromisoformat(v['start']), 'end': date.fromisoformat(v['end'])}
+                            for k, v in defaults.items()
+                        }
+                        save_parciales_config(parsed)
+                    return parsed
+        except Exception:
+            pass
+
+    parsed_defaults = {
+        k: {'start': date.fromisoformat(v['start']), 'end': date.fromisoformat(v['end'])}
+        for k, v in defaults.items()
+    }
+    save_parciales_config(parsed_defaults)
+    return parsed_defaults
+
+
+def save_parciales_config(config_dict):
+    """Guarda la configuración de fechas de Parciales en formato JSON."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    serializable = {}
+    for k, v in config_dict.items():
+        serializable[k] = {
+            'start': v['start'].isoformat() if isinstance(v['start'], date) else str(v['start']),
+            'end': v['end'].isoformat() if isinstance(v['end'], date) else str(v['end'])
+        }
+    with open(CONFIG_PARCIALES_PATH, "w", encoding="utf-8") as f:
+        json.dump(serializable, f, indent=4, ensure_ascii=False)
 
 
 def parse_parciales_dates(parciales_cfg):
@@ -253,7 +278,7 @@ def parse_khan_date(val, default_year=None):
     Limpia agresivamente la cadena de fecha de Khan Academy:
     - Remueve 'º', '°', 'ª'
     - Traduce abreviaturas y nombres de meses en español a inglés
-    - Determina dinámicamente el año actual (zona horaria del plantel)
+    - Determina dinámicamente el año actual (datetime.now().year)
     - Aplica lógica inteligente de cambio de año (crossover):
       Si el mes parseado es entre enero y julio (1-7) y el mes actual es entre agosto y diciembre (8-12),
       suma 1 al año para manejar correctamente los semestres interanuales (agosto-enero).
@@ -278,7 +303,7 @@ def parse_khan_date(val, default_year=None):
     s = re.sub(r'\s+', ' ', s).strip()
 
     # 4. Determinar año dinámicamente con lógica inteligente de crossover
-    now = now_local()
+    now = datetime.now()
     now_year = now.year if default_year is None else default_year
     now_month = now.month
 
@@ -295,13 +320,9 @@ def parse_khan_date(val, default_year=None):
     if not re.search(r'\b(20\d\d)\b', s):
         target_year = now_year
         # Crossover: si el mes es de enero a julio (1 a 7) y estamos en agosto a diciembre (8 a 12)
-        # la fecha pertenece al año siguiente; si estamos en enero y el mes es de agosto a diciembre,
-        # la fecha pertenece al año anterior (mismo semestre agosto-enero).
         if parsed_month_num is not None:
             if 1 <= parsed_month_num <= 7 and 8 <= now_month <= 12:
                 target_year = now_year + 1
-            elif 8 <= parsed_month_num <= 12 and now_month == 1:
-                target_year = now_year - 1
 
         # Insertar año después del día y antes de la hora
         s = re.sub(r'([A-Za-z]+\s+\d{1,2})([,\s]+)', rf'\1 {target_year}\2', s)
@@ -469,7 +490,6 @@ def save_teacher_criterios(folder_id, criterios_dict):
     Serializa la configuración del docente a JSON (criterios.json) y la guarda/sobrescribe
     DIRECTAMENTE en su carpeta específica de Google Drive usando MediaIoBaseUpload.
     También mantiene una copia local de respaldo y limpia el caché.
-    Retorna una tupla (nivel, mensaje) para mostrarse después de recargar la página.
     """
     serializable = dict(criterios_dict)
     if 'parciales' in serializable and isinstance(serializable['parciales'], dict):
@@ -488,14 +508,13 @@ def save_teacher_criterios(folder_id, criterios_dict):
     json_bytes = json_str.encode('utf-8')
 
     # Guardar en local como respaldo
+    os.makedirs(DATA_DIR, exist_ok=True)
+    local_path = os.path.join(DATA_DIR, "criterios.json")
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(os.path.join(DATA_DIR, "criterios.json"), "w", encoding="utf-8") as f:
+        with open(local_path, "w", encoding="utf-8") as f:
             f.write(json_str)
     except Exception:
         pass
-
-    result = ('success', "✅ Configuración guardada localmente (criterios.json).")
 
     # Guardar / Sobrescribir en Google Drive
     service = get_drive_service()
@@ -519,43 +538,30 @@ def save_teacher_criterios(folder_id, criterios_dict):
                     media_body=media,
                     supportsAllDrives=True
                 ).execute()
-            result = ('success', "✅ Configuración y fechas de Parciales guardadas exitosamente en Google Drive (criterios.json).")
         except HttpError as e:
             if 'storage quota' in str(e).lower() or (getattr(e, 'resp', None) and e.resp.status == 403):
-                result = ('warning', "⚠️ Nota: Tu cuenta de Google Drive no cuenta con cuota de escritura para Service Accounts institucionales. La configuración se ha guardado localmente en el servidor.")
+                st.warning("⚠️ Nota: Tu cuenta de Google Drive no cuenta con cuota de escritura para Service Accounts institucionales. La configuración se ha guardado localmente en el servidor.")
             elif getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
-                result = ('error', "⚠️ El servidor de Google Drive está experimentando alto tráfico. Por favor, intenta de nuevo en unos momentos.")
+                st.error("⚠️ El servidor de Google Drive está experimentando alto tráfico. Por favor, intenta de nuevo en unos momentos.")
             else:
-                result = ('error', f"Error al guardar criterios.json en Google Drive: {e}")
+                st.error(f"Error al guardar criterios.json en Google Drive: {e}")
         except Exception as e:
-            result = ('error', f"Error inesperado al guardar criterios.json en Google Drive: {e}")
+            st.error(f"Error inesperado al guardar criterios.json en Google Drive: {e}")
 
     st.cache_data.clear()
-    return result
 
 
-def set_flash(level, message):
-    """Guarda un mensaje para mostrarlo después de st.rerun() (si no, se pierde al recargar)."""
-    st.session_state['_flash'] = (level, message)
+def load_criteria_config(unique_task_types, folder_id=None):
+    """Compatibilidad: Carga task_criteria desde teacher_criterios."""
+    criterios = load_teacher_criterios(folder_id, unique_task_types)
+    return criterios.get('task_criteria', {})
 
 
-def show_flash():
-    """Muestra (una sola vez) el mensaje pendiente guardado con set_flash."""
-    flash = st.session_state.pop('_flash', None)
-    if flash:
-        level, message = flash
-        getattr(st, level, st.info)(message)
-
-
-# Prefijos de las claves de widgets del panel de configuración. Se borran al guardar o
-# restablecer para que los controles muestren los valores recién guardados.
-CONFIG_WIDGET_PREFIXES = ('cfg_', 'th_', 'crit_')
-
-
-def reset_config_widgets():
-    for k in list(st.session_state.keys()):
-        if str(k).startswith(CONFIG_WIDGET_PREFIXES):
-            del st.session_state[k]
+def save_criteria_config(config_dict, folder_id=None):
+    """Compatibilidad: Guarda la configuración en criterios.json."""
+    current = load_teacher_criterios(folder_id)
+    current['task_criteria'] = config_dict
+    save_teacher_criterios(folder_id, current)
 
 
 def render_criteria_explanation(criteria_config):
@@ -612,7 +618,6 @@ def apply_dynamic_grading(df, criteria_config):
 
     graded_rows = []
     cfg_lookup = {str(k).strip().lower(): v for k, v in cfg_dict.items()}
-    now = now_local()
 
     for _, row in df.iterrows():
         raw_type = str(row.get('Tipo de tarea', '')).strip()
@@ -630,6 +635,7 @@ def apply_dynamic_grading(df, criteria_config):
         due_dt = row.get('dt_entrega')
         comp_dt = row.get('dt_terminacion')
 
+        now = datetime.now()
         is_future = pd.notna(start_dt) and (start_dt > now)
 
         raw_attempts = row.get('Número de intentos', '')
@@ -792,9 +798,9 @@ def get_drive_service():
     Inicializa y cachea el cliente de Google Drive API v3 usando
     las credenciales del Service Account en st.secrets['gcp_service_account'].
     """
-    raw_creds = get_secret('gcp_service_account')
-    if raw_creds is None:
+    if 'gcp_service_account' not in st.secrets:
         return None
+    raw_creds = st.secrets['gcp_service_account']
     try:
         if isinstance(raw_creds, str):
             creds_dict = json.loads(raw_creds)
@@ -852,11 +858,9 @@ def find_drive_item(service, name, parent_id, is_folder=None):
     if not service or not parent_id or str(parent_id).startswith('PEGA_AQUÍ'):
         return None
 
-    # Escapar comillas y diagonales para que nombres como "Matemáticas d'Arte" no rompan la consulta
-    safe_name = str(name).replace('\\', '\\\\').replace("'", "\\'")
     query_parts = [
         f"'{parent_id}' in parents",
-        f"name = '{safe_name}'",
+        f"name = '{name}'",
         "trashed = false"
     ]
     if is_folder is True:
@@ -936,12 +940,12 @@ def download_drive_bytes(service, file_id):
 
 
 
-def read_drive_excel(service, file_id, dtype=None):
+def read_drive_excel(service, file_id):
     """Lee un archivo Excel desde Google Drive directamente en un DataFrame en memoria."""
     try:
         content = download_drive_bytes(service, file_id)
         if content:
-            return pd.read_excel(io.BytesIO(content), dtype=dtype)
+            return pd.read_excel(io.BytesIO(content))
     except HttpError as e:
         if getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
             st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
@@ -952,16 +956,16 @@ def read_drive_excel(service, file_id, dtype=None):
     return pd.DataFrame()
 
 
-def read_drive_csv(service, file_id, dtype=None):
+def read_drive_csv(service, file_id):
     """Lee un archivo CSV desde Google Drive directamente en un DataFrame en memoria."""
     try:
         content = download_drive_bytes(service, file_id)
         if not content:
             return pd.DataFrame()
         try:
-            return pd.read_csv(io.BytesIO(content), encoding='utf-8-sig', dtype=dtype)
+            return pd.read_csv(io.BytesIO(content), encoding='utf-8-sig')
         except Exception:
-            return pd.read_csv(io.BytesIO(content), encoding='latin-1', dtype=dtype)
+            return pd.read_csv(io.BytesIO(content), encoding='latin-1')
     except HttpError as e:
         if getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
             st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
@@ -984,9 +988,8 @@ def list_drive_csvs(service, folder_id):
         results = service.files().list(
             q=query,
             spaces='drive',
-            fields='files(id, name, mimeType, modifiedTime)',
-            orderBy='modifiedTime',
-            pageSize=200,
+            fields='files(id, name, mimeType)',
+            pageSize=100,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True
         ).execute()
@@ -1023,7 +1026,7 @@ def load_docentes_master():
         if not doc_file:
             return default_empty
 
-        df = read_drive_excel(service, doc_file['id'], dtype=str)
+        df = read_drive_excel(service, doc_file['id'])
         if df.empty:
             return default_empty
 
@@ -1056,12 +1059,7 @@ def load_docentes_master():
             if req not in df.columns:
                 df[req] = ''
             else:
-                df[req] = df[req].fillna('').astype(str).str.strip()
-
-        # Descartar filas sin usuario o contraseña (evita accesos con contraseña vacía)
-        df = df[(df['usuario_docente'] != '') & (df['password'] != '')].copy()
-        if df.empty:
-            return default_empty
+                df[req] = df[req].astype(str).str.strip()
 
         df['Nombre del Docente'] = df.apply(
             lambda r: r['Nombre del Docente'] if r['Nombre del Docente'].strip() else r['usuario_docente'],
@@ -1076,7 +1074,7 @@ def load_docentes_master():
             st.error(f"Error al cargar docentes desde Google Drive: {e}")
         return default_empty
     except Exception as e:
-        st.error(f"Error al procesar docentes.xlsx: {e}")
+        st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
         return default_empty
 
 
@@ -1097,47 +1095,11 @@ def normalize_credentials_df(df):
             rename_map[col] = 'Nombre del estudiante'
     df = df.rename(columns=rename_map)
     if {'Usuario', 'Contraseña', 'Nombre del estudiante'}.issubset(df.columns):
-        for col in ['Usuario', 'Contraseña', 'Nombre del estudiante']:
-            df[col] = df[col].fillna('').astype(str).str.strip()
-        # Contraseñas numéricas leídas como float ("1234.0") se normalizan a "1234"
-        df['Contraseña'] = df['Contraseña'].str.replace(r'^(\d+)\.0$', r'\1', regex=True)
-        # Descartar filas sin usuario o sin contraseña (antes una celda vacía se convertía en la contraseña "nan")
-        df = df[(df['Usuario'] != '') & (df['Contraseña'] != '')]
+        df['Usuario'] = df['Usuario'].astype(str).str.strip()
+        df['Contraseña'] = df['Contraseña'].astype(str).str.strip()
+        df['Nombre del estudiante'] = df['Nombre del estudiante'].astype(str).str.strip()
         return df[['Usuario', 'Contraseña', 'Nombre del estudiante']].drop_duplicates(subset=['Usuario'])
     return pd.DataFrame(columns=['Usuario', 'Contraseña', 'Nombre del estudiante'])
-
-
-ASSIGNMENT_KEY_COLS = ['Grupo', 'Nombre del estudiante', 'Nombre de la tarea', 'Fecha de entrega']
-
-
-def prepare_raw_assignments(dfs):
-    """
-    Une los CSVs de Khan Academy (ordenados del más antiguo al más reciente), limpia columnas,
-    elimina tareas duplicadas conservando el reporte más reciente y parsea las fechas.
-    """
-    all_data = pd.concat(dfs, ignore_index=True)
-    all_data.columns = [str(c).strip() for c in all_data.columns]
-
-    for col in ['Nombre del estudiante', 'Tipo de tarea', 'Nombre de la tarea']:
-        if col in all_data.columns:
-            all_data[col] = all_data[col].astype(str).str.strip()
-
-    # Si el mismo grupo se descargó más de una vez (o se subió el mismo archivo dos veces),
-    # cada tarea aparecería repetida y alteraría los promedios: se conserva la versión más reciente.
-    if set(ASSIGNMENT_KEY_COLS).issubset(all_data.columns):
-        all_data = all_data.drop_duplicates(subset=ASSIGNMENT_KEY_COLS, keep='last').reset_index(drop=True)
-
-    date_sources = {
-        'dt_entrega': 'Fecha de entrega',
-        'dt_terminacion': 'Última fecha de terminación',
-        'dt_inicio': 'Fecha de inicio',
-    }
-    for dt_col, src_col in date_sources.items():
-        if src_col in all_data.columns:
-            all_data[dt_col] = pd.to_datetime(all_data[src_col].apply(parse_khan_date), errors='coerce')
-        else:
-            all_data[dt_col] = pd.NaT
-    return all_data
 
 
 def load_credentials_local_fallback():
@@ -1146,7 +1108,7 @@ def load_credentials_local_fallback():
     excel_path = os.path.join(DATA_DIR, "credenciales.xlsx")
     if os.path.exists(excel_path):
         try:
-            df = pd.read_excel(excel_path, dtype=str)
+            df = pd.read_excel(excel_path)
             return normalize_credentials_df(df)
         except Exception:
             pass
@@ -1155,7 +1117,7 @@ def load_credentials_local_fallback():
         dfs = []
         for cf in csv_files:
             try:
-                tdf = pd.read_csv(cf, encoding='utf-8-sig', dtype=str)
+                tdf = pd.read_csv(cf, encoding='utf-8-sig')
                 ndf = normalize_credentials_df(tdf)
                 if not ndf.empty:
                     dfs.append(ndf)
@@ -1170,26 +1132,36 @@ def load_raw_assignments_local_fallback():
     """Fallback local para lectura de tareas si Drive no está configurado."""
     os.makedirs(DATA_DIR, exist_ok=True)
     csv_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
-    assignment_files = sorted(
-        (f for f in csv_files if "credencial" not in os.path.basename(f).lower()),
-        key=os.path.getmtime
-    )
+    assignment_files = [f for f in csv_files if "credencial" not in os.path.basename(f).lower()]
+    if not assignment_files:
+        return pd.DataFrame()
     dfs = []
     for filepath in assignment_files:
-        for encoding in ('utf-8-sig', 'latin-1'):
+        try:
+            df = pd.read_csv(filepath, encoding='utf-8-sig')
+            df['Archivo_Origen'] = os.path.basename(filepath)
+            df['Grupo'] = extract_group(filepath)
+            dfs.append(df)
+        except Exception:
             try:
-                df = pd.read_csv(filepath, encoding=encoding)
-                break
+                df = pd.read_csv(filepath, encoding='latin-1')
+                df['Archivo_Origen'] = os.path.basename(filepath)
+                df['Grupo'] = extract_group(filepath)
+                dfs.append(df)
             except Exception:
-                df = None
-        if df is None or df.empty:
-            continue
-        df['Archivo_Origen'] = os.path.basename(filepath)
-        df['Grupo'] = extract_group(filepath)
-        dfs.append(df)
+                continue
     if not dfs:
         return pd.DataFrame()
-    return prepare_raw_assignments(dfs)
+    all_data = pd.concat(dfs, ignore_index=True)
+    all_data.columns = [c.strip() for c in all_data.columns]
+    if 'Nombre del estudiante' in all_data.columns:
+        all_data['Nombre del estudiante'] = all_data['Nombre del estudiante'].astype(str).str.strip()
+    if 'Tipo de tarea' in all_data.columns:
+        all_data['Tipo de tarea'] = all_data['Tipo de tarea'].astype(str).str.strip()
+    all_data['dt_entrega'] = all_data['Fecha de entrega'].apply(parse_khan_date) if 'Fecha de entrega' in all_data.columns else pd.NaT
+    all_data['dt_terminacion'] = all_data['Última fecha de terminación'].apply(parse_khan_date) if 'Última fecha de terminación' in all_data.columns else pd.NaT
+    all_data['dt_inicio'] = all_data['Fecha de inicio'].apply(parse_khan_date) if 'Fecha de inicio' in all_data.columns else pd.NaT
+    return all_data
 
 
 @st.cache_data(ttl=3600)
@@ -1207,28 +1179,22 @@ def load_teacher_credentials(folder_id):
         # 1. Intentar credenciales.xlsx
         cred_file = find_drive_item(service, "credenciales.xlsx", folder_id, is_folder=False)
         if cred_file:
-            df = read_drive_excel(service, cred_file['id'], dtype=str)
+            df = read_drive_excel(service, cred_file['id'])
             norm_df = normalize_credentials_df(df)
             if not norm_df.empty:
                 return norm_df
 
         # 2. Buscar otros archivos con 'credencial'
         query = f"'{folder_id}' in parents and trashed = false"
-        results = service.files().list(
-            q=query,
-            fields='files(id, name, mimeType)',
-            pageSize=100,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True
-        ).execute()
+        results = service.files().list(q=query, fields='files(id, name, mimeType)').execute()
         files = results.get('files', [])
         for f in files:
             fname = f.get('name', '').lower()
             if 'credencial' in fname:
                 if fname.endswith('.xlsx'):
-                    df = read_drive_excel(service, f['id'], dtype=str)
+                    df = read_drive_excel(service, f['id'])
                 elif fname.endswith('.csv'):
-                    df = read_drive_csv(service, f['id'], dtype=str)
+                    df = read_drive_csv(service, f['id'])
                 else:
                     continue
                 norm_df = normalize_credentials_df(df)
@@ -1243,7 +1209,7 @@ def load_teacher_credentials(folder_id):
             st.error(f"Error de Google Drive API al obtener credenciales: {e}")
         return empty_creds
     except Exception as e:
-        st.error(f"Error al cargar las credenciales de los alumnos: {e}")
+        st.error("⚠️ El servidor está experimentando alto tráfico o error de conexión. Por favor, recarga la página en unos segundos.")
         return empty_creds
 
 
@@ -1276,7 +1242,31 @@ def load_teacher_raw_assignments(folder_id):
         if not dfs:
             return pd.DataFrame()
 
-        return prepare_raw_assignments(dfs)
+        all_data = pd.concat(dfs, ignore_index=True)
+        all_data.columns = [str(c).strip() for c in all_data.columns]
+
+        if 'Nombre del estudiante' in all_data.columns:
+            all_data['Nombre del estudiante'] = all_data['Nombre del estudiante'].astype(str).str.strip()
+
+        if 'Tipo de tarea' in all_data.columns:
+            all_data['Tipo de tarea'] = all_data['Tipo de tarea'].astype(str).str.strip()
+
+        if 'Fecha de entrega' in all_data.columns:
+            all_data['dt_entrega'] = all_data['Fecha de entrega'].apply(parse_khan_date)
+        else:
+            all_data['dt_entrega'] = pd.NaT
+
+        if 'Última fecha de terminación' in all_data.columns:
+            all_data['dt_terminacion'] = all_data['Última fecha de terminación'].apply(parse_khan_date)
+        else:
+            all_data['dt_terminacion'] = pd.NaT
+
+        if 'Fecha de inicio' in all_data.columns:
+            all_data['dt_inicio'] = all_data['Fecha de inicio'].apply(parse_khan_date)
+        else:
+            all_data['dt_inicio'] = pd.NaT
+
+        return all_data
     except HttpError as e:
         if getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
             st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
@@ -1284,8 +1274,23 @@ def load_teacher_raw_assignments(folder_id):
             st.error(f"Error de Google Drive API al obtener tareas: {e}")
         return pd.DataFrame()
     except Exception as e:
-        st.error(f"Error al procesar los reportes CSV de Khan Academy: {e}")
+        st.error("⚠️ El servidor está experimentando alto tráfico o error de conexión. Por favor, recarga la página en unos segundos.")
         return pd.DataFrame()
+
+
+def load_teacher_assignments(folder_id, criteria_config=None):
+    """
+    Carga las asignaciones del docente y les aplica la calificación dinámica según criteria_config.
+    """
+    raw_df = load_teacher_raw_assignments(folder_id)
+    if raw_df.empty:
+        return raw_df
+    if criteria_config is None:
+        unique_types = sorted([t for t in raw_df['Tipo de tarea'].dropna().unique() if t]) if 'Tipo de tarea' in raw_df.columns else []
+        criteria_config = load_teacher_criterios(folder_id, unique_types)
+    return apply_dynamic_grading(raw_df.copy(), criteria_config)
+
+
 
 
 def compute_student_block_grades(assignments_df, criterios_config=None):
@@ -1510,8 +1515,8 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
                 <div>
                     <h3 style="margin: 0; color: #1e293b; font-size: 1.25rem;">
-                        📅 Fecha de Entrega: <strong>{html.escape(str(due_date_str))}</strong>
-                        <span class="badge-parcial">{html.escape(str(parcial_tag))}</span>
+                        📅 Fecha de Entrega: <strong>{due_date_str}</strong>
+                        <span class="badge-parcial">{parcial_tag}</span>
                     </h3>
                     <span style="color: #64748b; font-size: 0.9rem;">
                         Actividades: {block_tasks_count} | Completadas: {block_completed} | 
@@ -1568,7 +1573,7 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
 
         st.dataframe(
             table_df,
-            width='stretch',
+            use_container_width=True,
             hide_index=True,
             column_config={
                 "Actividad": st.column_config.TextColumn("Actividad", width="large"),
@@ -1663,7 +1668,7 @@ def render_login():
             with st.form("student_login_form", clear_on_submit=False):
                 username_input = st.text_input("Usuario Khan Academy", placeholder="ej. alboresclementepaulo", key="login_st_user").strip()
                 password_input = st.text_input("Contraseña", type="password", placeholder="••••••••", key="login_st_pass").strip()
-                submit_st_btn = st.form_submit_button("Ingresar como Estudiante", width='stretch', type="primary")
+                submit_st_btn = st.form_submit_button("Ingresar como Estudiante", use_container_width=True, type="primary")
 
                 if submit_st_btn:
                     # Debounce contra clics rápidos / spam del botón
@@ -1708,9 +1713,9 @@ def render_login():
             st.caption("Ingresa con tu usuario y contraseña de docente registrados en docentes.xlsx:")
 
             with st.form("teacher_login_form", clear_on_submit=False):
-                doc_user_input = st.text_input("Usuario Docente", placeholder="ej. docente_tsm", key="login_doc_user").strip()
+                doc_user_input = st.text_input("Usuario Docente", placeholder="ej. docente_tsm o javier_admin", key="login_doc_user").strip()
                 doc_pass_input = st.text_input("Contraseña", type="password", placeholder="••••••••", key="login_doc_pass").strip()
-                submit_doc_btn = st.form_submit_button("Ingresar al Panel Docente", width='stretch', type="primary")
+                submit_doc_btn = st.form_submit_button("Ingresar al Panel Docente", use_container_width=True, type="primary")
 
                 if submit_doc_btn:
                     # Debounce contra clics repetidos
@@ -1750,7 +1755,7 @@ def render_login():
                             st.success(f"Bienvenido(a), {teacher_full_name}")
                             st.rerun()
 
-                        elif ADMIN_USERNAME and ADMIN_PASSWORD and doc_user_input == ADMIN_USERNAME and doc_pass_input == ADMIN_PASSWORD:
+                        elif doc_user_input == ADMIN_USERNAME and doc_pass_input == ADMIN_PASSWORD:
                             st.session_state['logged_in'] = True
                             st.session_state['role'] = 'admin'
                             st.session_state['username'] = ADMIN_USERNAME
@@ -1788,23 +1793,21 @@ def render_admin():
                 teacher_email = m.iloc[0].get('e_mail', '')
                 st.session_state['teacher_email'] = teacher_email
 
-    email_display = f" | Correo: <code>{html.escape(str(teacher_email))}</code>" if teacher_email else ""
+    email_display = f" | Correo: <code>{teacher_email}</code>" if teacher_email else ""
     header_col1, header_col2 = st.columns([5, 1])
     with header_col1:
         st.markdown(f"""
         <div class="main-header" style="background: linear-gradient(135deg, #0f172a 0%, #334155 100%);">
-            <h1>🛡️ Panel Docente - {html.escape(str(asignatura))}</h1>
-            <p>Docente: <strong>{html.escape(str(teacher_name))}</strong>{email_display} | Carpeta Drive: <code>{html.escape(str(carpeta_nombre))}</code> | Sincronización en memoria</p>
+            <h1>🛡️ Panel Docente - {asignatura}</h1>
+            <p>Docente: <strong>{teacher_name}</strong>{email_display} | Carpeta Drive: <code>{carpeta_nombre}</code> | Sincronización en memoria</p>
         </div>
         """, unsafe_allow_html=True)
     with header_col2:
         st.write("")
         st.write("")
-        if st.button("🚪 Cerrar Sesión", width='stretch'):
+        if st.button("🚪 Cerrar Sesión", use_container_width=True):
             st.session_state.clear()
             st.rerun()
-
-    show_flash()
 
     # Cargar datos base crudos aislados de la carpeta del docente
     raw_assignments = load_teacher_raw_assignments(teacher_folder_id)
@@ -1871,13 +1874,14 @@ def render_admin():
             def_exc = float(cur_th.get('excelente', th_defaults['excelente']))
             def_bien = float(cur_th.get('bien', th_defaults['bien']))
             def_reg = float(cur_th.get('regular', th_defaults['regular']))
+            def_riesgo = float(cur_th.get('en_riesgo', th_defaults['en_riesgo']))
 
             if sel_scale == 100 and def_exc <= 10.0:
-                def_exc, def_bien, def_reg = 95.0, 80.0, 60.0
+                def_exc, def_bien, def_reg, def_riesgo = 95.0, 80.0, 60.0, 60.0
             elif sel_scale == 10 and def_exc > 10.0:
-                def_exc, def_bien, def_reg = 9.5, 8.0, 6.0
+                def_exc, def_bien, def_reg, def_riesgo = 9.5, 8.0, 6.0, 6.0
 
-            u_col1, u_col2, u_col3 = st.columns(3)
+            u_col1, u_col2, u_col3, u_col4 = st.columns(4)
             with u_col1:
                 th_input_exc = st.number_input(
                     "🌟 'Excelente' (Mínimo)",
@@ -1905,9 +1909,15 @@ def render_admin():
                     step=0.5 if sel_scale == 10 else 1.0,
                     key=f"th_reg_{sel_scale}"
                 )
-            st.caption(f"🚨 **En riesgo:** promedio menor a {th_input_reg:g} (el mínimo de 'Regular').")
-            if not (th_input_exc >= th_input_bien >= th_input_reg):
-                st.warning("⚠️ Los umbrales deben ir de mayor a menor: Excelente ≥ Bien ≥ Regular.")
+            with u_col4:
+                th_input_riesgo = st.number_input(
+                    "🚨 'En riesgo' (Menor a)",
+                    min_value=0.0,
+                    max_value=float(sel_scale),
+                    value=def_riesgo,
+                    step=0.5 if sel_scale == 10 else 1.0,
+                    key=f"th_riesgo_{sel_scale}"
+                )
 
         with tab_parciales:
             st.markdown("##### 📅 Periodos de Calificación por Parcial")
@@ -1948,14 +1958,6 @@ def render_admin():
                     value=saved_parcial_dates['Parcial 3']['end'],
                     key="cfg_p3_end"
                 )
-
-            parcial_ranges = [('Parcial 1', p1_start, p1_end), ('Parcial 2', p2_start, p2_end), ('Parcial 3', p3_start, p3_end)]
-            parcial_issues = [f"**{n}** termina antes de iniciar" for n, a, b in parcial_ranges if a > b]
-            for (n1, _, e1), (n2, s2, _) in zip(parcial_ranges, parcial_ranges[1:]):
-                if s2 <= e1:
-                    parcial_issues.append(f"**{n2}** inicia antes de que termine **{n1}** (las fechas se traslapan)")
-            if parcial_issues:
-                st.warning("⚠️ Revisa las fechas: " + "; ".join(parcial_issues) + ".")
 
         with tab_tasks:
             st.markdown("##### 📌 Criterios de Calificación por Tipo de Tarea")
@@ -2023,7 +2025,7 @@ def render_admin():
         st.write("")
         b_col1, b_col2, _ = st.columns([2.5, 2.2, 2.5])
         with b_col1:
-            if st.button("💾 Guardar Configuración en Google Drive", type="primary", width='stretch', key="save_teacher_crit_btn"):
+            if st.button("💾 Guardar Configuración en Google Drive", type="primary", use_container_width=True, key="save_teacher_crit_btn"):
                 # 1. Crear explícitamente el diccionario de configuración con todos los ajustes
                 updated_criterios = {
                     'escala_maxima': int(sel_scale),
@@ -2032,7 +2034,7 @@ def render_admin():
                         'excelente': float(th_input_exc),
                         'bien': float(th_input_bien),
                         'regular': float(th_input_reg),
-                        'en_riesgo': float(th_input_reg)
+                        'en_riesgo': float(th_input_riesgo)
                     },
                     'parciales': {
                         'Parcial 1': {
@@ -2051,19 +2053,98 @@ def render_admin():
                     'task_criteria': current_task_criteria
                 }
 
-                level, message = save_teacher_criterios(teacher_folder_id, updated_criterios)
-                reset_config_widgets()
-                set_flash(level, message)
+                # 2. Convertir explícitamente a cadena JSON formateada
+                json_data = json.dumps(updated_criterios, indent=4, ensure_ascii=False)
+                json_bytes = json_data.encode('utf-8')
+
+                # 3. Guardar copia local de respaldo
+                try:
+                    os.makedirs(DATA_DIR, exist_ok=True)
+                    local_path = os.path.join(DATA_DIR, "criterios.json")
+                    with open(local_path, "w", encoding="utf-8") as f:
+                        f.write(json_data)
+                except Exception:
+                    pass
+
+                # 4. Subir directamente a la carpeta de Google Drive del docente usando MediaIoBaseUpload
+                service = get_drive_service()
+                drive_uploaded = False
+                if service and teacher_folder_id and not str(teacher_folder_id).startswith('PEGA_AQUÍ'):
+                    try:
+                        existing = find_drive_item(service, "criterios.json", teacher_folder_id, is_folder=False)
+                        media = MediaIoBaseUpload(io.BytesIO(json_bytes), mimetype='application/json', resumable=True)
+                        if existing:
+                            service.files().update(
+                                fileId=existing['id'],
+                                media_body=media,
+                                supportsAllDrives=True
+                            ).execute()
+                        else:
+                            file_metadata = {
+                                'name': 'criterios.json',
+                                'parents': [teacher_folder_id]
+                            }
+                            service.files().create(
+                                body=file_metadata,
+                                media_body=media,
+                                supportsAllDrives=True
+                            ).execute()
+                        drive_uploaded = True
+                    except HttpError as e:
+                        if 'storage quota' in str(e).lower() or (getattr(e, 'resp', None) and e.resp.status == 403):
+                            st.warning("⚠️ Nota: Tu cuenta de Google Drive no cuenta con cuota de escritura para Service Accounts institucionales. La configuración se ha guardado localmente en el servidor.")
+                        elif getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
+                            st.error("⚠️ El servidor de Google Drive está experimentando alto tráfico. Por favor, intenta de nuevo en unos momentos.")
+                        else:
+                            st.error(f"Error al subir criterios.json a Google Drive: {e}")
+                    except Exception as e:
+                        st.error(f"Error inesperado al subir criterios.json a Google Drive: {e}")
+
+                st.cache_data.clear()
+                if drive_uploaded:
+                    st.success("✅ Configuración y fechas de Parciales guardadas exitosamente en Google Drive (criterios.json).")
+                else:
+                    st.success("✅ Configuración guardada localmente (criterios.json).")
                 st.rerun()
 
         with b_col2:
-            if st.button("🔄 Restablecer Predeterminados", width='stretch', key="reset_teacher_crit_btn"):
+            if st.button("🔄 Restablecer Predeterminados", use_container_width=True, key="reset_teacher_crit_btn"):
                 def_crit = get_default_teacher_criterios(unique_task_types, scale=sel_scale)
-                level, message = save_teacher_criterios(teacher_folder_id, def_crit)
-                reset_config_widgets()
-                if level == 'success':
-                    level, message = 'info', "Configuración restablecida a los valores predeterminados."
-                set_flash(level, message)
+                json_data = json.dumps(def_crit, indent=4, ensure_ascii=False, default=str)
+                json_bytes = json_data.encode('utf-8')
+                try:
+                    os.makedirs(DATA_DIR, exist_ok=True)
+                    local_path = os.path.join(DATA_DIR, "criterios.json")
+                    with open(local_path, "w", encoding="utf-8") as f:
+                        f.write(json_data)
+                except Exception:
+                    pass
+
+                service = get_drive_service()
+                if service and teacher_folder_id and not str(teacher_folder_id).startswith('PEGA_AQUÍ'):
+                    try:
+                        existing = find_drive_item(service, "criterios.json", teacher_folder_id, is_folder=False)
+                        media = MediaIoBaseUpload(io.BytesIO(json_bytes), mimetype='application/json', resumable=True)
+                        if existing:
+                            service.files().update(
+                                fileId=existing['id'],
+                                media_body=media,
+                                supportsAllDrives=True
+                            ).execute()
+                        else:
+                            file_metadata = {
+                                'name': 'criterios.json',
+                                'parents': [teacher_folder_id]
+                            }
+                            service.files().create(
+                                body=file_metadata,
+                                media_body=media,
+                                supportsAllDrives=True
+                            ).execute()
+                    except Exception:
+                        pass
+                st.cache_data.clear()
+                st.info("Configuración restablecida a los valores predeterminados.")
                 st.rerun()
 
     with st.expander("☁️ Sincronización con Google Drive", expanded=True):
@@ -2074,14 +2155,14 @@ def render_admin():
         if teacher_folder_id:
             drive_folder_url = f"https://drive.google.com/drive/folders/{teacher_folder_id}"
             st.success("🟢 Conexión activa con Google Drive (Lectura en memoria sin almacenamiento en disco).")
-            st.link_button(f"📂 Abrir Carpeta '{carpeta_nombre}' en Google Drive", drive_folder_url, width='stretch')
+            st.link_button(f"📂 Abrir Carpeta '{carpeta_nombre}' en Google Drive", drive_folder_url, use_container_width=True)
         else:
             drive_folder_url = "https://drive.google.com"
             st.info("ℹ️ Sesión en modo local/administrador general.")
 
-        if st.button("🔄 Sincronizar / Refrescar Datos de Google Drive", width='stretch', type="primary", key="admin_refresh_drive_btn"):
+        if st.button("🔄 Sincronizar / Refrescar Datos de Google Drive", use_container_width=True, type="primary", key="admin_refresh_drive_btn"):
             st.cache_data.clear()
-            set_flash('success', "✅ Datos sincronizados directamente desde Google Drive.")
+            st.success("✅ Datos sincronizados directamente desde Google Drive.")
             st.rerun()
 
         st.markdown("---")
@@ -2103,22 +2184,17 @@ def render_admin():
             key="admin_upload_drive_file"
         )
         if uploaded_file is not None:
-            if st.button(f"⬆️ Subir '{uploaded_file.name}'", type="primary", width='stretch', key="admin_btn_process_upload"):
+            if st.button(f"⬆️ Subir '{uploaded_file.name}'", type="primary", use_container_width=True, key="admin_btn_process_upload"):
                 upload_success = False
                 service = get_drive_service()
                 if teacher_folder_id and service:
                     try:
                         media = MediaIoBaseUpload(io.BytesIO(uploaded_file.getvalue()), mimetype=uploaded_file.type or 'application/octet-stream', resumable=True)
-                        # Si ya existe un archivo con el mismo nombre se reemplaza (evita duplicados)
-                        existing = find_drive_item(service, uploaded_file.name, teacher_folder_id, is_folder=False)
-                        if existing:
-                            service.files().update(fileId=existing['id'], media_body=media, supportsAllDrives=True).execute()
-                        else:
-                            file_metadata = {
-                                'name': uploaded_file.name,
-                                'parents': [teacher_folder_id]
-                            }
-                            service.files().create(body=file_metadata, media_body=media, supportsAllDrives=True).execute()
+                        file_metadata = {
+                            'name': uploaded_file.name,
+                            'parents': [teacher_folder_id]
+                        }
+                        service.files().create(body=file_metadata, media_body=media, supportsAllDrives=True).execute()
                         upload_success = True
                     except HttpError as e:
                         if 'storage quota' in str(e).lower() or (getattr(e, 'resp', None) and e.resp.status == 403):
@@ -2141,8 +2217,7 @@ def render_admin():
 
                 if upload_success:
                     st.cache_data.clear()
-                    destino = "Google Drive" if (teacher_folder_id and service) else "la carpeta local `datos/`"
-                    set_flash('success', f"✅ Archivo '{uploaded_file.name}' subido exitosamente a {destino}.")
+                    st.success(f"✅ Archivo '{uploaded_file.name}' subido exitosamente a Google Drive.")
                     st.rerun()
 
         st.markdown("---")
@@ -2155,7 +2230,7 @@ def render_admin():
             data=template_bytes,
             file_name="credenciales.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            width='stretch',
+            use_container_width=True,
             key="dl_cred_template_btn"
         )
 
@@ -2181,7 +2256,7 @@ def render_admin():
     st.caption("Concentrado de calificaciones por bloques con estatus de desempeño y filtros por Grupo y Parcial.")
 
     if raw_assignments.empty:
-        st.warning(f"No hay reportes CSV de Khan Academy en la carpeta `{carpeta_nombre}`. Súbelos en la sección de Sincronización.")
+        st.warning("No hay tareas registradas en la carpeta `datos/`.")
         return
 
     # Criterios activos completos en tiempo real
@@ -2192,7 +2267,7 @@ def render_admin():
             'excelente': th_input_exc,
             'bien': th_input_bien,
             'regular': th_input_reg,
-            'en_riesgo': th_input_reg
+            'en_riesgo': th_input_riesgo
         },
         'parciales': {
             'Parcial 1': {'start': p1_start, 'end': p1_end},
@@ -2233,11 +2308,7 @@ def render_admin():
         search_student = st.text_input("🔍 Buscar estudiante:", placeholder="Nombre...").strip()
 
     with f_col4:
-        fill_option = st.selectbox(
-            "Celdas sin actividad:",
-            ["N/A", "—", "0.0"],
-            help="Cómo mostrar los bloques en los que el alumno no tiene actividades asignadas (p. ej. fechas de otro grupo). Solo afecta la visualización: esas celdas nunca cuentan para el promedio."
-        )
+        fill_option = st.selectbox("Valores sin entrega:", ["0.0", "N/A"])
 
     # Filtrar asignaciones por grupo(s)
     if selected_groups:
@@ -2273,12 +2344,6 @@ def render_admin():
         columns='Fecha de entrega',
         values='block_grade'
     ).reset_index()
-    # Bloques que existen pero aún no inician (para distinguirlos de celdas sin actividad)
-    future_pivot = block_summary.pivot(
-        index=['Grupo', 'Nombre del estudiante'],
-        columns='Fecha de entrega',
-        values='all_future'
-    ).reset_index()
 
     # Columnas de fecha existentes en el pivote
     existing_date_cols = [c for c in date_order if c in pivot_df.columns]
@@ -2298,7 +2363,7 @@ def render_admin():
 
     # Búsqueda por nombre si se especificó
     if search_student:
-        pivot_df = pivot_df[pivot_df['Nombre del estudiante'].str.contains(search_student, case=False, na=False, regex=False)]
+        pivot_df = pivot_df[pivot_df['Nombre del estudiante'].str.contains(search_student, case=False, na=False)]
 
     # --------------------------------------------------------------------------
     # MÉTRICAS Y RESUMEN RÁPIDO DE RENDIMIENTO ACADÉMICO
@@ -2323,27 +2388,20 @@ def render_admin():
         st.metric(f"👌 Regular (≥ {th_input_reg:.1f})", f"{c_reg}", f"{pct:.0f}% alumnos")
     with col_e4:
         pct = (c_riesgo / total_st * 100) if total_st else 0
-        st.metric(f"🚨 En riesgo (< {th_input_reg:.1f})", f"{c_riesgo}", f"{pct:.0f}% alumnos")
+        st.metric(f"🚨 En riesgo (< {th_input_riesgo:.1f})", f"{c_riesgo}", f"{pct:.0f}% alumnos")
 
     st.write("")
 
     # Formateo de visualización de notas
     display_pivot = pivot_df.copy()
-    future_flags = future_pivot.set_index(['Grupo', 'Nombre del estudiante']).reindex(
-        pd.MultiIndex.from_frame(display_pivot[['Grupo', 'Nombre del estudiante']])
-    )
     for col in existing_date_cols:
-        is_future_block = future_flags[col].fillna(False).astype(bool).to_numpy()
-        display_pivot[col] = [
-            f"{x:.1f}" if pd.notna(x) else ("Programada" if fut else fill_option)
-            for x, fut in zip(display_pivot[col], is_future_block)
-        ]
+        display_pivot[col] = display_pivot[col].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "Programada")
     display_pivot['Promedio General'] = display_pivot['Promedio General'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "0.0")
 
     # Renderizar la tabla pivote con Estatus inmediatamente después del nombre
     st.dataframe(
         display_pivot,
-        width='stretch',
+        use_container_width=True,
         hide_index=True,
         height=min(550, 100 + len(display_pivot) * 35),
         column_config={
@@ -2361,7 +2419,7 @@ def render_admin():
         st.download_button(
             label="📥 Descargar Concentrado (CSV)",
             data=csv_bytes,
-            file_name=f"Concentrado_Calificaciones_{now_local().strftime('%Y%m%d')}.csv",
+            file_name=f"Concentrado_Calificaciones_{datetime.now().strftime('%Y%m%d')}.csv",
             mime="text/csv"
         )
     with exp_c2:
@@ -2371,7 +2429,7 @@ def render_admin():
         st.download_button(
             label="📥 Descargar Concentrado (Excel)",
             data=excel_buff.getvalue(),
-            file_name=f"Concentrado_Calificaciones_{now_local().strftime('%Y%m%d')}.xlsx",
+            file_name=f"Concentrado_Calificaciones_{datetime.now().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
@@ -2486,7 +2544,7 @@ def render_admin():
     st.dataframe(
         styled_drilldown,
         column_order=cols_to_show,
-        width='stretch',
+        use_container_width=True,
         hide_index=True,
         height=min(550, 100 + len(drill_display) * 35),
         column_config={
@@ -2526,16 +2584,12 @@ def render_student():
         unique_task_types = ['Video', 'Ejercicio', 'Artículo']
 
     criterios_data = load_teacher_criterios(teacher_folder_id, unique_task_types)
-
-    # Calificar solo las actividades del alumno (no las de todo el grupo)
-    if not raw_assignments.empty and 'Nombre del estudiante' in raw_assignments.columns:
-        own_rows = raw_assignments[raw_assignments['Nombre del estudiante'].str.strip() == student_name.strip()]
-    else:
-        own_rows = pd.DataFrame()
-    student_tasks = apply_dynamic_grading(own_rows.copy(), criterios_data)
+    all_assignments = apply_dynamic_grading(raw_assignments.copy(), criterios_data)
 
     # CRÍTICO: Asignar Parciales vectorialmente comparando .dt.date contra datetime.date de criterios.json del docente
-    student_tasks = assign_parciales_vectorized(student_tasks, criterios_data)
+    assignments_tagged = assign_parciales_vectorized(all_assignments.copy(), criterios_data)
+
+    student_tasks = assignments_tagged[assignments_tagged['Nombre del estudiante'].str.strip() == student_name.strip()]
     student_group = student_tasks['Grupo'].iloc[0] if not student_tasks.empty else ""
 
     teacher_name = st.session_state.get('teacher_name', 'Docente')
@@ -2543,18 +2597,18 @@ def render_student():
     with header_col1:
         st.markdown(f"""
         <div class="main-header">
-            <h1>🎓 Calificaciones: {html.escape(str(student_name))}</h1>
-            <p>Grupo: <strong>{html.escape(str(student_group))}</strong> | Usuario: <code>{html.escape(str(username))}</code> | Asignatura: <strong>{html.escape(str(asignatura))}</strong> | Docente: <strong>{html.escape(str(teacher_name))}</strong></p>
+            <h1>🎓 Calificaciones: {student_name}</h1>
+            <p>Grupo: <strong>{student_group}</strong> | Usuario: <code>{username}</code> | Asignatura: <strong>{asignatura}</strong> | Docente: <strong>{teacher_name}</strong></p>
         </div>
         """, unsafe_allow_html=True)
     with header_col2:
         st.write("")
         st.write("")
-        if st.button("🚪 Cerrar Sesión", width='stretch'):
+        if st.button("🚪 Cerrar Sesión", use_container_width=True):
             st.session_state.clear()
             st.rerun()
 
-    if raw_assignments.empty:
+    if all_assignments.empty:
         st.warning("No hay tareas registradas en el sistema para esta asignatura. Contacta al docente.")
         return
 

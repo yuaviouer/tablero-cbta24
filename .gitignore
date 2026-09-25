@@ -1,5 +1,0 @@
-# Datos de alumnos y configuración local (nunca subir credenciales al repositorio)
-datos/
-.streamlit/secrets.toml
-__pycache__/
-*.pyc
