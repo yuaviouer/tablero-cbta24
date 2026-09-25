@@ -873,7 +873,7 @@ def find_drive_item(service, name, parent_id, is_folder=None):
             pageSize=10,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True
-        ).execute()
+        ).execute(num_retries=3)
         files = results.get('files', [])
         if files:
             return files[0]
@@ -922,7 +922,7 @@ def download_drive_bytes(service, file_id):
         downloader = MediaIoBaseDownload(fh, request)
         done = False
         while not done:
-            status, done = downloader.next_chunk()
+            status, done = downloader.next_chunk(num_retries=3)
         return fh.getvalue()
     except HttpError as e:
         if getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
@@ -989,7 +989,7 @@ def list_drive_csvs(service, folder_id):
             pageSize=200,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True
-        ).execute()
+        ).execute(num_retries=3)
         files = results.get('files', [])
         csv_files = [
             f for f in files
@@ -1220,7 +1220,7 @@ def load_teacher_credentials(folder_id):
             pageSize=100,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True
-        ).execute()
+        ).execute(num_retries=3)
         files = results.get('files', [])
         for f in files:
             fname = f.get('name', '').lower()
@@ -1612,6 +1612,10 @@ def render_login():
 
     # Cargar archivo maestro de docentes desde Drive
     docentes_df = load_docentes_master()
+    # Si Drive falló (p. ej. tiempo de espera agotado), no conservar el resultado vacío
+    # en caché durante una hora: el siguiente intento vuelve a consultar Drive.
+    if docentes_df.empty:
+        load_docentes_master.clear()
 
     col1, col2, col3 = st.columns([1, 2.4, 1])
     with col2:
@@ -1658,7 +1662,11 @@ def render_login():
             matched_teacher_asig = teacher_df[teacher_df['asignatura'] == selected_asig] if not teacher_df.empty else pd.DataFrame()
             folder_name = matched_teacher_asig.iloc[0]['carpeta_nombre'] if not matched_teacher_asig.empty else ""
             cached_folder_id = get_cached_folder_id(folder_name) if folder_name else None
+            if folder_name and not cached_folder_id:
+                get_cached_folder_id.clear()
             cached_creds_df = load_teacher_credentials(cached_folder_id)
+            if cached_creds_df.empty:
+                load_teacher_credentials.clear()
 
             with st.form("student_login_form", clear_on_submit=False):
                 username_input = st.text_input("Usuario Khan Academy", placeholder="ej. alboresclementepaulo", key="login_st_user").strip()
@@ -1763,6 +1771,8 @@ def render_login():
                             st.success("Acceso concedido como Administrador Maestro.")
                             st.rerun()
 
+                        elif docentes_df.empty and drive_ready:
+                            st.error("No se pudo cargar la lista de docentes desde Google Drive. Espera unos segundos y vuelve a intentarlo.")
                         else:
                             st.error("Credenciales de docente no válidas.")
 
