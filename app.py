@@ -741,14 +741,22 @@ def apply_dynamic_grading(df, criteria_config):
         valor_tardio = float(cfg.get('valor_tardio', 0.1))
         multiplicar = bool(cfg.get('multiplicar_por_aciertos', False))
 
-        # Valor de la actividad si se entrega completa (usado para proyecciones del alumno)
-        if multiplicar and total_q > 0:
-            potential_max = valor_a_tiempo * total_q
-            potential_on_time = valor_a_tiempo * total_q
-            potential_late = valor_tardio * total_q
+        # Valor de la actividad si se entrega completa (usado para proyecciones del alumno).
+        # Si el alumno no ha abierto el ejercicio, Khan no reporta sus preguntas: se usa el
+        # número de preguntas del mismo ejercicio en las filas de sus compañeros.
+        known_total = total_q
+        if known_total <= 0:
+            try:
+                fallback_total = float(row.get('_preguntas_tarea', 0))
+                known_total = fallback_total if fallback_total > 0 else 0.0
+            except (ValueError, TypeError):
+                known_total = 0.0
+        if multiplicar and known_total > 0:
+            potential_max = valor_a_tiempo * known_total
+            potential_on_time = valor_a_tiempo * known_total
+            potential_late = valor_tardio * known_total
         elif multiplicar:
-            # Khan no reporta el número de preguntas de ejercicios no iniciados:
-            # se proyecta con el valor base (entrega completa = puntaje máximo).
+            # Sin ningún dato del número de preguntas: se proyecta con el valor base.
             potential_max = valor_a_tiempo
             potential_on_time = valor_a_tiempo
             potential_late = valor_tardio
@@ -790,13 +798,15 @@ def apply_dynamic_grading(df, criteria_config):
                 earned_pts = 0.0
                 status = 'No completado'
                 obs = 'Sin entrega'
-                max_pts = (valor_a_tiempo * total_q) if (multiplicar and total_q > 0) else valor_a_tiempo
+                # Con el número de preguntas conocido (propio o de sus compañeros), el ejercicio
+                # sin entregar pesa lo mismo que para el resto del grupo.
+                max_pts = (valor_a_tiempo * known_total) if (multiplicar and known_total > 0) else valor_a_tiempo
 
             elif is_late and evaluar_intentos and attempts > max_intentos:
                 earned_pts = 0.0
                 status = f'Tardía (>{max_intentos} intentos)'
                 obs = f'Tardía + >{max_intentos} intentos (0 pts)'
-                max_pts = (valor_a_tiempo * total_q) if (multiplicar and total_q > 0) else valor_a_tiempo
+                max_pts = (valor_a_tiempo * known_total) if (multiplicar and known_total > 0) else valor_a_tiempo
 
             elif is_late:
                 chosen_val = valor_tardio
@@ -842,7 +852,10 @@ def apply_dynamic_grading(df, criteria_config):
             'max_intentos': max_intentos,
             'potential_max': round(potential_max, 2),
             'potential_on_time': round(potential_on_time, 2),
-            'potential_late': round(potential_late, 2)
+            'potential_late': round(potential_late, 2),
+            'per_correct_on_time': valor_a_tiempo if (multiplicar and known_total > 0) else None,
+            'per_correct_late': valor_tardio if (multiplicar and known_total > 0) else None,
+            'questions_known': int(known_total) if known_total > 0 else 0
         })
 
     graded_df = pd.DataFrame(graded_rows, index=df.index)
@@ -1243,6 +1256,12 @@ def prepare_raw_assignments(dfs):
     # cada tarea aparecería repetida y alteraría los promedios: se conserva la versión más reciente.
     if set(ASSIGNMENT_KEY_COLS).issubset(all_data.columns):
         all_data = all_data.drop_duplicates(subset=ASSIGNMENT_KEY_COLS, keep='last').reset_index(drop=True)
+
+    # Khan deja vacío el número de preguntas cuando el alumno no ha abierto el ejercicio.
+    # Se toma de las filas de sus compañeros para proyectar correctamente cuánto vale.
+    if {'Nombre de la tarea', 'Número total de preguntas'}.issubset(all_data.columns):
+        totals = pd.to_numeric(all_data['Número total de preguntas'], errors='coerce')
+        all_data['_preguntas_tarea'] = totals.where(totals > 0).groupby(all_data['Nombre de la tarea']).transform('max')
 
     date_sources = {
         'dt_entrega': 'Fecha de entrega',
@@ -1662,7 +1681,7 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
             if row['status'] == 'En curso':
                 aciertos_str = "—"
                 intentos_str = str(row['attempts_count']) if row['attempts_count'] else "—"
-                puntos_str = f"Vale {row['potential_max']:.1f}"
+                puntos_str = f"Vale hasta {row['potential_max']:.1f}"
                 terminacion_str = "Pendiente"
                 estado_str = "En curso"
                 detalle_str = f"Entrégala antes de: {row['Fecha de entrega']}"
@@ -1822,6 +1841,7 @@ def build_student_insights(tasks, criteria_config):
         sim = tasks.copy()
         if recover_overdue and not ins['overdue'].empty:
             m = sim['status'] == 'No completado'
+            sim.loc[m, 'max_points'] = sim.loc[m, ['max_points', 'potential_max']].max(axis=1)
             sim.loc[m, 'earned_points'] = sim.loc[m, 'potential_late']
             sim.loc[m, 'status'] = 'Tardía'
         if upcoming_mode and not ins['upcoming'].empty:
@@ -1954,6 +1974,17 @@ def build_motivation_message(ins):
     return ("Todavía estás a tiempo de recuperarte", f"Cada bloque nuevo es una oportunidad. Entrega a tiempo tus próximas actividades y pide ayuda a tu docente si algún tema se te complica.{trend_txt}")
 
 
+def _exercise_detail(r, late):
+    """'0.5 pts por acierto · 4 preguntas · máx. 3 intentos' para ejercicios que se califican por aciertos."""
+    per = r.get('per_correct_late' if late else 'per_correct_on_time')
+    if per is None or pd.isna(per) or not r.get('questions_known'):
+        return ""
+    txt = f" · {per:g} pts por acierto · {int(r['questions_known'])} preguntas"
+    if r.get('evaluar_intentos'):
+        txt += f" · máx. {int(r['max_intentos'])} intentos"
+    return html.escape(txt)
+
+
 def _task_card_html(title, meta, right, accent):
     return f"""
     <div class="task-card" style="border-left-color: {accent};">
@@ -2080,7 +2111,9 @@ def render_student_pending(ins, key_prefix):
             lines.append(f"- Si entregas tus {len(overdue)} actividad(es) atrasada(s), aunque sea tarde: **{ins['avg_recover_overdue']:.1f}**.")
         if lines:
             st.markdown("\n".join(lines))
-        st.caption("Estimación suponiendo que respondes todo correctamente y sin intentos extra. Las entregas tardías valen menos, ¡pero siempre suman!")
+        st.caption("Estimación suponiendo que respondes todo correctamente sin pasarte del máximo de intentos. "
+                   "En los ejercicios, los puntos dependen de tus aciertos; si una entrega tardía supera el máximo de intentos, vale 0. "
+                   "Las entregas tardías valen menos, ¡pero siempre suman!")
         st.link_button("🚀 Ir a Khan Academy", "https://es.khanacademy.org/", type="primary", width='stretch')
         st.divider()
 
@@ -2097,8 +2130,8 @@ def render_student_pending(ins, key_prefix):
             cards = [
                 _task_card_html(
                     r['Nombre de la tarea'],
-                    html.escape(str(r['Tipo de tarea'])),
-                    f"Vale<br><strong>{r['potential_max']:.1f} pts</strong>",
+                    html.escape(str(r['Tipo de tarea'])) + _exercise_detail(r, late=False),
+                    f"Vale hasta<br><strong>{r['potential_max']:.1f} pts</strong>",
                     '#dc2626' if urgent else '#2563eb'
                 ) for _, r in grp.iterrows()
             ]
@@ -2111,8 +2144,8 @@ def render_student_pending(ins, key_prefix):
         cards = [
             _task_card_html(
                 r['Nombre de la tarea'],
-                f"{html.escape(str(r['Tipo de tarea']))} · Venció {format_short_date(r['dt_entrega'], with_time=False)} ({relative_days_label(r['dt_entrega'])})",
-                f"Recuperas<br><strong>{r['potential_late']:.1f} pts</strong>",
+                f"{html.escape(str(r['Tipo de tarea']))} · Venció {format_short_date(r['dt_entrega'], with_time=False)} ({relative_days_label(r['dt_entrega'])})" + _exercise_detail(r, late=True),
+                f"Recuperas hasta<br><strong>{r['potential_late']:.1f} pts</strong>",
                 '#d97706'
             ) for _, r in overdue.iterrows()
         ]
