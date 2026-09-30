@@ -1725,6 +1725,15 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
 # ==============================================================================
 # EXPERIENCIA DEL ESTUDIANTE: INICIO, PENDIENTES, RECUPERACIÓN Y LOGROS
 # ==============================================================================
+def compact_html(markup):
+    """
+    Une el HTML en una sola línea antes de pasarlo a st.markdown. Si queda una línea en
+    blanco seguida de líneas con sangría, Markdown lo interpreta como bloque de código
+    y el docente ve el HTML en crudo (p. ej. en las tarjetas sin aviso opcional).
+    """
+    return "".join(line.strip() for line in str(markup).splitlines())
+
+
 MESES_CORTOS = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic']
 
 STATUS_STYLES = {
@@ -1998,7 +2007,7 @@ def render_badges(ins):
             <div class="badge-state">{state}</div>
             <div class="badge-desc">{detail}</div>
         </div>""")
-    st.markdown(f"<div class='badge-grid'>{''.join(cards)}</div>", unsafe_allow_html=True)
+    st.markdown(compact_html(f"<div class='badge-grid'>{''.join(cards)}</div>"), unsafe_allow_html=True)
 
 
 def render_student_home(ins):
@@ -2006,7 +2015,7 @@ def render_student_home(ins):
     title, body = build_motivation_message(ins)
     avg_txt = f"{ins['avg']:.1f}" if ins['avg'] is not None else "—"
     status_txt = ins['status'] or "Sin evaluar"
-    st.markdown(f"""
+    st.markdown(compact_html(f"""
     <div class="hero-card" style="border-left-color: {style['accent']};">
         <div class="hero-top">
             <div>
@@ -2017,7 +2026,7 @@ def render_student_home(ins):
         </div>
         <div class="hero-msg"><strong>{html.escape(title)}</strong><br>{html.escape(body)}</div>
     </div>
-    """, unsafe_allow_html=True)
+    """), unsafe_allow_html=True)
 
     # Fila compacta de indicadores (se mantiene en una sola fila también en celular)
     parcial_label = f"Promedio {ins['parcial_actual']}" if ins['parcial_actual'] else "Parcial actual"
@@ -2093,7 +2102,7 @@ def render_student_pending(ins, key_prefix):
                     '#dc2626' if urgent else '#2563eb'
                 ) for _, r in grp.iterrows()
             ]
-            st.markdown("".join(cards), unsafe_allow_html=True)
+            st.markdown(compact_html("".join(cards)), unsafe_allow_html=True)
 
     st.markdown(f"#### ⚠️ Atrasadas — aún puedes entregarlas ({len(overdue)})")
     if overdue.empty:
@@ -2107,7 +2116,7 @@ def render_student_pending(ins, key_prefix):
                 '#d97706'
             ) for _, r in overdue.iterrows()
         ]
-        st.markdown("".join(cards), unsafe_allow_html=True)
+        st.markdown(compact_html("".join(cards)), unsafe_allow_html=True)
 
     if not scheduled.empty:
         next_start = scheduled['dt_inicio'].iloc[0]
@@ -2437,7 +2446,7 @@ def render_teacher_summary(tasks, block_summary, criteria_config, color_map, asi
                     <div><div class="sc-label">Acción sugerida</div><ul>{actions}</ul></div>
                 </div>
             </div>""")
-        st.markdown("<div class='student-cards'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
+        st.markdown(compact_html("<div class='student-cards'>" + "".join(cards) + "</div>"), unsafe_allow_html=True)
         st.download_button(
             "📥 Descargar lista (CSV)", att_df[export_cols_att].to_csv(index=False).encode('utf-8-sig'),
             file_name=f"Alumnos_atencion_{now_local().strftime('%Y%m%d')}.csv", mime="text/csv",
@@ -2460,7 +2469,7 @@ def render_teacher_summary(tasks, block_summary, criteria_config, color_map, asi
                 </div>
                 <ul>{kudos}</ul>
             </div>""")
-        st.markdown("<div class='student-cards'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
+        st.markdown(compact_html("<div class='student-cards'>" + "".join(cards) + "</div>"), unsafe_allow_html=True)
         st.download_button(
             "📥 Descargar lista (CSV)", rec_df[export_cols_rec].to_csv(index=False).encode('utf-8-sig'),
             file_name=f"Alumnos_reconocimiento_{now_local().strftime('%Y%m%d')}.csv", mime="text/csv",
@@ -2540,11 +2549,11 @@ def render_task_analysis(tasks):
             f"<li><strong>{html.escape(str(r['Actividad']))}</strong> ({html.escape(str(r['Grupos']))}): {html.escape(', '.join(r['_issues']))}</li>"
             for _, r in flagged.head(5).iterrows()
         )
-        st.markdown(f"""
+        st.markdown(compact_html(f"""
         <div class="student-card" style="border-left-color: #d97706;">
             <div class="sc-label">🧩 Temas que conviene repasar</div>
             <ul>{items}</ul>
-        </div>""", unsafe_allow_html=True)
+        </div>"""), unsafe_allow_html=True)
         st.write("")
 
     show = df.drop(columns=['_issues', '_dt'])
@@ -2621,7 +2630,7 @@ def render_study_pairs(class_df):
             </div>
             {note}
         </div>""")
-    st.markdown("<div class='student-cards'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
+    st.markdown(compact_html("<div class='student-cards'>" + "".join(cards) + "</div>"), unsafe_allow_html=True)
     if unpaired:
         st.caption("Sin pareja disponible en su grupo: " + ", ".join(unpaired))
     st.download_button(
