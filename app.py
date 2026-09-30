@@ -798,13 +798,15 @@ def apply_dynamic_grading(df, criteria_config):
                 earned_pts = 0.0
                 status = 'No completado'
                 obs = 'Sin entrega'
-                max_pts = (valor_a_tiempo * total_q) if (multiplicar and total_q > 0) else valor_a_tiempo
+                # Con el número de preguntas conocido (propio o de sus compañeros), el ejercicio
+                # sin entregar pesa lo mismo que para el resto del grupo.
+                max_pts = (valor_a_tiempo * known_total) if (multiplicar and known_total > 0) else valor_a_tiempo
 
             elif is_late and evaluar_intentos and attempts > max_intentos:
                 earned_pts = 0.0
                 status = f'Tardía (>{max_intentos} intentos)'
                 obs = f'Tardía + >{max_intentos} intentos (0 pts)'
-                max_pts = (valor_a_tiempo * total_q) if (multiplicar and total_q > 0) else valor_a_tiempo
+                max_pts = (valor_a_tiempo * known_total) if (multiplicar and known_total > 0) else valor_a_tiempo
 
             elif is_late:
                 chosen_val = valor_tardio
