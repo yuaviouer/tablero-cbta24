@@ -160,6 +160,22 @@ st.markdown("""
     .mini-val { font-size: 1.5rem; font-weight: 700; line-height: 1.2; }
     .mini-val small { font-size: 0.75rem; font-weight: 500; color: #64748b; }
     .mini-val small.delta-up { color: #15803d; font-weight: 700; }
+    .mini-val small.delta-down { color: #b91c1c; font-weight: 700; }
+    .mini-sub { font-size: 0.75rem; color: #475569; margin-top: 2px; line-height: 1.3; }
+    .teacher-stats { grid-template-columns: repeat(4, 1fr); }
+    .student-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 10px; margin-bottom: 10px; }
+    .student-card {
+        background: #ffffff; border: 1px solid #e2e8f0; border-left: 5px solid #2563eb;
+        border-radius: 10px; padding: 12px 14px; color: #0f172a;
+    }
+    .student-card ul { margin: 4px 0 0 0; padding-left: 18px; font-size: 0.85rem; color: #334155; }
+    .student-card li { margin: 1px 0; }
+    .sc-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+    .sc-name { font-weight: 700; font-size: 0.95rem; display: block; }
+    .sc-meta { font-size: 0.8rem; color: #64748b; }
+    .sc-badge { padding: 2px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 700; white-space: nowrap; }
+    .sc-body { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 6px; }
+    .sc-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: #64748b; font-weight: 700; }
     .badge-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
     .badge-card {
         background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px;
@@ -181,6 +197,9 @@ st.markdown("""
         .badge-grid { grid-template-columns: repeat(2, 1fr); }
         .mini-val { font-size: 1.2rem; }
         .mini-stat { padding: 8px; }
+        .teacher-stats { grid-template-columns: repeat(2, 1fr); }
+        .student-cards { grid-template-columns: 1fr; }
+        .sc-body { grid-template-columns: 1fr; }
     }
     .badge-parcial {
         display: inline-block;
@@ -2117,6 +2136,337 @@ def render_student_experience(student_name, tasks, criteria_config, key_prefix="
 
 
 # ==============================================================================
+# PANEL DOCENTE: RESUMEN, ALUMNOS QUE NECESITAN ATENCIÓN Y RECONOCIMIENTOS
+# ==============================================================================
+# Paleta categórica (orden fijo) para distinguir grupos en las gráficas
+GROUP_PALETTE = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#4a3aa7', '#e34948']
+
+
+def group_color_map(all_groups):
+    """El color sigue al grupo (no a su posición en el filtro)."""
+    return {g: GROUP_PALETTE[i % len(GROUP_PALETTE)] for i, g in enumerate(sorted(all_groups))}
+
+
+def build_class_insights(tasks, block_summary, criteria_config):
+    """
+    Resume el desempeño de cada alumno para detectar a quién apoyar y a quién reconocer.
+    Retorna un DataFrame con una fila por alumno.
+    """
+    cfg = criteria_config if isinstance(criteria_config, dict) else {}
+    keys = ['Grupo', 'Nombre del estudiante', 'Fecha de entrega']
+
+    blocks = block_summary.copy()
+    status_by_block = tasks.groupby(keys)['status']
+    blocks = blocks.merge(
+        pd.DataFrame({
+            'has_pending': status_by_block.agg(lambda s: s.isin(NOT_EVALUATED_STATUSES).any()),
+            'all_on_time': status_by_block.agg(lambda s: s.astype(str).str.startswith('A tiempo').all()),
+            'all_missing': status_by_block.agg(lambda s: (s == 'No completado').all()),
+        }).reset_index(),
+        on=keys, how='left'
+    )
+    blocks['finished'] = (~blocks['has_pending'].fillna(True).astype(bool)) & blocks['block_grade'].notna()
+
+    rows = []
+    for (grupo, nombre), b in blocks.groupby(['Grupo', 'Nombre del estudiante']):
+        fb = b[b['finished']].sort_values('dt_entrega')
+        grades = b['block_grade'].dropna()
+        avg = float(grades.mean()) if not grades.empty else None
+
+        last = prev_avg = trend = None
+        if len(fb) >= 1:
+            last = float(fb['block_grade'].iloc[-1])
+        if len(fb) >= 2:
+            prev_avg = float(fb['block_grade'].iloc[:-1].mean())
+            trend = last - prev_avg
+
+        missing_streak = 0
+        for v in reversed(fb['all_missing'].tolist()):
+            if not v:
+                break
+            missing_streak += 1
+        on_time_streak = 0
+        for v in reversed(fb['all_on_time'].tolist()):
+            if not v:
+                break
+            on_time_streak += 1
+
+        t = tasks[(tasks['Grupo'] == grupo) & (tasks['Nombre del estudiante'] == nombre)]
+        evaluated = t[~t['status'].isin(NOT_EVALUATED_STATUSES)]
+        completed = evaluated[evaluated['is_completed'].astype(bool)]
+        n_late = int(evaluated['is_late'].astype(bool).sum())
+        n_on_time = int(evaluated['status'].astype(str).str.startswith('A tiempo').sum())
+        excess = t[t['evaluar_intentos'].astype(bool) & (t['attempts_count'] > t['max_intentos']) & ~t['status'].isin(NOT_EVALUATED_STATUSES)]
+
+        rows.append({
+            'Grupo': grupo,
+            'Nombre del estudiante': nombre,
+            'avg': avg,
+            'status': classify_student(avg, cfg.get('thresholds', {}), cfg.get('escala_maxima', 10)) if avg is not None else None,
+            'last': last,
+            'prev_avg': prev_avg,
+            'trend': trend,
+            'missing_streak': missing_streak,
+            'on_time_streak': on_time_streak,
+            'n_evaluated': len(evaluated),
+            'n_completed': len(completed),
+            'n_late': n_late,
+            'n_on_time': n_on_time,
+            'n_overdue': int((t['status'] == 'No completado').sum()),
+            'n_excess_attempts': len(excess),
+        })
+    return pd.DataFrame(rows)
+
+
+def build_attention_lists(class_df, criteria_config):
+    """Aplica reglas simples y explicables para las listas de atención y reconocimiento."""
+    cfg = criteria_config if isinstance(criteria_config, dict) else {}
+    scale = int(cfg.get('escala_maxima', 10))
+    step = 1.0 if scale == 10 else 10.0
+    th = cfg.get('thresholds', {}) or {}
+    min_pass = float(th.get('regular', 6.0 if scale == 10 else 60.0))
+
+    attention, recognition = [], []
+    for _, r in class_df.iterrows():
+        reasons, actions, severity = [], [], 0
+        if r['missing_streak'] >= 2:
+            reasons.append(f"No entregó nada en los últimos {r['missing_streak']} bloques")
+            actions.append("Contactarlo (y a su familia si es necesario); verificar que pueda entrar a Khan Academy")
+            severity += 3
+        if r['status'] == 'En riesgo':
+            reasons.append(f"Promedio {r['avg']:.1f}, bajo el mínimo ({min_pass:g})")
+            actions.append(f"Plática individual y plan para entregar sus {r['n_overdue']} atrasada(s)" if r['n_overdue'] else "Plática individual y seguimiento semanal")
+            severity += 2
+        if r['trend'] is not None and r['trend'] <= -1.5 * step:
+            reasons.append(f"Bajó de {r['prev_avg']:.1f} a {r['last']:.1f} en su último bloque")
+            actions.append("Preguntarle qué pasó esta semana")
+            severity += 2
+        if r['n_completed'] >= 3 and r['n_late'] / r['n_completed'] >= 0.4:
+            reasons.append(f"Entrega tarde el {r['n_late'] / r['n_completed'] * 100:.0f}% de sus actividades")
+            actions.append("Recordatorios de fechas; ayudarle a organizar su semana")
+            severity += 1
+        if r['n_excess_attempts'] >= 2:
+            reasons.append(f"Excede los intentos en {r['n_excess_attempts']} ejercicios")
+            actions.append("Repasar el tema con él; posible dificultad de comprensión")
+            severity += 1
+        if reasons:
+            attention.append({
+                'Prioridad': '🔴 Alta' if severity >= 3 else '🟠 Media',
+                '_sev': severity,
+                'Nombre del estudiante': r['Nombre del estudiante'],
+                'Grupo': r['Grupo'],
+                'Promedio': f"{r['avg']:.1f}" if r['avg'] is not None else "—",
+                'Motivos': " · ".join(reasons),
+                'Acción sugerida': "; ".join(dict.fromkeys(actions)),
+                '_reasons': reasons,
+                '_actions': list(dict.fromkeys(actions)),
+                'Atrasadas': int(r['n_overdue']),
+            })
+
+        kudos = []
+        if r['status'] == 'Excelente':
+            kudos.append(f"Promedio excelente ({r['avg']:.1f})")
+        if r['on_time_streak'] >= 3:
+            kudos.append(f"{r['on_time_streak']} bloques seguidos entregando todo a tiempo")
+        if r['trend'] is not None and r['trend'] >= step:
+            kudos.append(f"Mejoró de {r['prev_avg']:.1f} a {r['last']:.1f}")
+        if r['n_evaluated'] >= 5 and r['n_on_time'] == r['n_evaluated']:
+            kudos.append("100% de actividades a tiempo")
+        if kudos:
+            recognition.append({
+                'Nombre del estudiante': r['Nombre del estudiante'],
+                'Grupo': r['Grupo'],
+                'Promedio': f"{r['avg']:.1f}" if r['avg'] is not None else "—",
+                'Motivo de reconocimiento': " · ".join(kudos),
+                '_kudos': kudos,
+                '_improved': r['trend'] is not None and r['trend'] >= step,
+            })
+
+    att_df = pd.DataFrame(attention)
+    if not att_df.empty:
+        att_df = att_df.sort_values(['_sev', 'Atrasadas'], ascending=[False, False]).drop(columns='_sev')
+    rec_df = pd.DataFrame(recognition)
+    if not rec_df.empty:
+        # Primero quienes mejoraron: el esfuerzo también merece reconocimiento
+        rec_df = rec_df.sort_values('_improved', ascending=False).drop(columns='_improved')
+    return att_df, rec_df
+
+
+def render_group_trend_chart(block_summary, tasks, criteria_config, color_map):
+    cfg = criteria_config if isinstance(criteria_config, dict) else {}
+    scale = int(cfg.get('escala_maxima', 10))
+    max_grade = scale * float(cfg.get('peso_khan', 100)) / 100.0
+    min_pass = float((cfg.get('thresholds', {}) or {}).get('regular', 6.0 if scale == 10 else 60.0))
+
+    # Solo bloques cerrados (sin actividades en curso ni programadas)
+    pending_dates = set(tasks.loc[tasks['status'].isin(NOT_EVALUATED_STATUSES), 'Fecha de entrega'])
+    data = block_summary[block_summary['block_grade'].notna() & ~block_summary['Fecha de entrega'].isin(pending_dates)]
+    if data.empty:
+        st.caption("La gráfica aparecerá cuando haya bloques cerrados.")
+        return
+    # Se agrupa por semana (lunes) porque cada grupo puede tener fechas de entrega distintas
+    data = data.dropna(subset=['dt_entrega']).copy()
+    data['semana'] = data['dt_entrega'].dt.normalize() - pd.to_timedelta(data['dt_entrega'].dt.weekday, unit='D')
+    trend = data.groupby(['Grupo', 'semana'], as_index=False).agg(
+        Promedio=('block_grade', 'mean'), Alumnos=('Nombre del estudiante', 'nunique')
+    ).rename(columns={'semana': 'dt'}).sort_values('dt')
+    trend['Promedio'] = trend['Promedio'].round(1)
+    trend['Entrega'] = trend['dt'].apply(lambda d: "Sem. " + format_short_date(d, with_time=False))
+    order = trend.drop_duplicates('Entrega')['Entrega'].tolist()
+
+    import altair as alt
+    groups = sorted(trend['Grupo'].unique())
+    color = alt.Color('Grupo:N', scale=alt.Scale(domain=groups, range=[color_map[g] for g in groups]),
+                      legend=alt.Legend(orient='top', title=None) if len(groups) > 1 else None)
+    line = alt.Chart(trend).mark_line(strokeWidth=2, point=alt.OverlayMarkDef(size=64, filled=True)).encode(
+        x=alt.X('Entrega:N', sort=order, title=None, axis=alt.Axis(labelAngle=0, grid=False)),
+        y=alt.Y('Promedio:Q', scale=alt.Scale(domain=[0, max_grade]), title=None, axis=alt.Axis(gridOpacity=0.4, tickCount=5)),
+        color=color,
+        tooltip=[alt.Tooltip('Grupo:N'), alt.Tooltip('Entrega:N'), alt.Tooltip('Promedio:Q', format='.1f'), alt.Tooltip('Alumnos:Q')]
+    )
+    rule_df = pd.DataFrame({'y': [min_pass], 'label': [f"Mínimo aprobatorio ({min_pass:g})"]})
+    rule = alt.Chart(rule_df).mark_rule(strokeDash=[4, 4], color='#94a3b8', strokeWidth=1.5).encode(y='y:Q')
+    rule_text = alt.Chart(rule_df).mark_text(align='left', dx=4, dy=-7, color='#64748b', fontSize=11).encode(
+        y='y:Q', x=alt.value(0), text='label:N'
+    )
+    st.altair_chart((rule + rule_text + line).properties(height=280), width='stretch')
+
+
+def render_teacher_summary(tasks, block_summary, criteria_config, color_map):
+    """Pestaña 'Resumen y acciones' del panel docente."""
+    cfg = criteria_config if isinstance(criteria_config, dict) else {}
+    class_df = build_class_insights(tasks, block_summary, cfg)
+    if class_df.empty:
+        st.info("Aún no hay información suficiente para el resumen.")
+        return
+    att_df, rec_df = build_attention_lists(class_df, cfg)
+    scale = int(cfg.get('escala_maxima', 10))
+    step = 1.0 if scale == 10 else 10.0
+
+    # --- Indicadores clave
+    total = len(class_df)
+    n_riesgo = int((class_df['status'] == 'En riesgo').sum())
+    n_bajaron = int((class_df['trend'].fillna(0) <= -step).sum())
+
+    evaluated = tasks[~tasks['status'].isin(NOT_EVALUATED_STATUSES)]
+    pending_dates = set(tasks.loc[tasks['status'].isin(NOT_EVALUATED_STATUSES), 'Fecha de entrega'])
+    closed = evaluated[~evaluated['Fecha de entrega'].isin(pending_dates)].dropna(subset=['dt_entrega'])
+    on_time_txt, on_time_delta, on_time_label = "—", "", "⏰ A tiempo (última semana)"
+    if not closed.empty:
+        # Ventanas de 7 días (los grupos pueden tener fechas de entrega distintas)
+        last_dt = closed['dt_entrega'].max()
+        week = closed[closed['dt_entrega'] > last_dt - pd.Timedelta(days=7)]
+        prev_week = closed[(closed['dt_entrega'] <= last_dt - pd.Timedelta(days=7)) & (closed['dt_entrega'] > last_dt - pd.Timedelta(days=14))]
+        last_pct = week['status'].astype(str).str.startswith('A tiempo').mean() * 100
+        on_time_txt = f"{last_pct:.0f}%"
+        if not prev_week.empty:
+            diff = last_pct - prev_week['status'].astype(str).str.startswith('A tiempo').mean() * 100
+            arrow = "▲" if diff >= 0 else "▼"
+            cls = "delta-up" if diff >= 0 else "delta-down"
+            on_time_delta = f" <small class='{cls}'>{arrow} {abs(diff):.0f} pts vs. semana anterior</small>"
+
+    worst_txt, worst_detail = "—", ""
+    by_task = evaluated.groupby('Nombre de la tarea').agg(
+        tasa=('is_completed', 'mean'), n=('is_completed', 'size'), tipo=('Tipo de tarea', 'first')
+    )
+    by_task = by_task[by_task['n'] >= 3]
+    if not by_task.empty:
+        worst = by_task['tasa'].idxmin()
+        worst_txt = f"{by_task.loc[worst, 'tasa'] * 100:.0f}% <small>la completó</small>"
+        worst_detail = f"<div class='mini-sub'>{html.escape(str(worst))}</div>"
+
+    stats = [
+        ("🚨 En riesgo", f"{n_riesgo} <small>de {total}</small>", ""),
+        ("📉 Bajaron en su último bloque", f"{n_bajaron}", ""),
+        (on_time_label, f"{on_time_txt}{on_time_delta}", ""),
+        ("🧩 Actividad con menos entregas", worst_txt, worst_detail),
+    ]
+    st.markdown(
+        "<div class='mini-stats teacher-stats'>" + "".join(
+            f"<div class='mini-stat'><div class='mini-label'>{lbl}</div><div class='mini-val'>{val}</div>{sub}</div>"
+            for lbl, val, sub in stats
+        ) + "</div>",
+        unsafe_allow_html=True
+    )
+
+    # --- Entrega en curso: quién ya completó y quién no
+    in_progress = tasks[tasks['status'] == 'En curso']
+    if not in_progress.empty:
+        next_dt = in_progress['dt_entrega'].min()
+        due_rows = tasks[tasks['dt_entrega'] == next_dt]
+        per_student = due_rows.groupby(['Grupo', 'Nombre del estudiante'])['status'].agg(
+            lambda s: int((s == 'En curso').sum())
+        )
+        done = int((per_student == 0).sum())
+        st.info(f"📅 **Próxima entrega: {format_short_date(next_dt)} ({relative_days_label(next_dt)})** — "
+                f"{done} de {len(per_student)} alumnos ya completaron todo.")
+        missing = per_student[per_student > 0].reset_index().rename(columns={'status': 'Actividades por entregar'})
+        if not missing.empty:
+            with st.expander(f"Ver los {len(missing)} alumnos que aún no completan esta entrega (para enviarles un recordatorio)"):
+                st.dataframe(missing.sort_values(['Grupo', 'Nombre del estudiante']), hide_index=True, width='stretch')
+
+    # --- Listas de acción
+    export_cols_att = ['Prioridad', 'Nombre del estudiante', 'Grupo', 'Promedio', 'Motivos', 'Acción sugerida', 'Atrasadas']
+    export_cols_rec = ['Nombre del estudiante', 'Grupo', 'Promedio', 'Motivo de reconocimiento']
+
+    st.markdown("#### 🆘 Necesitan atención")
+    if att_df.empty:
+        st.success("🎉 Ningún alumno requiere atención especial con los filtros actuales.")
+    else:
+        st.caption(f"{len(att_df)} alumno(s), ordenados por prioridad. Para ver el detalle de alguno, usa la pestaña **🔍 Detalle por alumno**.")
+        cards = []
+        for _, r in att_df.iterrows():
+            high = r['Prioridad'].endswith('Alta')
+            reasons = "".join(f"<li>{html.escape(x)}</li>" for x in r['_reasons'])
+            actions = "".join(f"<li>{html.escape(x)}</li>" for x in r['_actions'])
+            cards.append(f"""
+            <div class="student-card" style="border-left-color: {'#dc2626' if high else '#d97706'};">
+                <div class="sc-head">
+                    <div><span class="sc-name">{html.escape(r['Nombre del estudiante'])}</span>
+                    <span class="sc-meta">{html.escape(str(r['Grupo']))} · Promedio {r['Promedio']}{f" · {r['Atrasadas']} atrasada(s)" if r['Atrasadas'] else ""}</span></div>
+                    <span class="sc-badge" style="background: {'#fee2e2' if high else '#fef3c7'}; color: {'#991b1b' if high else '#92400e'};">{r['Prioridad']}</span>
+                </div>
+                <div class="sc-body">
+                    <div><div class="sc-label">Motivos</div><ul>{reasons}</ul></div>
+                    <div><div class="sc-label">Acción sugerida</div><ul>{actions}</ul></div>
+                </div>
+            </div>""")
+        st.markdown("<div class='student-cards'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
+        st.download_button(
+            "📥 Descargar lista (CSV)", att_df[export_cols_att].to_csv(index=False).encode('utf-8-sig'),
+            file_name=f"Alumnos_atencion_{now_local().strftime('%Y%m%d')}.csv", mime="text/csv",
+            key="dl_attention"
+        )
+
+    st.markdown("#### 🌟 Para reconocer")
+    if rec_df.empty:
+        st.caption("Aún no hay alumnos con logros destacados en este periodo.")
+    else:
+        st.caption("Reconócelos en clase: quienes mejoraron aparecen primero, porque el esfuerzo también cuenta.")
+        cards = []
+        for _, r in rec_df.iterrows():
+            kudos = "".join(f"<li>{html.escape(x)}</li>" for x in r['_kudos'])
+            cards.append(f"""
+            <div class="student-card" style="border-left-color: #16a34a;">
+                <div class="sc-head">
+                    <div><span class="sc-name">{html.escape(r['Nombre del estudiante'])}</span>
+                    <span class="sc-meta">{html.escape(str(r['Grupo']))} · Promedio {r['Promedio']}</span></div>
+                </div>
+                <ul>{kudos}</ul>
+            </div>""")
+        st.markdown("<div class='student-cards'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
+        st.download_button(
+            "📥 Descargar lista (CSV)", rec_df[export_cols_rec].to_csv(index=False).encode('utf-8-sig'),
+            file_name=f"Alumnos_reconocimiento_{now_local().strftime('%Y%m%d')}.csv", mime="text/csv",
+            key="dl_recognition"
+        )
+
+    st.markdown("#### 📈 Tendencia por grupo")
+    st.caption("Promedio de cada grupo en los bloques ya cerrados.")
+    render_group_trend_chart(block_summary, tasks, cfg, color_map)
+
+
+# ==============================================================================
 # VISTA: INICIO DE SESIÓN CON ENRUTAMIENTO DINÁMICO (GOOGLE DRIVE)
 # ==============================================================================
 def render_login():
@@ -2715,8 +3065,8 @@ def render_admin():
     # --------------------------------------------------------------------------
     # SECCIÓN 2: MASTER DASHBOARD CON CLASIFICACIÓN DE RENDIMIENTO (ESTATUS)
     # --------------------------------------------------------------------------
-    st.markdown("### 📊 Master Dashboard de Calificaciones")
-    st.caption("Concentrado de calificaciones por bloques con estatus de desempeño y filtros por Grupo y Parcial.")
+    st.markdown("### 📊 Seguimiento de mis grupos")
+    st.caption("Filtra por grupo y parcial; los filtros aplican a todas las pestañas.")
 
     if raw_assignments.empty:
         st.warning(f"No hay reportes CSV de Khan Academy en la carpeta `{carpeta_nombre}`. Súbelos en la sección de Sincronización.")
@@ -2751,7 +3101,7 @@ def render_admin():
     available_groups = sorted([g for g in assignments_tagged['Grupo'].dropna().unique() if g])
 
     # Controles del Master Dashboard
-    f_col1, f_col2, f_col3, f_col4 = st.columns([3, 2, 2, 2])
+    f_col1, f_col2 = st.columns([3, 2])
 
     with f_col1:
         selected_groups = st.multiselect(
@@ -2765,16 +3115,6 @@ def render_admin():
         filtro_parcial_master = st.selectbox(
             "Filtrar por Parcial:",
             ["Todos los Parciales", "Parcial 1", "Parcial 2", "Parcial 3", "Sin asignar"]
-        )
-
-    with f_col3:
-        search_student = st.text_input("🔍 Buscar estudiante:", placeholder="Nombre...").strip()
-
-    with f_col4:
-        fill_option = st.selectbox(
-            "Celdas sin actividad:",
-            ["N/A", "—", "0.0"],
-            help="Cómo mostrar los bloques en los que el alumno no tiene actividades asignadas (p. ej. fechas de otro grupo). Solo afecta la visualización: esas celdas nunca cuentan para el promedio."
         )
 
     # Filtrar asignaciones por grupo(s)
@@ -2839,219 +3179,235 @@ def render_admin():
     column_arrangement = ['Grupo', 'Nombre del estudiante', 'Estatus'] + existing_date_cols + ['Promedio General']
     pivot_df = pivot_df[column_arrangement]
 
-    # Búsqueda por nombre si se especificó
-    if search_student:
-        pivot_df = pivot_df[pivot_df['Nombre del estudiante'].str.contains(search_student, case=False, na=False, regex=False)]
+    tab_resumen, tab_conc, tab_detalle = st.tabs(["🎯 Resumen y acciones", "📊 Concentrado", "🔍 Detalle por alumno"])
 
-    # --------------------------------------------------------------------------
-    # MÉTRICAS Y RESUMEN RÁPIDO DE RENDIMIENTO ACADÉMICO
-    # --------------------------------------------------------------------------
-    st.markdown("#### 🎯 Distribución de Rendimiento Académico")
-    estatus_counts = pivot_df['Estatus'].value_counts()
-    c_exc = int(estatus_counts.get('Excelente', 0))
-    c_bien = int(estatus_counts.get('Bien', 0))
-    c_reg = int(estatus_counts.get('Regular', 0))
-    c_riesgo = int(estatus_counts.get('En riesgo', 0))
-    total_st = len(pivot_df)
+    with tab_resumen:
+        render_teacher_summary(active_master, block_summary, active_criteria_config, group_color_map(available_groups))
 
-    col_e1, col_e2, col_e3, col_e4 = st.columns(4)
-    with col_e1:
-        pct = (c_exc / total_st * 100) if total_st else 0
-        st.metric(f"🌟 Excelente (≥ {th_input_exc:.1f})", f"{c_exc}", f"{pct:.0f}% alumnos")
-    with col_e2:
-        pct = (c_bien / total_st * 100) if total_st else 0
-        st.metric(f"👍 Bien (≥ {th_input_bien:.1f})", f"{c_bien}", f"{pct:.0f}% alumnos")
-    with col_e3:
-        pct = (c_reg / total_st * 100) if total_st else 0
-        st.metric(f"👌 Regular (≥ {th_input_reg:.1f})", f"{c_reg}", f"{pct:.0f}% alumnos")
-    with col_e4:
-        pct = (c_riesgo / total_st * 100) if total_st else 0
-        st.metric(f"🚨 En riesgo (< {th_input_reg:.1f})", f"{c_riesgo}", f"{pct:.0f}% alumnos")
+    with tab_conc:
+        # Controles propios del concentrado
+        cf_col1, cf_col2 = st.columns([3, 2])
+        with cf_col1:
+            search_student = st.text_input("🔍 Buscar estudiante:", placeholder="Nombre...").strip()
+        with cf_col2:
+            fill_option = st.selectbox(
+                "Celdas sin actividad:",
+                ["N/A", "—", "0.0"],
+                help="Cómo mostrar los bloques en los que el alumno no tiene actividades asignadas (p. ej. fechas de otro grupo). Solo afecta la visualización: esas celdas nunca cuentan para el promedio."
+            )
 
-    st.write("")
+        # Búsqueda por nombre si se especificó
+        if search_student:
+            pivot_df = pivot_df[pivot_df['Nombre del estudiante'].str.contains(search_student, case=False, na=False, regex=False)]
 
-    # Formateo de visualización de notas
-    display_pivot = pivot_df.copy()
-    future_flags = future_pivot.set_index(['Grupo', 'Nombre del estudiante']).reindex(
-        pd.MultiIndex.from_frame(display_pivot[['Grupo', 'Nombre del estudiante']])
-    )
-    not_eval_flags = not_eval_pivot.set_index(['Grupo', 'Nombre del estudiante']).reindex(
-        pd.MultiIndex.from_frame(display_pivot[['Grupo', 'Nombre del estudiante']])
-    )
-    for col in existing_date_cols:
-        is_future_block = future_flags[col].fillna(False).astype(bool).to_numpy()
-        is_not_eval_block = not_eval_flags[col].fillna(False).astype(bool).to_numpy()
-        display_pivot[col] = [
-            f"{x:.1f}" if pd.notna(x) else ("Programada" if fut else ("En curso" if ne else fill_option))
-            for x, fut, ne in zip(display_pivot[col], is_future_block, is_not_eval_block)
-        ]
-    display_pivot['Promedio General'] = display_pivot['Promedio General'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "0.0")
+        # --------------------------------------------------------------------------
+        # MÉTRICAS Y RESUMEN RÁPIDO DE RENDIMIENTO ACADÉMICO
+        # --------------------------------------------------------------------------
+        st.markdown("#### 🎯 Distribución de Rendimiento Académico")
+        estatus_counts = pivot_df['Estatus'].value_counts()
+        c_exc = int(estatus_counts.get('Excelente', 0))
+        c_bien = int(estatus_counts.get('Bien', 0))
+        c_reg = int(estatus_counts.get('Regular', 0))
+        c_riesgo = int(estatus_counts.get('En riesgo', 0))
+        total_st = len(pivot_df)
 
-    # Renderizar la tabla pivote con Estatus inmediatamente después del nombre
-    st.dataframe(
-        display_pivot,
-        width='stretch',
-        hide_index=True,
-        height=min(550, 100 + len(display_pivot) * 35),
-        column_config={
-            "Grupo": st.column_config.TextColumn("Grupo", width="small"),
-            "Nombre del estudiante": st.column_config.TextColumn("Nombre del estudiante", width="large"),
-            "Estatus": st.column_config.TextColumn("Estatus", width="medium"),
-            "Promedio General": st.column_config.TextColumn("Promedio General", width="small")
-        }
-    )
+        col_e1, col_e2, col_e3, col_e4 = st.columns(4)
+        with col_e1:
+            pct = (c_exc / total_st * 100) if total_st else 0
+            st.metric(f"🌟 Excelente (≥ {th_input_exc:.1f})", f"{c_exc}", f"{pct:.0f}% alumnos")
+        with col_e2:
+            pct = (c_bien / total_st * 100) if total_st else 0
+            st.metric(f"👍 Bien (≥ {th_input_bien:.1f})", f"{c_bien}", f"{pct:.0f}% alumnos")
+        with col_e3:
+            pct = (c_reg / total_st * 100) if total_st else 0
+            st.metric(f"👌 Regular (≥ {th_input_reg:.1f})", f"{c_reg}", f"{pct:.0f}% alumnos")
+        with col_e4:
+            pct = (c_riesgo / total_st * 100) if total_st else 0
+            st.metric(f"🚨 En riesgo (< {th_input_reg:.1f})", f"{c_riesgo}", f"{pct:.0f}% alumnos")
 
-    # Botones de exportación
-    exp_c1, exp_c2, _ = st.columns([1.5, 1.5, 3])
-    with exp_c1:
-        csv_bytes = display_pivot.to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            label="📥 Descargar Concentrado (CSV)",
-            data=csv_bytes,
-            file_name=f"Concentrado_Calificaciones_{now_local().strftime('%Y%m%d')}.csv",
-            mime="text/csv"
+        st.write("")
+
+        # Formateo de visualización de notas
+        display_pivot = pivot_df.copy()
+        future_flags = future_pivot.set_index(['Grupo', 'Nombre del estudiante']).reindex(
+            pd.MultiIndex.from_frame(display_pivot[['Grupo', 'Nombre del estudiante']])
         )
-    with exp_c2:
-        excel_buff = io.BytesIO()
-        with pd.ExcelWriter(excel_buff, engine='openpyxl') as writer:
-            display_pivot.to_excel(writer, index=False, sheet_name="Concentrado")
-        st.download_button(
-            label="📥 Descargar Concentrado (Excel)",
-            data=excel_buff.getvalue(),
-            file_name=f"Concentrado_Calificaciones_{now_local().strftime('%Y%m%d')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        not_eval_flags = not_eval_pivot.set_index(['Grupo', 'Nombre del estudiante']).reindex(
+            pd.MultiIndex.from_frame(display_pivot[['Grupo', 'Nombre del estudiante']])
+        )
+        for col in existing_date_cols:
+            is_future_block = future_flags[col].fillna(False).astype(bool).to_numpy()
+            is_not_eval_block = not_eval_flags[col].fillna(False).astype(bool).to_numpy()
+            display_pivot[col] = [
+                f"{x:.1f}" if pd.notna(x) else ("Programada" if fut else ("En curso" if ne else fill_option))
+                for x, fut, ne in zip(display_pivot[col], is_future_block, is_not_eval_block)
+            ]
+        display_pivot['Promedio General'] = display_pivot['Promedio General'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "0.0")
+
+        # Renderizar la tabla pivote con Estatus inmediatamente después del nombre
+        st.dataframe(
+            display_pivot,
+            width='stretch',
+            hide_index=True,
+            height=min(550, 100 + len(display_pivot) * 35),
+            column_config={
+                "Grupo": st.column_config.TextColumn("Grupo", width="small"),
+                "Nombre del estudiante": st.column_config.TextColumn("Nombre del estudiante", width="large"),
+                "Estatus": st.column_config.TextColumn("Estatus", width="medium"),
+                "Promedio General": st.column_config.TextColumn("Promedio General", width="small")
+            }
         )
 
-    st.divider()
+        # Botones de exportación
+        exp_c1, exp_c2, _ = st.columns([1.5, 1.5, 3])
+        with exp_c1:
+            csv_bytes = display_pivot.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label="📥 Descargar Concentrado (CSV)",
+                data=csv_bytes,
+                file_name=f"Concentrado_Calificaciones_{now_local().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+        with exp_c2:
+            excel_buff = io.BytesIO()
+            with pd.ExcelWriter(excel_buff, engine='openpyxl') as writer:
+                display_pivot.to_excel(writer, index=False, sheet_name="Concentrado")
+            st.download_button(
+                label="📥 Descargar Concentrado (Excel)",
+                data=excel_buff.getvalue(),
+                file_name=f"Concentrado_Calificaciones_{now_local().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
-    # --------------------------------------------------------------------------
-    # SECCIÓN 3: ENHANCED ADMIN DRILL-DOWN (INSPECCIÓN INDIVIDUAL DE ESTUDIANTE)
-    # --------------------------------------------------------------------------
-    st.markdown("### 🔍 Detalle Individual de Estudiante (Drill-Down)")
-    st.caption("Selecciona a un estudiante para inspeccionar el desglose completo de todas sus actividades con formato condicional.")
+    with tab_detalle:
+        # --------------------------------------------------------------------------
+        # SECCIÓN 3: ENHANCED ADMIN DRILL-DOWN (INSPECCIÓN INDIVIDUAL DE ESTUDIANTE)
+        # --------------------------------------------------------------------------
+        st.markdown("### 🔍 Detalle Individual de Estudiante (Drill-Down)")
+        st.caption("Selecciona a un estudiante para inspeccionar el desglose completo de todas sus actividades con formato condicional.")
 
-    candidate_students_df = assignments_tagged[assignments_tagged['Grupo'].isin(selected_groups)] if selected_groups else assignments_tagged
-    available_students = sorted(candidate_students_df['Nombre del estudiante'].dropna().unique())
+        candidate_students_df = assignments_tagged[assignments_tagged['Grupo'].isin(selected_groups)] if selected_groups else assignments_tagged
+        available_students = sorted(candidate_students_df['Nombre del estudiante'].dropna().unique())
 
-    if not available_students:
-        st.info("No hay estudiantes para los grupos seleccionados.")
-        return
+        if not available_students:
+            st.info("No hay estudiantes para los grupos seleccionados.")
+            return
 
-    drill_col1, drill_col2, drill_col3 = st.columns([3, 1, 1])
-    with drill_col1:
-        selected_student = st.selectbox(
-            "Selecciona un estudiante para inspeccionar en detalle:",
-            options=available_students,
-            key="admin_drilldown_student_select"
+        drill_col1, drill_col2, drill_col3 = st.columns([3, 1, 1])
+        with drill_col1:
+            selected_student = st.selectbox(
+                "Selecciona un estudiante para inspeccionar en detalle:",
+                options=available_students,
+                key="admin_drilldown_student_select"
+            )
+
+        student_tasks_data = assignments_tagged[assignments_tagged['Nombre del estudiante'] == selected_student].copy()
+        student_group = student_tasks_data['Grupo'].iloc[0] if not student_tasks_data.empty else "N/A"
+
+        # Calcular promedio del estudiante en todos los bloques (omitiendo futuros)
+        st_blocks = compute_student_block_grades(student_tasks_data, active_criteria_config)
+        valid_st_blocks = st_blocks['block_grade'].dropna()
+        st_avg = valid_st_blocks.mean() if not valid_st_blocks.empty else 0.0
+        st_estatus = classify_student(st_avg, active_criteria_config['thresholds'], active_criteria_config['escala_maxima'])
+
+        with drill_col2:
+            st.write("")
+            st.write("")
+            st.info(f"**Grupo:** {student_group}")
+
+        with drill_col3:
+            st.write("")
+            st.write("")
+            st.info(f"**Estatus:** {st_estatus} ({st_avg:.1f})")
+
+        # --------------------------------------------------------------------------
+        # TABLA COMPLETA CON FORMATO CONDICIONAL (.style)
+        # --------------------------------------------------------------------------
+        st.markdown("#### 📋 Listado Completo de Actividades del Alumno")
+        st.caption("Semáforo de detección rápida: 🟥 **Rojo tenue:** Calificación de 0 puntos (sin entrega o penalizada) | 🟨 **Amarillo tenue:** Actividad realizada con intentos que superan el límite permitido | ⚪ **Gris/Cursiva:** Actividad programada o en curso (aún no vence).")
+
+        # Ordenar por fecha de entrega y nombre
+        all_tasks_sorted = student_tasks_data.sort_values(by=['dt_entrega', 'Nombre de la tarea']).copy()
+
+        # Columnas requeridas: 'Nombre de la tarea', 'Tipo', 'Parcial', 'Fecha de entrega', 'Número de intentos', 'Puntos Obtenidos'
+        drill_rows = []
+        for _, task_r in all_tasks_sorted.iterrows():
+            is_prog = task_r.get('status') in NOT_EVALUATED_STATUSES
+            if is_prog:
+                pts_display = task_r.get('status')
+                attempts_display = "—"
+            else:
+                pts_display = f"{task_r['earned_points']:.1f}"
+                raw_att = task_r.get('Número de intentos')
+                attempts_display = str(raw_att) if pd.notna(raw_att) and str(raw_att).strip() not in ['', 'En progreso'] else ("1" if task_r.get('is_completed') else "0")
+
+            drill_rows.append({
+                'Nombre de la tarea': task_r['Nombre de la tarea'],
+                'Tipo': task_r['Tipo de tarea'],
+                'Parcial': task_r['Parcial'],
+                'Fecha de entrega': task_r['Fecha de entrega'],
+                'Número de intentos': attempts_display,
+                'Puntos Obtenidos': pts_display,
+                '_status': task_r['status'],
+                '_earned_points': task_r['earned_points'],
+                '_evaluar_intentos': task_r['evaluar_intentos'],
+                '_max_intentos': task_r['max_intentos']
+            })
+
+        drill_display = pd.DataFrame(drill_rows)
+
+        # Función de formato condicional con Pandas .style
+        def highlight_drilldown_rows(row):
+            status = row.get('_status', '')
+            if status in NOT_EVALUATED_STATUSES:
+                return ['background-color: #f8fafc; color: #64748b; font-style: italic;'] * len(row)
+
+            score = row.get('_earned_points', 0)
+            attempts = row.get('Número de intentos', 0)
+            eval_attempts = row.get('_evaluar_intentos', False)
+            max_attempts = row.get('_max_intentos', 3)
+            try:
+                s_val = float(score)
+            except (ValueError, TypeError):
+                s_val = 0.0
+            try:
+                a_val = int(float(str(attempts).strip()))
+            except (ValueError, TypeError):
+                a_val = 0
+
+            # Rojo tenue para puntaje final de 0 en actividades activas
+            if s_val == 0.0:
+                return ['background-color: #fee2e2; color: #991b1b; font-weight: 500;'] * len(row)
+            # Amarillo tenue para intentos extras (> max_intentos) SOLO si la actividad evalúa intentos
+            elif eval_attempts and a_val > max_attempts:
+                return ['background-color: #fef9c3; color: #854d0e; font-weight: 500;'] * len(row)
+            return [''] * len(row)
+
+        cols_to_show = ['Nombre de la tarea', 'Tipo', 'Parcial', 'Fecha de entrega', 'Número de intentos', 'Puntos Obtenidos']
+        styled_drilldown = drill_display.style.apply(highlight_drilldown_rows, axis=1)
+
+        st.dataframe(
+            styled_drilldown,
+            column_order=cols_to_show,
+            width='stretch',
+            hide_index=True,
+            height=min(550, 100 + len(drill_display) * 35),
+            column_config={
+                "Nombre de la tarea": st.column_config.TextColumn("Nombre de la tarea", width="large"),
+                "Tipo": st.column_config.TextColumn("Tipo", width="small"),
+                "Parcial": st.column_config.TextColumn("Parcial", width="small"),
+                "Fecha de entrega": st.column_config.TextColumn("Fecha de entrega", width="medium"),
+                "Número de intentos": st.column_config.TextColumn("Número de intentos", width="small"),
+                "Puntos Obtenidos": st.column_config.TextColumn("Puntos Obtenidos", width="small"),
+            }
         )
 
-    student_tasks_data = assignments_tagged[assignments_tagged['Nombre del estudiante'] == selected_student].copy()
-    student_group = student_tasks_data['Grupo'].iloc[0] if not student_tasks_data.empty else "N/A"
-
-    # Calcular promedio del estudiante en todos los bloques (omitiendo futuros)
-    st_blocks = compute_student_block_grades(student_tasks_data, active_criteria_config)
-    valid_st_blocks = st_blocks['block_grade'].dropna()
-    st_avg = valid_st_blocks.mean() if not valid_st_blocks.empty else 0.0
-    st_estatus = classify_student(st_avg, active_criteria_config['thresholds'], active_criteria_config['escala_maxima'])
-
-    with drill_col2:
         st.write("")
-        st.write("")
-        st.info(f"**Grupo:** {student_group}")
 
-    with drill_col3:
-        st.write("")
-        st.write("")
-        st.info(f"**Estatus:** {st_estatus} ({st_avg:.1f})")
-
-    # --------------------------------------------------------------------------
-    # TABLA COMPLETA CON FORMATO CONDICIONAL (.style)
-    # --------------------------------------------------------------------------
-    st.markdown("#### 📋 Listado Completo de Actividades del Alumno")
-    st.caption("Semáforo de detección rápida: 🟥 **Rojo tenue:** Calificación de 0 puntos (sin entrega o penalizada) | 🟨 **Amarillo tenue:** Actividad realizada con intentos que superan el límite permitido | ⚪ **Gris/Cursiva:** Actividad programada o en curso (aún no vence).")
-
-    # Ordenar por fecha de entrega y nombre
-    all_tasks_sorted = student_tasks_data.sort_values(by=['dt_entrega', 'Nombre de la tarea']).copy()
-
-    # Columnas requeridas: 'Nombre de la tarea', 'Tipo', 'Parcial', 'Fecha de entrega', 'Número de intentos', 'Puntos Obtenidos'
-    drill_rows = []
-    for _, task_r in all_tasks_sorted.iterrows():
-        is_prog = task_r.get('status') in NOT_EVALUATED_STATUSES
-        if is_prog:
-            pts_display = task_r.get('status')
-            attempts_display = "—"
-        else:
-            pts_display = f"{task_r['earned_points']:.1f}"
-            raw_att = task_r.get('Número de intentos')
-            attempts_display = str(raw_att) if pd.notna(raw_att) and str(raw_att).strip() not in ['', 'En progreso'] else ("1" if task_r.get('is_completed') else "0")
-
-        drill_rows.append({
-            'Nombre de la tarea': task_r['Nombre de la tarea'],
-            'Tipo': task_r['Tipo de tarea'],
-            'Parcial': task_r['Parcial'],
-            'Fecha de entrega': task_r['Fecha de entrega'],
-            'Número de intentos': attempts_display,
-            'Puntos Obtenidos': pts_display,
-            '_status': task_r['status'],
-            '_earned_points': task_r['earned_points'],
-            '_evaluar_intentos': task_r['evaluar_intentos'],
-            '_max_intentos': task_r['max_intentos']
-        })
-
-    drill_display = pd.DataFrame(drill_rows)
-
-    # Función de formato condicional con Pandas .style
-    def highlight_drilldown_rows(row):
-        status = row.get('_status', '')
-        if status in NOT_EVALUATED_STATUSES:
-            return ['background-color: #f8fafc; color: #64748b; font-style: italic;'] * len(row)
-
-        score = row.get('_earned_points', 0)
-        attempts = row.get('Número de intentos', 0)
-        eval_attempts = row.get('_evaluar_intentos', False)
-        max_attempts = row.get('_max_intentos', 3)
-        try:
-            s_val = float(score)
-        except (ValueError, TypeError):
-            s_val = 0.0
-        try:
-            a_val = int(float(str(attempts).strip()))
-        except (ValueError, TypeError):
-            a_val = 0
-
-        # Rojo tenue para puntaje final de 0 en actividades activas
-        if s_val == 0.0:
-            return ['background-color: #fee2e2; color: #991b1b; font-weight: 500;'] * len(row)
-        # Amarillo tenue para intentos extras (> max_intentos) SOLO si la actividad evalúa intentos
-        elif eval_attempts and a_val > max_attempts:
-            return ['background-color: #fef9c3; color: #854d0e; font-weight: 500;'] * len(row)
-        return [''] * len(row)
-
-    cols_to_show = ['Nombre de la tarea', 'Tipo', 'Parcial', 'Fecha de entrega', 'Número de intentos', 'Puntos Obtenidos']
-    styled_drilldown = drill_display.style.apply(highlight_drilldown_rows, axis=1)
-
-    st.dataframe(
-        styled_drilldown,
-        column_order=cols_to_show,
-        width='stretch',
-        hide_index=True,
-        height=min(550, 100 + len(drill_display) * 35),
-        column_config={
-            "Nombre de la tarea": st.column_config.TextColumn("Nombre de la tarea", width="large"),
-            "Tipo": st.column_config.TextColumn("Tipo", width="small"),
-            "Parcial": st.column_config.TextColumn("Parcial", width="small"),
-            "Fecha de entrega": st.column_config.TextColumn("Fecha de entrega", width="medium"),
-            "Número de intentos": st.column_config.TextColumn("Número de intentos", width="small"),
-            "Puntos Obtenidos": st.column_config.TextColumn("Puntos Obtenidos", width="small"),
-        }
-    )
-
-    st.write("")
-
-    # Visualización complementaria: Dashboard idéntico con desglose por bloques y filtros
-    with st.expander("👁️ Vista del alumno (así ve su portal este estudiante)", expanded=True):
-        updated_at = student_tasks_data['Archivo_Modificado'].max() if 'Archivo_Modificado' in student_tasks_data.columns else None
-        render_student_experience(selected_student, student_tasks_data, active_criteria_config, key_prefix="admin", updated_at=updated_at)
+        # Visualización complementaria: Dashboard idéntico con desglose por bloques y filtros
+        with st.expander("👁️ Vista del alumno (así ve su portal este estudiante)", expanded=True):
+            updated_at = student_tasks_data['Archivo_Modificado'].max() if 'Archivo_Modificado' in student_tasks_data.columns else None
+            render_student_experience(selected_student, student_tasks_data, active_criteria_config, key_prefix="admin", updated_at=updated_at)
 
 
 # ==============================================================================
