@@ -174,6 +174,9 @@ st.markdown("""
     .sc-name { font-weight: 700; font-size: 0.95rem; display: block; }
     .sc-meta { font-size: 0.8rem; color: #64748b; }
     .sc-badge { padding: 2px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 700; white-space: nowrap; }
+    .pair-row { display: grid; grid-template-columns: 1fr auto 1fr; gap: 8px; align-items: center; margin-top: 4px; }
+    .pair-row .sc-label, .pair-row .sc-name, .pair-row .sc-meta { display: block; }
+    .pair-arrow { font-size: 1.3rem; color: #64748b; }
     .sc-body { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 6px; }
     .sc-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: #64748b; font-weight: 700; }
     .badge-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
@@ -1722,6 +1725,15 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
 # ==============================================================================
 # EXPERIENCIA DEL ESTUDIANTE: INICIO, PENDIENTES, RECUPERACIÓN Y LOGROS
 # ==============================================================================
+def compact_html(markup):
+    """
+    Une el HTML en una sola línea antes de pasarlo a st.markdown. Si queda una línea en
+    blanco seguida de líneas con sangría, Markdown lo interpreta como bloque de código
+    y el docente ve el HTML en crudo (p. ej. en las tarjetas sin aviso opcional).
+    """
+    return "".join(line.strip() for line in str(markup).splitlines())
+
+
 MESES_CORTOS = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic']
 
 STATUS_STYLES = {
@@ -1925,14 +1937,14 @@ def build_motivation_message(ins):
     if status == 'Bien':
         gap = max(0.0, ins['min_excelente'] - avg)
         extra = ""
-        if best is not None and best > avg:
+        if _meaningful_gain(avg, best):
             extra = f" Si entregas tus pendientes, tu promedio puede llegar a {best:.1f}."
         return ("¡Vas muy bien!", f"Estás a {gap:.1f} de llegar a Excelente.{streak_txt}{trend_txt}{extra}")
     if status == 'Regular':
-        extra = f" Si entregas tus pendientes, tu promedio puede subir a {best:.1f}." if (best is not None and best > avg) else " Entrega tus próximas actividades a tiempo para subir tu promedio."
+        extra = f" Si entregas tus pendientes, tu promedio puede subir a {best:.1f}." if _meaningful_gain(avg, best) else " Entrega tus próximas actividades a tiempo para subir tu promedio."
         return ("Vas aprobando, ¡puedes más!", f"Estás por encima del mínimo, pero todavía hay espacio para mejorar.{trend_txt}{extra}")
     # En riesgo: tono de apoyo, nunca de regaño
-    if best is not None and best > avg:
+    if _meaningful_gain(avg, best):
         parts = []
         if n_over:
             parts.append(f"{n_over} actividad(es) atrasada(s)")
@@ -1995,7 +2007,7 @@ def render_badges(ins):
             <div class="badge-state">{state}</div>
             <div class="badge-desc">{detail}</div>
         </div>""")
-    st.markdown(f"<div class='badge-grid'>{''.join(cards)}</div>", unsafe_allow_html=True)
+    st.markdown(compact_html(f"<div class='badge-grid'>{''.join(cards)}</div>"), unsafe_allow_html=True)
 
 
 def render_student_home(ins):
@@ -2003,7 +2015,7 @@ def render_student_home(ins):
     title, body = build_motivation_message(ins)
     avg_txt = f"{ins['avg']:.1f}" if ins['avg'] is not None else "—"
     status_txt = ins['status'] or "Sin evaluar"
-    st.markdown(f"""
+    st.markdown(compact_html(f"""
     <div class="hero-card" style="border-left-color: {style['accent']};">
         <div class="hero-top">
             <div>
@@ -2014,7 +2026,7 @@ def render_student_home(ins):
         </div>
         <div class="hero-msg"><strong>{html.escape(title)}</strong><br>{html.escape(body)}</div>
     </div>
-    """, unsafe_allow_html=True)
+    """), unsafe_allow_html=True)
 
     # Fila compacta de indicadores (se mantiene en una sola fila también en celular)
     parcial_label = f"Promedio {ins['parcial_actual']}" if ins['parcial_actual'] else "Parcial actual"
@@ -2090,7 +2102,7 @@ def render_student_pending(ins, key_prefix):
                     '#dc2626' if urgent else '#2563eb'
                 ) for _, r in grp.iterrows()
             ]
-            st.markdown("".join(cards), unsafe_allow_html=True)
+            st.markdown(compact_html("".join(cards)), unsafe_allow_html=True)
 
     st.markdown(f"#### ⚠️ Atrasadas — aún puedes entregarlas ({len(overdue)})")
     if overdue.empty:
@@ -2104,7 +2116,7 @@ def render_student_pending(ins, key_prefix):
                 '#d97706'
             ) for _, r in overdue.iterrows()
         ]
-        st.markdown("".join(cards), unsafe_allow_html=True)
+        st.markdown(compact_html("".join(cards)), unsafe_allow_html=True)
 
     if not scheduled.empty:
         next_start = scheduled['dt_inicio'].iloc[0]
@@ -2332,7 +2344,7 @@ def render_group_trend_chart(block_summary, tasks, criteria_config, color_map):
     st.altair_chart((rule + rule_text + line).properties(height=280), width='stretch')
 
 
-def render_teacher_summary(tasks, block_summary, criteria_config, color_map):
+def render_teacher_summary(tasks, block_summary, criteria_config, color_map, asignatura="la materia"):
     """Pestaña 'Resumen y acciones' del panel docente."""
     cfg = criteria_config if isinstance(criteria_config, dict) else {}
     class_df = build_class_insights(tasks, block_summary, cfg)
@@ -2404,6 +2416,9 @@ def render_teacher_summary(tasks, block_summary, criteria_config, color_map):
         if not missing.empty:
             with st.expander(f"Ver los {len(missing)} alumnos que aún no completan esta entrega (para enviarles un recordatorio)"):
                 st.dataframe(missing.sort_values(['Grupo', 'Nombre del estudiante']), hide_index=True, width='stretch')
+        with st.expander("📢 Mensaje de recordatorio para el grupo"):
+            activities = due_rows['Nombre de la tarea'].dropna().astype(str).unique().tolist()
+            render_copy_message(build_group_reminder(next_dt, activities, asignatura), key="wa_group_reminder")
 
     # --- Listas de acción
     export_cols_att = ['Prioridad', 'Nombre del estudiante', 'Grupo', 'Promedio', 'Motivos', 'Acción sugerida', 'Atrasadas']
@@ -2431,7 +2446,7 @@ def render_teacher_summary(tasks, block_summary, criteria_config, color_map):
                     <div><div class="sc-label">Acción sugerida</div><ul>{actions}</ul></div>
                 </div>
             </div>""")
-        st.markdown("<div class='student-cards'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
+        st.markdown(compact_html("<div class='student-cards'>" + "".join(cards) + "</div>"), unsafe_allow_html=True)
         st.download_button(
             "📥 Descargar lista (CSV)", att_df[export_cols_att].to_csv(index=False).encode('utf-8-sig'),
             file_name=f"Alumnos_atencion_{now_local().strftime('%Y%m%d')}.csv", mime="text/csv",
@@ -2454,16 +2469,248 @@ def render_teacher_summary(tasks, block_summary, criteria_config, color_map):
                 </div>
                 <ul>{kudos}</ul>
             </div>""")
-        st.markdown("<div class='student-cards'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
+        st.markdown(compact_html("<div class='student-cards'>" + "".join(cards) + "</div>"), unsafe_allow_html=True)
         st.download_button(
             "📥 Descargar lista (CSV)", rec_df[export_cols_rec].to_csv(index=False).encode('utf-8-sig'),
             file_name=f"Alumnos_reconocimiento_{now_local().strftime('%Y%m%d')}.csv", mime="text/csv",
             key="dl_recognition"
         )
 
+    render_study_pairs(class_df)
+
     st.markdown("#### 📈 Tendencia por grupo")
     st.caption("Promedio de cada grupo en los bloques ya cerrados.")
     render_group_trend_chart(block_summary, tasks, cfg, color_map)
+
+
+# ==============================================================================
+# FASE 3: ANÁLISIS POR ACTIVIDAD, PAREJAS DE ESTUDIO Y MENSAJES SUGERIDOS
+# ==============================================================================
+def build_task_analysis(tasks):
+    """Una fila por actividad: participación, puntualidad, aciertos e intentos."""
+    active = tasks[tasks['status'] != 'Programada']
+    if active.empty:
+        return pd.DataFrame()
+    rows = []
+    for (name, tipo), t in active.groupby(['Nombre de la tarea', 'Tipo de tarea']):
+        n = len(t)
+        completed = t[t['is_completed'].astype(bool)]
+        in_progress = (t['status'] == 'En curso').any()
+        exercises = completed[completed['total_count'] > 0]
+        aciertos = (exercises['correct_count'] / exercises['total_count']).mean() * 100 if not exercises.empty else None
+        intentos = exercises['attempts_count'].mean() if not exercises.empty else None
+        pct_done = len(completed) / n * 100
+        pct_on_time = t['status'].astype(str).str.startswith('A tiempo').sum() / n * 100
+
+        issues = []
+        if not in_progress and pct_done < 60:
+            issues.append(f"solo el {pct_done:.0f}% la completó")
+        if aciertos is not None and len(exercises) >= 3 and aciertos < 70:
+            issues.append(f"aciertos promedio de {aciertos:.0f}%")
+        if in_progress:
+            signal = "⏳ En curso"
+        elif issues:
+            signal = "⚠️ Repasar"
+        else:
+            signal = "✅ Bien"
+        rows.append({
+            'Señal': signal,
+            'Actividad': name,
+            'Tipo': tipo,
+            'Grupos': ", ".join(sorted(t['Grupo'].dropna().astype(str).unique())),
+            'Entrega': format_short_date(t['dt_entrega'].min(), with_time=False),
+            'Completada': round(pct_done, 0),
+            'A tiempo': round(pct_on_time, 0),
+            'Aciertos': round(aciertos, 0) if aciertos is not None else None,
+            'Intentos prom.': round(intentos, 1) if intentos is not None else None,
+            'Sin entregar': n - len(completed),
+            '_issues': issues,
+            '_dt': t['dt_entrega'].min(),
+        })
+    df = pd.DataFrame(rows)
+    order = {"⚠️ Repasar": 0, "⏳ En curso": 1, "✅ Bien": 2}
+    df['_ord'] = df['Señal'].map(order)
+    return df.sort_values(['_ord', 'Completada', '_dt']).drop(columns='_ord')
+
+
+def render_task_analysis(tasks):
+    st.caption("Cómo les fue a tus alumnos en cada actividad. Si muchos no la completaron o tuvieron pocos aciertos, "
+               "probablemente el tema necesita repasarse en clase.")
+    df = build_task_analysis(tasks)
+    if df.empty:
+        st.info("Aún no hay actividades iniciadas en este periodo.")
+        return
+
+    flagged = df[df['Señal'] == "⚠️ Repasar"]
+    if flagged.empty:
+        st.success("✅ Ninguna actividad cerrada muestra señales de dificultad.")
+    else:
+        items = "".join(
+            f"<li><strong>{html.escape(str(r['Actividad']))}</strong> ({html.escape(str(r['Grupos']))}): {html.escape(', '.join(r['_issues']))}</li>"
+            for _, r in flagged.head(5).iterrows()
+        )
+        st.markdown(compact_html(f"""
+        <div class="student-card" style="border-left-color: #d97706;">
+            <div class="sc-label">🧩 Temas que conviene repasar</div>
+            <ul>{items}</ul>
+        </div>"""), unsafe_allow_html=True)
+        st.write("")
+
+    show = df.drop(columns=['_issues', '_dt'])
+    for col in ['Aciertos', 'Intentos prom.']:
+        show[col] = pd.to_numeric(show[col], errors='coerce')
+    st.dataframe(
+        show, hide_index=True, width='stretch', height=min(520, 40 + len(show) * 36),
+        column_config={
+            'Señal': st.column_config.TextColumn(width="medium"),
+            'Actividad': st.column_config.TextColumn(width="large"),
+            'Completada': st.column_config.ProgressColumn("Completada", format="%d%%", min_value=0, max_value=100),
+            'A tiempo': st.column_config.ProgressColumn("A tiempo", format="%d%%", min_value=0, max_value=100),
+            'Aciertos': st.column_config.NumberColumn("Aciertos (ejercicios)", format="%d%%"),
+            'Intentos prom.': st.column_config.NumberColumn(format="%.1f"),
+        }
+    )
+    st.download_button(
+        "📥 Descargar análisis (CSV)", show.to_csv(index=False).encode('utf-8-sig'),
+        file_name=f"Analisis_actividades_{now_local().strftime('%Y%m%d')}.csv", mime="text/csv", key="dl_task_analysis"
+    )
+
+    st.markdown("##### ¿Quién no la ha completado?")
+    options = df['Actividad'].tolist()
+    selected = st.selectbox("Actividad:", options, key="task_analysis_select")
+    pending = tasks[(tasks['Nombre de la tarea'] == selected) & ~tasks['is_completed'].astype(bool) & (tasks['status'] != 'Programada')]
+    if pending.empty:
+        st.success("🎉 Todos los alumnos la completaron.")
+    else:
+        st.dataframe(
+            pending[['Grupo', 'Nombre del estudiante', 'status']].rename(columns={'status': 'Estado'})
+            .sort_values(['Grupo', 'Nombre del estudiante']),
+            hide_index=True, width='stretch'
+        )
+
+
+def build_study_pairs(class_df):
+    """
+    Dentro de cada grupo, empareja a quien va mejor con quien más necesita apoyo
+    (el mejor promedio con el más bajo, y así sucesivamente).
+    """
+    pairs, unpaired = [], []
+    for grupo, g in class_df.groupby('Grupo'):
+        tutors = g[g['status'].isin(['Excelente', 'Bien'])].sort_values(['avg', 'on_time_streak'], ascending=[False, False])
+        learners = g[g['status'].isin(['En riesgo', 'Regular'])].sort_values('avg')
+        for (_, t), (_, l) in zip(tutors.iterrows(), learners.iterrows()):
+            pairs.append({
+                'Grupo': grupo,
+                'Apoya': t['Nombre del estudiante'], 'Promedio (apoya)': f"{t['avg']:.1f}",
+                'Recibe apoyo': l['Nombre del estudiante'], 'Promedio (recibe)': f"{l['avg']:.1f}",
+                '_note': "Dejó de entregar: conviene hablar primero con él/ella" if l['missing_streak'] >= 2 else "",
+            })
+        for _, l in learners.iloc[len(tutors):].iterrows():
+            unpaired.append(f"{l['Nombre del estudiante']} ({grupo})")
+    return pd.DataFrame(pairs), unpaired
+
+
+def render_study_pairs(class_df):
+    st.markdown("#### 🤝 Parejas de estudio sugeridas")
+    pairs, unpaired = build_study_pairs(class_df)
+    if pairs.empty:
+        st.caption("No hay suficientes alumnos con buen desempeño y alumnos que necesiten apoyo en el mismo grupo para sugerir parejas.")
+        return
+    st.caption("Dentro de cada grupo se empareja al mejor promedio con el más bajo. Es solo una sugerencia: tú conoces mejor a tus alumnos.")
+    cards = []
+    for _, p in pairs.iterrows():
+        note = f"<div class='sc-meta' style='margin-top:4px;'>⚠️ {html.escape(p['_note'])}</div>" if p['_note'] else ""
+        cards.append(f"""
+        <div class="student-card" style="border-left-color: #2563eb;">
+            <div class="sc-meta">{html.escape(str(p['Grupo']))}</div>
+            <div class="pair-row">
+                <div><span class="sc-label">Apoya</span><span class="sc-name">{html.escape(p['Apoya'])}</span><span class="sc-meta">Promedio {p['Promedio (apoya)']}</span></div>
+                <div class="pair-arrow">⟷</div>
+                <div><span class="sc-label">Recibe apoyo</span><span class="sc-name">{html.escape(p['Recibe apoyo'])}</span><span class="sc-meta">Promedio {p['Promedio (recibe)']}</span></div>
+            </div>
+            {note}
+        </div>""")
+    st.markdown(compact_html("<div class='student-cards'>" + "".join(cards) + "</div>"), unsafe_allow_html=True)
+    if unpaired:
+        st.caption("Sin pareja disponible en su grupo: " + ", ".join(unpaired))
+    st.download_button(
+        "📥 Descargar parejas (CSV)", pairs.drop(columns='_note').to_csv(index=False).encode('utf-8-sig'),
+        file_name=f"Parejas_estudio_{now_local().strftime('%Y%m%d')}.csv", mime="text/csv", key="dl_pairs"
+    )
+
+
+def _plural(n, singular, plural):
+    return f"{n} {singular if n == 1 else plural}"
+
+
+def _pending_parts(ins):
+    parts = []
+    if len(ins['overdue']):
+        parts.append(_plural(len(ins['overdue']), "actividad atrasada", "actividades atrasadas"))
+    if len(ins['upcoming']):
+        parts.append(_plural(len(ins['upcoming']), "actividad por entregar", "actividades por entregar"))
+    return " y ".join(parts)
+
+
+def _meaningful_gain(avg, best):
+    """True si la mejora se nota con un decimal (evita 'puede llegar a 8.8' cuando ya tiene 8.8)."""
+    return best is not None and avg is not None and round(best, 1) > round(avg, 1)
+
+
+def build_student_message(ins, student_name, asignatura, teacher_name, audience):
+    """Mensaje listo para copiar: tono de reconocimiento o de apoyo según el desempeño."""
+    name = str(student_name).title()
+    status, avg, best = ins['status'], ins['avg'], ins['avg_best']
+    parts = _pending_parts(ins)
+    can_improve = _meaningful_gain(avg, best)
+    n_pend = len(ins['overdue']) + len(ins['upcoming'])
+    las = "la" if n_pend == 1 else "las"
+    streak = f" y lleva {ins['streak']} bloques seguidos entregando todo a tiempo" if ins['streak'] >= 2 else ""
+
+    if audience == 'alumno':
+        sign = f"\n\n— {teacher_name}"
+        if status is None:
+            return f"¡Hola {name}! Bienvenido(a) a {asignatura}. Recuerda entregar a tiempo tus actividades de Khan Academy: cada una cuenta para tu calificación.{sign}"
+        streak_a = streak.replace("lleva", "llevas")
+        if status == 'Excelente':
+            return f"¡Hola {name}! Quiero felicitarte por tu trabajo en {asignatura}: tienes un promedio de {avg:.1f}{streak_a}. Tu constancia se nota. ¡Sigue con ese ritmo todo el semestre! 🌟{sign}"
+        pend = f" Tienes {parts} en Khan Academy; si {las} entregas, tu promedio puede llegar a {best:.1f}." if (parts and can_improve) else ""
+        if status == 'Bien':
+            gap = max(0.0, ins['min_excelente'] - avg)
+            return f"¡Hola {name}! Vas muy bien en {asignatura}, con promedio de {avg:.1f}. Estás a {gap:.1f} de llegar a Excelente.{pend} ¡Tú puedes! 💪{sign}"
+        if status == 'Regular':
+            return f"Hola {name}, vas aprobando {asignatura} con {avg:.1f}, pero sé que puedes dar más.{pend} Si algún tema se te complica, pregúntame en clase.{sign}"
+        recovery = f": si entregas tus {parts}, tu promedio puede subir a {best:.1f}" if (parts and can_improve) else ""
+        return f"Hola {name}, quiero ayudarte en {asignatura}. Tu promedio va en {avg:.1f}, pero todavía estás a tiempo de recuperarte{recovery}. ¿Platicamos en la próxima clase para hacer un plan juntos? Cuenta conmigo.{sign}"
+
+    # Mensaje para la familia
+    intro = f"Buen día. Le escribe {teacher_name}, docente de {asignatura} del CBTA 24. Le comparto el avance de {name}"
+    close = "\n\nQuedo a sus órdenes. Saludos cordiales."
+    pend = f" Tiene {parts} en Khan Academy." if parts else ""
+    if status is None:
+        return f"{intro}: aún no tiene actividades evaluadas en este periodo.{pend} Le agradezco su apoyo para que entregue sus actividades a tiempo.{close}"
+    if status == 'Excelente':
+        return f"{intro}: tiene un promedio de {avg:.1f} (Excelente){streak}. Le felicito por su acompañamiento; es un gusto tener a {name} en clase.{close}"
+    if status == 'Bien':
+        return f"{intro}: tiene un promedio de {avg:.1f} (Bien).{pend} Le agradezco su apoyo para que mantenga este ritmo.{close}"
+    if status == 'Regular':
+        return f"{intro}: tiene un promedio de {avg:.1f}, que es aprobatorio pero puede mejorar.{pend} Le pido su apoyo para que revise con {name} sus actividades pendientes.{close}"
+    recovery = f" Si entrega sus pendientes, su promedio puede subir a {best:.1f}." if (parts and can_improve) else ""
+    return (f"{intro}: actualmente su promedio es de {avg:.1f}, por debajo del mínimo aprobatorio.{pend} Todavía está a tiempo de recuperarse.{recovery} "
+            f"Le pido su apoyo para revisar juntos sus pendientes y, si lo considera conveniente, podemos agendar una reunión.{close}")
+
+
+def build_group_reminder(due_dt, activities, asignatura):
+    lines = "\n".join(f"• {a}" for a in activities)
+    return (f"📢 Recordatorio de {asignatura}: el {format_short_date(due_dt)} ({relative_days_label(due_dt)}) vence la entrega de:\n"
+            f"{lines}\n\n¡No lo dejes para el último momento! Revisa tus pendientes y tu calificación en el portal. 💪")
+
+
+def render_copy_message(text, key):
+    """Muestra el mensaje con botón de copiar y un acceso directo a WhatsApp."""
+    from urllib.parse import quote
+    st.code(text, language=None, wrap_lines=True)
+    st.link_button("💬 Abrir en WhatsApp", f"https://wa.me/?text={quote(text)}", key=key)
 
 
 # ==============================================================================
@@ -3179,10 +3426,13 @@ def render_admin():
     column_arrangement = ['Grupo', 'Nombre del estudiante', 'Estatus'] + existing_date_cols + ['Promedio General']
     pivot_df = pivot_df[column_arrangement]
 
-    tab_resumen, tab_conc, tab_detalle = st.tabs(["🎯 Resumen y acciones", "📊 Concentrado", "🔍 Detalle por alumno"])
+    tab_resumen, tab_conc, tab_actividad, tab_detalle = st.tabs(["🎯 Resumen y acciones", "📊 Concentrado", "🧩 Por actividad", "🔍 Detalle por alumno"])
 
     with tab_resumen:
-        render_teacher_summary(active_master, block_summary, active_criteria_config, group_color_map(available_groups))
+        render_teacher_summary(active_master, block_summary, active_criteria_config, group_color_map(available_groups), asignatura)
+
+    with tab_actividad:
+        render_task_analysis(active_master)
 
     with tab_conc:
         # Controles propios del concentrado
@@ -3323,6 +3573,19 @@ def render_admin():
         # --------------------------------------------------------------------------
         # TABLA COMPLETA CON FORMATO CONDICIONAL (.style)
         # --------------------------------------------------------------------------
+        st.markdown("#### 💬 Mensaje sugerido")
+        msg_audience = st.radio(
+            "Para:", ["El alumno", "Su familia"], horizontal=True, key="msg_audience",
+            help="Texto listo para copiar y enviar. Revísalo y ajústalo antes de mandarlo."
+        )
+        if not student_tasks_data.empty:
+            msg_ins = build_student_insights(student_tasks_data, active_criteria_config)
+            msg_text = build_student_message(
+                msg_ins, selected_student, asignatura, teacher_name,
+                'alumno' if msg_audience == "El alumno" else 'familia'
+            )
+            render_copy_message(msg_text, key="wa_student_msg")
+
         st.markdown("#### 📋 Listado Completo de Actividades del Alumno")
         st.caption("Semáforo de detección rápida: 🟥 **Rojo tenue:** Calificación de 0 puntos (sin entrega o penalizada) | 🟨 **Amarillo tenue:** Actividad realizada con intentos que superan el límite permitido | ⚪ **Gris/Cursiva:** Actividad programada o en curso (aún no vence).")
 
@@ -3339,7 +3602,7 @@ def render_admin():
             else:
                 pts_display = f"{task_r['earned_points']:.1f}"
                 raw_att = task_r.get('Número de intentos')
-                attempts_display = str(raw_att) if pd.notna(raw_att) and str(raw_att).strip() not in ['', 'En progreso'] else ("1" if task_r.get('is_completed') else "0")
+                attempts_display = str(task_r.get('attempts_count', 0)) if pd.notna(raw_att) and str(raw_att).strip() not in ['', 'En progreso'] else ("1" if task_r.get('is_completed') else "0")
 
             drill_rows.append({
                 'Nombre de la tarea': task_r['Nombre de la tarea'],
