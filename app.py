@@ -128,6 +128,60 @@ st.markdown("""
         padding: 16px 20px;
         margin-bottom: 18px;
     }
+    /* Vista del alumno */
+    .hero-card {
+        background: #ffffff;
+        border: 1px solid #e2e8f0;
+        border-left: 6px solid #2563eb;
+        border-radius: 12px;
+        padding: 20px 22px;
+        margin-bottom: 16px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        color: #0f172a;
+    }
+    .hero-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+    .hero-label { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; color: #64748b; font-weight: 600; }
+    .hero-grade { font-size: 3rem; font-weight: 800; line-height: 1.1; color: #0f172a; }
+    .hero-grade span { font-size: 1.1rem; font-weight: 600; color: #64748b; }
+    .hero-status { padding: 6px 14px; border-radius: 999px; font-weight: 700; font-size: 0.95rem; white-space: nowrap; }
+    .hero-msg { margin-top: 12px; font-size: 1rem; line-height: 1.5; color: #334155; }
+    .task-card {
+        display: flex; justify-content: space-between; align-items: center; gap: 12px;
+        background: #ffffff; border: 1px solid #e2e8f0; border-left: 4px solid #2563eb;
+        border-radius: 8px; padding: 10px 14px; margin: 0 0 8px 0; color: #0f172a;
+    }
+    .task-title { font-weight: 600; font-size: 0.95rem; }
+    .task-meta { font-size: 0.82rem; color: #64748b; margin-top: 2px; }
+    .task-right { text-align: right; font-size: 0.8rem; color: #64748b; white-space: nowrap; }
+    .task-right strong { font-size: 0.95rem; color: #0f172a; }
+    .mini-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 14px; }
+    .mini-stat { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px 12px; color: #0f172a; }
+    .mini-label { font-size: 0.75rem; color: #64748b; font-weight: 600; }
+    .mini-val { font-size: 1.5rem; font-weight: 700; line-height: 1.2; }
+    .mini-val small { font-size: 0.75rem; font-weight: 500; color: #64748b; }
+    .mini-val small.delta-up { color: #15803d; font-weight: 700; }
+    .badge-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+    .badge-card {
+        background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px;
+        padding: 12px; text-align: center; color: #0f172a;
+    }
+    .badge-card.earned { border-color: #86efac; background: #f0fdf4; }
+    .badge-card.locked { opacity: 0.6; }
+    .badge-card.locked .badge-icon { filter: grayscale(1); }
+    .badge-icon { font-size: 1.8rem; }
+    .badge-title { font-weight: 700; font-size: 0.9rem; margin-top: 4px; }
+    .badge-state { font-size: 0.72rem; color: #64748b; margin: 2px 0 4px 0; }
+    .badge-desc { font-size: 0.78rem; color: #475569; line-height: 1.35; }
+    @media (max-width: 640px) {
+        .main-header { padding: 16px 18px; }
+        .main-header h1 { font-size: 1.3rem; }
+        .main-header p { font-size: 0.85rem; }
+        .hero-grade { font-size: 2.4rem; }
+        .stat-val { font-size: 1.4rem; }
+        .badge-grid { grid-template-columns: repeat(2, 1fr); }
+        .mini-val { font-size: 1.2rem; }
+        .mini-stat { padding: 8px; }
+    }
     .badge-parcial {
         display: inline-block;
         background-color: #dbeafe;
@@ -597,6 +651,9 @@ def render_criteria_explanation(criteria_config):
 # ==============================================================================
 # MOTOR DE CALIFICACIÓN DINÁMICO
 # ==============================================================================
+NOT_EVALUATED_STATUSES = ('Programada', 'En curso')
+
+
 def apply_dynamic_grading(df, criteria_config):
     """
     Aplica las reglas de calificación y penalización dinámicamente según criteria_config,
@@ -658,6 +715,31 @@ def apply_dynamic_grading(df, criteria_config):
         except (ValueError, TypeError):
             correct_q = 0.0
 
+        valor_a_tiempo = float(cfg.get('valor_a_tiempo', 1.0))
+        valor_tardio = float(cfg.get('valor_tardio', 0.1))
+        multiplicar = bool(cfg.get('multiplicar_por_aciertos', False))
+
+        # Valor de la actividad si se entrega completa (usado para proyecciones del alumno)
+        if multiplicar and total_q > 0:
+            potential_max = valor_a_tiempo * total_q
+            potential_on_time = valor_a_tiempo * total_q
+            potential_late = valor_tardio * total_q
+        elif multiplicar:
+            # Khan no reporta el número de preguntas de ejercicios no iniciados:
+            # se proyecta con el valor base (entrega completa = puntaje máximo).
+            potential_max = valor_a_tiempo
+            potential_on_time = valor_a_tiempo
+            potential_late = valor_tardio
+        else:
+            potential_max = valor_a_tiempo
+            potential_on_time = valor_a_tiempo
+            potential_late = valor_tardio
+
+        is_completed = (not is_future) and pd.notna(comp_dt) and str(comp_dt).strip() != ''
+        # Actividad iniciada, sin entregar y cuya fecha de entrega aún no llega:
+        # todavía no se evalúa (antes contaba como 0 aunque el alumno tuviera tiempo).
+        is_in_progress = (not is_future) and (not is_completed) and pd.notna(due_dt) and (due_dt > now)
+
         if is_future:
             # Tarea futura (no iniciada): se fijan Max Points y Earned Points a 0
             # para no tener ningún peso matemático sobre el promedio del bloque
@@ -665,10 +747,14 @@ def apply_dynamic_grading(df, criteria_config):
             max_pts = 0.0
             status = 'Programada'
             obs = 'Programada (no iniciada)'
-            is_completed = False
+            is_late = False
+        elif is_in_progress:
+            earned_pts = 0.0
+            max_pts = 0.0
+            status = 'En curso'
+            obs = 'En curso (aún no vence)'
             is_late = False
         else:
-            is_completed = pd.notna(comp_dt) and str(comp_dt).strip() != ''
             is_late = is_completed and pd.notna(due_dt) and (comp_dt > due_dt)
 
             if evaluar_intentos:
@@ -677,9 +763,6 @@ def apply_dynamic_grading(df, criteria_config):
                 penalty_attempts = 0
 
             effective_correct = max(0.0, correct_q - penalty_attempts)
-            valor_a_tiempo = float(cfg.get('valor_a_tiempo', 1.0))
-            valor_tardio = float(cfg.get('valor_tardio', 0.1))
-            multiplicar = bool(cfg.get('multiplicar_por_aciertos', False))
 
             if not is_completed:
                 earned_pts = 0.0
@@ -732,8 +815,12 @@ def apply_dynamic_grading(df, criteria_config):
             'is_completed': is_completed,
             'is_late': is_late,
             'is_future': is_future,
+            'is_in_progress': is_in_progress,
             'evaluar_intentos': evaluar_intentos,
-            'max_intentos': max_intentos
+            'max_intentos': max_intentos,
+            'potential_max': round(potential_max, 2),
+            'potential_on_time': round(potential_on_time, 2),
+            'potential_late': round(potential_late, 2)
         })
 
     graded_df = pd.DataFrame(graded_rows, index=df.index)
@@ -1107,6 +1194,14 @@ def normalize_credentials_df(df):
     return pd.DataFrame(columns=['Usuario', 'Contraseña', 'Nombre del estudiante'])
 
 
+def parse_drive_time(value):
+    """Convierte el modifiedTime de Drive (ISO en UTC) a hora local del plantel."""
+    ts = pd.to_datetime(value, errors='coerce', utc=True)
+    if pd.isna(ts):
+        return pd.NaT
+    return ts.tz_convert(LOCAL_TZ).tz_localize(None)
+
+
 ASSIGNMENT_KEY_COLS = ['Grupo', 'Nombre del estudiante', 'Nombre de la tarea', 'Fecha de entrega']
 
 
@@ -1186,6 +1281,7 @@ def load_raw_assignments_local_fallback():
             continue
         df['Archivo_Origen'] = os.path.basename(filepath)
         df['Grupo'] = extract_group(filepath)
+        df['Archivo_Modificado'] = datetime.fromtimestamp(os.path.getmtime(filepath), LOCAL_TZ).replace(tzinfo=None)
         dfs.append(df)
     if not dfs:
         return pd.DataFrame()
@@ -1271,6 +1367,7 @@ def load_teacher_raw_assignments(folder_id):
             if not df.empty:
                 df['Archivo_Origen'] = file_name
                 df['Grupo'] = extract_group(file_name)
+                df['Archivo_Modificado'] = parse_drive_time(item.get('modifiedTime'))
                 dfs.append(df)
 
         if not dfs:
@@ -1293,7 +1390,7 @@ def compute_student_block_grades(assignments_df, criterios_config=None):
     Calcula la calificación por bloque (Fecha de entrega) para cada estudiante y grupo:
     Block Grade = (Sum(Puntos Ganados) / Sum(Puntos Posibles)) * scale * (weight / 100.0)
     Redondeado a 1 decimal.
-    Si todas las tareas del bloque son futuras (status == 'Programada' y max_points == 0),
+    Si ninguna tarea del bloque se ha evaluado todavía (todas 'Programada' o 'En curso'),
     la calificación del bloque se marca como NaN para no afectar el promedio del estudiante.
     """
     if assignments_df.empty:
@@ -1313,14 +1410,15 @@ def compute_student_block_grades(assignments_df, criterios_config=None):
         max_sum=('max_points', 'sum'),
         dt_entrega=('dt_entrega', 'first'),
         parcial=('Parcial', 'first') if 'Parcial' in assignments_df.columns else ('dt_entrega', 'first'),
-        all_future=('status', lambda s: (s == 'Programada').all() if len(s) > 0 else False)
+        all_future=('status', lambda s: (s == 'Programada').all() if len(s) > 0 else False),
+        not_evaluated=('status', lambda s: s.isin(NOT_EVALUATED_STATUSES).all() if len(s) > 0 else False)
     )
 
     def calc_grade(r):
         if r['max_sum'] > 0:
             raw_grade = (r['earned_sum'] / r['max_sum']) * scale * (weight / 100.0)
             return round(raw_grade, 1)
-        elif r.get('all_future', False):
+        elif r.get('not_evaluated', False):
             return float('nan')
         else:
             return 0.0
@@ -1392,6 +1490,7 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
     # --------------------------------------------------------------------------
     total_tasks = len(active_data)
     future_tasks = (active_data['status'] == 'Programada').sum()
+    in_progress_tasks = (active_data['status'] == 'En curso').sum()
     active_tasks = total_tasks - future_tasks
     completed_tasks = active_data['is_completed'].sum()
     late_tasks = active_data['is_late'].sum()
@@ -1412,7 +1511,12 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
         </div>
         """, unsafe_allow_html=True)
     with kpi_col2:
-        caption_future = f"<div style='font-size:0.75rem; color:#64748b; margin-top:2px;'>({future_tasks} programadas)</div>" if future_tasks > 0 else ""
+        pending_bits = []
+        if in_progress_tasks > 0:
+            pending_bits.append(f"{in_progress_tasks} en curso")
+        if future_tasks > 0:
+            pending_bits.append(f"{future_tasks} programadas")
+        caption_future = f"<div style='font-size:0.75rem; color:#64748b; margin-top:2px;'>({', '.join(pending_bits)})</div>" if pending_bits else ""
         st.markdown(f"""
         <div class="stat-card">
             <div class="stat-title">Actividades</div>
@@ -1467,7 +1571,8 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
         # Puntos del bloque completos
         block_earned_total = block_df['earned_points'].sum()
         block_max_total = block_df['max_points'].sum()
-        is_block_all_future = (block_df['status'] == 'Programada').all() if not block_df.empty else False
+        is_block_all_future = block_df['status'].isin(NOT_EVALUATED_STATUSES).all() if not block_df.empty else False
+        block_label = "Programada" if (block_df['status'] == 'Programada').all() else "En curso"
 
         if block_max_total > 0:
             block_grade = round((block_earned_total / block_max_total) * scale * (weight / 100.0), 1)
@@ -1478,10 +1583,10 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
             grade_suffix = f"<span style='font-size: 0.95rem; color: #64748b;'> / {scale}</span>"
         elif is_block_all_future:
             block_grade = None
-            grade_str = "Programada"
+            grade_str = block_label
             grade_color = '#64748b'
             progress_val = 0.0
-            pts_display = "<span style='color: #64748b; font-style: italic;'>Pendiente de inicio</span>"
+            pts_display = "<span style='color: #64748b; font-style: italic;'>" + ("Pendiente de inicio" if block_label == "Programada" else "Aún no vence") + "</span>"
             grade_suffix = ""
         else:
             block_grade = 0.0
@@ -1532,7 +1637,14 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
         # Tabla detallada del bloque
         table_rows = []
         for _, row in display_df.iterrows():
-            if row['status'] == 'Programada':
+            if row['status'] == 'En curso':
+                aciertos_str = "—"
+                intentos_str = str(row['attempts_count']) if row['attempts_count'] else "—"
+                puntos_str = f"Vale {row['potential_max']:.1f}"
+                terminacion_str = "Pendiente"
+                estado_str = "En curso"
+                detalle_str = f"Entrégala antes de: {row['Fecha de entrega']}"
+            elif row['status'] == 'Programada':
                 aciertos_str = "—"
                 intentos_str = "—"
                 puntos_str = "Programada"
@@ -1586,6 +1698,422 @@ def render_student_dashboard(student_name, student_data, criteria_config=None, i
     # Acordeón de reglas con criterios activos dinámicos
     with st.expander("ℹ️ ¿Cómo se calculan los puntos ponderados y penalizaciones?"):
         st.markdown(render_criteria_explanation(criteria_config))
+
+
+# ==============================================================================
+# EXPERIENCIA DEL ESTUDIANTE: INICIO, PENDIENTES, RECUPERACIÓN Y LOGROS
+# ==============================================================================
+MESES_CORTOS = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic']
+
+STATUS_STYLES = {
+    'Excelente': {'icon': '🌟', 'bg': '#dcfce7', 'fg': '#166534', 'accent': '#16a34a'},
+    'Bien': {'icon': '👍', 'bg': '#dbeafe', 'fg': '#1e40af', 'accent': '#2563eb'},
+    'Regular': {'icon': '💪', 'bg': '#fef3c7', 'fg': '#92400e', 'accent': '#d97706'},
+    'En riesgo': {'icon': '🤝', 'bg': '#fee2e2', 'fg': '#991b1b', 'accent': '#dc2626'},
+    None: {'icon': '👋', 'bg': '#f1f5f9', 'fg': '#334155', 'accent': '#64748b'},
+}
+
+
+def format_short_date(dt, with_time=True):
+    """'8 sep · 23:59' a partir de un Timestamp."""
+    if dt is None or pd.isna(dt):
+        return "sin fecha"
+    text = f"{dt.day} {MESES_CORTOS[dt.month - 1]}"
+    return f"{text} · {dt:%H:%M}" if with_time else text
+
+
+def relative_days_label(dt, today=None):
+    """'hoy', 'mañana', 'en 3 días', 'hace 2 días'."""
+    if dt is None or pd.isna(dt):
+        return ""
+    today = today or now_local().date()
+    diff = (dt.date() - today).days
+    if diff == 0:
+        return "hoy"
+    if diff == 1:
+        return "mañana"
+    if diff > 1:
+        return f"en {diff} días"
+    if diff == -1:
+        return "ayer"
+    return f"hace {-diff} días"
+
+
+def _average_block_grade(tasks, criteria_config):
+    blocks = compute_student_block_grades(tasks, criteria_config)
+    if blocks.empty:
+        return None
+    grades = blocks['block_grade'].dropna()
+    return float(grades.mean()) if not grades.empty else None
+
+
+def build_student_insights(tasks, criteria_config):
+    """
+    Calcula todo lo que necesita la vista del alumno a partir de sus actividades calificadas:
+    promedio actual, pendientes, proyecciones de recuperación, racha, tendencia y logros.
+    """
+    cfg = criteria_config if isinstance(criteria_config, dict) else {}
+    scale = int(cfg.get('escala_maxima', 10))
+    weight = float(cfg.get('peso_khan', 100))
+    thresholds = cfg.get('thresholds', {}) or {}
+    max_grade = scale * weight / 100.0
+    step = 1.0 if scale == 10 else 10.0  # "un punto" en la escala del docente
+    min_pass = float(thresholds.get('regular', 6.0 if scale == 10 else 60.0))
+    min_excelente = float(thresholds.get('excelente', 9.5 if scale == 10 else 95.0))
+    today = now_local().date()
+
+    ins = {
+        'scale': scale, 'max_grade': max_grade, 'min_pass': min_pass,
+        'min_excelente': min_excelente, 'step': step,
+    }
+
+    avg_now = _average_block_grade(tasks, cfg)
+    ins['avg'] = avg_now
+    ins['status'] = classify_student(avg_now, thresholds, scale) if avg_now is not None else None
+
+    # Promedio del parcial en curso
+    ins['parcial_actual'] = None
+    ins['parcial_avg'] = None
+    if 'Parcial' in tasks.columns:
+        for p_name, rng in parse_parciales_dates(cfg.get('parciales', {})).items():
+            if rng['start'] <= today <= rng['end']:
+                ins['parcial_actual'] = p_name
+                ins['parcial_avg'] = _average_block_grade(tasks[tasks['Parcial'] == p_name], cfg)
+                break
+
+    # Pendientes
+    ins['upcoming'] = tasks[tasks['status'] == 'En curso'].sort_values('dt_entrega')
+    ins['overdue'] = tasks[tasks['status'] == 'No completado'].sort_values('dt_entrega')
+    ins['scheduled'] = tasks[tasks['status'] == 'Programada'].sort_values('dt_inicio')
+
+    # Proyecciones ("¿qué pasa si entrego?")
+    def simulate(recover_overdue=False, upcoming_mode=None):
+        sim = tasks.copy()
+        if recover_overdue and not ins['overdue'].empty:
+            m = sim['status'] == 'No completado'
+            sim.loc[m, 'earned_points'] = sim.loc[m, 'potential_late']
+            sim.loc[m, 'status'] = 'Tardía'
+        if upcoming_mode and not ins['upcoming'].empty:
+            m = sim['status'] == 'En curso'
+            sim.loc[m, 'max_points'] = sim.loc[m, 'potential_max']
+            sim.loc[m, 'earned_points'] = sim.loc[m, 'potential_on_time'] if upcoming_mode == 'on_time' else 0.0
+            sim.loc[m, 'status'] = 'A tiempo' if upcoming_mode == 'on_time' else 'No completado'
+        return _average_block_grade(sim, cfg)
+
+    ins['avg_recover_overdue'] = simulate(recover_overdue=True) if not ins['overdue'].empty else None
+    ins['avg_upcoming_on_time'] = simulate(upcoming_mode='on_time') if not ins['upcoming'].empty else None
+    ins['avg_upcoming_missed'] = simulate(upcoming_mode='missed') if not ins['upcoming'].empty else None
+    ins['avg_best'] = simulate(recover_overdue=True, upcoming_mode='on_time') if (not ins['overdue'].empty or not ins['upcoming'].empty) else None
+
+    # Bloques ya cerrados (todas sus actividades vencidas o entregadas), en orden cronológico
+    blocks = compute_student_block_grades(tasks, cfg)
+    finished = []
+    if not blocks.empty:
+        for _, b in blocks.sort_values('dt_entrega').iterrows():
+            b_tasks = tasks[tasks['Fecha de entrega'] == b['Fecha de entrega']]
+            if b_tasks['status'].isin(NOT_EVALUATED_STATUSES).any() or pd.isna(b['block_grade']):
+                continue
+            finished.append({
+                'fecha': b['Fecha de entrega'],
+                'dt': b['dt_entrega'],
+                'grade': float(b['block_grade']),
+                'all_on_time': bool(b_tasks['status'].astype(str).str.startswith('A tiempo').all()),
+            })
+    ins['finished_blocks'] = finished
+
+    streak = 0
+    for b in reversed(finished):
+        if not b['all_on_time']:
+            break
+        streak += 1
+    ins['streak'] = streak
+
+    ins['trend'] = None
+    if len(finished) >= 2:
+        prev = [b['grade'] for b in finished[:-1]]
+        ins['trend'] = finished[-1]['grade'] - (sum(prev) / len(prev))
+
+    evaluated = tasks[~tasks['status'].isin(NOT_EVALUATED_STATUSES)]
+    on_time = evaluated['status'].astype(str).str.startswith('A tiempo')
+    ins['n_evaluated'] = len(evaluated)
+    ins['on_time_pct'] = (on_time.mean() * 100) if len(evaluated) else None
+
+    perfect_ex = evaluated[on_time & (evaluated['total_count'] > 0) & (evaluated['correct_count'] >= evaluated['total_count'])]
+
+    # Logros: se calculan solo con los datos del propio alumno (sin comparar con compañeros)
+    ins['badges'] = [
+        {
+            'icon': '🔥', 'title': 'Racha puntual',
+            'earned': streak >= 3,
+            'desc': f"{streak} bloque(s) seguidos entregando todo a tiempo." if streak else "Entrega completo y a tiempo varios bloques seguidos.",
+            'how': "Entrega todas las actividades a tiempo 3 bloques seguidos.",
+        },
+        {
+            'icon': '🎯', 'title': 'Puntería perfecta',
+            'earned': len(perfect_ex) > 0,
+            'desc': f"{len(perfect_ex)} ejercicio(s) con todas las respuestas correctas.",
+            'how': "Resuelve un ejercicio a tiempo con el 100% de aciertos.",
+        },
+        {
+            'icon': '⏰', 'title': 'Siempre a tiempo',
+            'earned': ins['on_time_pct'] is not None and len(evaluated) >= 5 and ins['on_time_pct'] >= 90,
+            'desc': f"{ins['on_time_pct']:.0f}% de tus actividades entregadas a tiempo." if ins['on_time_pct'] is not None else "Aún no hay actividades evaluadas.",
+            'how': "Entrega a tiempo al menos el 90% de tus actividades.",
+        },
+        {
+            'icon': '🏆', 'title': 'Bloque perfecto',
+            'earned': any(b['grade'] >= max_grade - 0.05 for b in finished),
+            'desc': f"Obtuviste {max_grade:g} en al menos un bloque.",
+            'how': f"Consigue {max_grade:g} en un bloque de entrega.",
+        },
+        {
+            'icon': '📈', 'title': 'En ascenso',
+            'earned': ins['trend'] is not None and (ins['trend'] >= step or finished[-1]['grade'] >= max_grade - 0.05),
+            'desc': "Tu último bloque superó tu promedio anterior." if (ins['trend'] or 0) >= step else "Mantuviste la calificación máxima en tu último bloque.",
+            'how': "Supera tu promedio por al menos 1 punto en tu siguiente bloque.",
+        },
+        {
+            'icon': '✅', 'title': 'Al día',
+            'earned': len(finished) > 0 and ins['overdue'].empty,
+            'desc': "No tienes actividades atrasadas.",
+            'how': "Entrega todas tus actividades atrasadas.",
+        },
+    ]
+    return ins
+
+
+def build_motivation_message(ins):
+    """Mensaje personalizado según el desempeño: reconoce lo bueno y propone un siguiente paso concreto."""
+    status = ins['status']
+    avg = ins['avg']
+    n_over = len(ins['overdue'])
+    n_up = len(ins['upcoming'])
+    best = ins['avg_best']
+
+    if status is None:
+        if n_up:
+            return ("¡Bienvenido(a)!", f"Aún no tienes actividades evaluadas. Tienes {n_up} actividad(es) en curso: entrégalas a tiempo y empieza el semestre con el pie derecho.")
+        return ("¡Bienvenido(a)!", "Aún no tienes actividades evaluadas. Aquí verás tu avance en cuanto tu docente publique las primeras tareas.")
+
+    streak_txt = f" Llevas {ins['streak']} bloque(s) seguidos entregando todo a tiempo." if ins['streak'] >= 2 else ""
+    trend = ins['trend']
+    trend_txt = ""
+    if trend is not None and trend >= ins['step'] * 0.5:
+        trend_txt = " Tu último bloque fue mejor que tu promedio: ¡vas mejorando!"
+
+    if status == 'Excelente':
+        return ("¡Vas excelente!", f"Tu esfuerzo se nota.{streak_txt}{trend_txt} Mantén este ritmo todo el semestre.")
+    if status == 'Bien':
+        gap = max(0.0, ins['min_excelente'] - avg)
+        extra = ""
+        if best is not None and best > avg:
+            extra = f" Si entregas tus pendientes, tu promedio puede llegar a {best:.1f}."
+        return ("¡Vas muy bien!", f"Estás a {gap:.1f} de llegar a Excelente.{streak_txt}{trend_txt}{extra}")
+    if status == 'Regular':
+        extra = f" Si entregas tus pendientes, tu promedio puede subir a {best:.1f}." if (best is not None and best > avg) else " Entrega tus próximas actividades a tiempo para subir tu promedio."
+        return ("Vas aprobando, ¡puedes más!", f"Estás por encima del mínimo, pero todavía hay espacio para mejorar.{trend_txt}{extra}")
+    # En riesgo: tono de apoyo, nunca de regaño
+    if best is not None and best > avg:
+        parts = []
+        if n_over:
+            parts.append(f"{n_over} actividad(es) atrasada(s)")
+        if n_up:
+            parts.append(f"{n_up} en curso")
+        return ("Todavía estás a tiempo de recuperarte", f"Si entregas tus {' y '.join(parts)}, tu promedio puede subir de {avg:.1f} a {best:.1f}. Empieza por la que vence primero; cada entrega cuenta.{trend_txt}")
+    return ("Todavía estás a tiempo de recuperarte", f"Cada bloque nuevo es una oportunidad. Entrega a tiempo tus próximas actividades y pide ayuda a tu docente si algún tema se te complica.{trend_txt}")
+
+
+def _task_card_html(title, meta, right, accent):
+    return f"""
+    <div class="task-card" style="border-left-color: {accent};">
+        <div class="task-main">
+            <div class="task-title">{html.escape(str(title))}</div>
+            <div class="task-meta">{meta}</div>
+        </div>
+        <div class="task-right">{right}</div>
+    </div>"""
+
+
+def render_progress_chart(ins):
+    finished = ins['finished_blocks']
+    if len(finished) < 2:
+        st.caption("Tu gráfica de progreso aparecerá cuando tengas al menos 2 bloques evaluados.")
+        return
+    import altair as alt
+    chart_df = pd.DataFrame([
+        {'Entrega': format_short_date(b['dt'], with_time=False) if pd.notna(b['dt']) else str(b['fecha']),
+         'Orden': i, 'Calificación': round(b['grade'], 1)}
+        for i, b in enumerate(finished)
+    ])
+    y_scale = alt.Scale(domain=[0, ins['max_grade']])
+    x_enc = alt.X('Entrega:N', sort=alt.SortField('Orden'), title=None, axis=alt.Axis(labelAngle=0, grid=False))
+    line = alt.Chart(chart_df).mark_line(
+        strokeWidth=2, color='#2563eb',
+        point=alt.OverlayMarkDef(size=70, filled=True, color='#2563eb')
+    ).encode(
+        x=x_enc,
+        y=alt.Y('Calificación:Q', scale=y_scale, title=None, axis=alt.Axis(gridOpacity=0.4, tickCount=5)),
+        tooltip=[alt.Tooltip('Entrega:N'), alt.Tooltip('Calificación:Q', format='.1f')]
+    )
+    rule_df = pd.DataFrame({'y': [ins['min_pass']], 'label': [f"Mínimo aprobatorio ({ins['min_pass']:g})"]})
+    rule = alt.Chart(rule_df).mark_rule(strokeDash=[4, 4], color='#94a3b8', strokeWidth=1.5).encode(y='y:Q')
+    rule_text = alt.Chart(rule_df).mark_text(align='left', dx=4, dy=-7, color='#64748b', fontSize=11).encode(
+        y='y:Q', x=alt.value(0), text='label:N'
+    )
+    st.altair_chart((rule + rule_text + line).properties(height=240), width='stretch')
+
+
+def render_badges(ins):
+    cards = []
+    for b in ins['badges']:
+        cls = "badge-card earned" if b['earned'] else "badge-card locked"
+        detail = b['desc'] if b['earned'] else f"<em>Cómo conseguirlo:</em> {b['how']}"
+        state = "✔ Conseguido" if b['earned'] else "🔒 Por conseguir"
+        cards.append(f"""
+        <div class="{cls}">
+            <div class="badge-icon">{b['icon']}</div>
+            <div class="badge-title">{b['title']}</div>
+            <div class="badge-state">{state}</div>
+            <div class="badge-desc">{detail}</div>
+        </div>""")
+    st.markdown(f"<div class='badge-grid'>{''.join(cards)}</div>", unsafe_allow_html=True)
+
+
+def render_student_home(ins):
+    style = STATUS_STYLES.get(ins['status'], STATUS_STYLES[None])
+    title, body = build_motivation_message(ins)
+    avg_txt = f"{ins['avg']:.1f}" if ins['avg'] is not None else "—"
+    status_txt = ins['status'] or "Sin evaluar"
+    st.markdown(f"""
+    <div class="hero-card" style="border-left-color: {style['accent']};">
+        <div class="hero-top">
+            <div>
+                <div class="hero-label">Promedio general</div>
+                <div class="hero-grade">{avg_txt}<span> / {ins['scale']}</span></div>
+            </div>
+            <div class="hero-status" style="background: {style['bg']}; color: {style['fg']};">{style['icon']} {status_txt}</div>
+        </div>
+        <div class="hero-msg"><strong>{html.escape(title)}</strong><br>{html.escape(body)}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Fila compacta de indicadores (se mantiene en una sola fila también en celular)
+    parcial_label = f"Promedio {ins['parcial_actual']}" if ins['parcial_actual'] else "Parcial actual"
+    mini_stats = [
+        (parcial_label, f"{ins['parcial_avg']:.1f}" if ins['parcial_avg'] is not None else "—"),
+        ("🔥 Racha puntual", f"{ins['streak']} <small>bloque(s)</small>"),
+        ("⏰ A tiempo", f"{ins['on_time_pct']:.0f}%" if ins['on_time_pct'] is not None else "—"),
+    ]
+    st.markdown(
+        "<div class='mini-stats'>" + "".join(
+            f"<div class='mini-stat'><div class='mini-label'>{html.escape(lbl)}</div><div class='mini-val'>{val}</div></div>"
+            for lbl, val in mini_stats
+        ) + "</div>",
+        unsafe_allow_html=True
+    )
+
+    # Próximo paso
+    if not ins['upcoming'].empty:
+        next_dt = ins['upcoming']['dt_entrega'].iloc[0]
+        n_next = int((ins['upcoming']['dt_entrega'] == next_dt).sum())
+        st.info(f"⏰ **Tu próxima entrega:** {format_short_date(next_dt)} ({relative_days_label(next_dt)}) — {n_next} actividad(es). Revisa la pestaña **Pendientes**.")
+    elif not ins['overdue'].empty:
+        st.warning(f"📝 Tienes **{len(ins['overdue'])} actividad(es) atrasada(s)** que todavía puedes entregar. Revisa la pestaña **Pendientes**.")
+    elif ins['avg'] is not None:
+        st.success("✅ ¡Estás al día! No tienes actividades pendientes por ahora.")
+
+    st.markdown("#### 📈 Mi progreso por bloque")
+    render_progress_chart(ins)
+
+    st.markdown("#### 🏅 Mis logros")
+    render_badges(ins)
+
+
+def render_student_pending(ins, key_prefix):
+    upcoming, overdue, scheduled = ins['upcoming'], ins['overdue'], ins['scheduled']
+
+    # Calculadora de recuperación
+    if ins['avg_best'] is not None:
+        st.markdown("#### 🧮 ¿Cuánto puede subir mi promedio?")
+        delta = (ins['avg_best'] - ins['avg']) if ins['avg'] is not None else None
+        delta_html = f" <small class='delta-up'>▲ {delta:.1f}</small>" if delta is not None and delta >= 0.05 else ""
+        st.markdown(f"""
+        <div class='mini-stats' style='grid-template-columns: repeat(2, 1fr);'>
+            <div class='mini-stat'><div class='mini-label'>Promedio actual</div><div class='mini-val'>{f"{ins['avg']:.1f}" if ins['avg'] is not None else "—"}</div></div>
+            <div class='mini-stat'><div class='mini-label'>Si entregas todo lo pendiente</div><div class='mini-val'>{ins['avg_best']:.1f}{delta_html}</div></div>
+        </div>""", unsafe_allow_html=True)
+        lines = []
+        if ins['avg_upcoming_on_time'] is not None:
+            lines.append(f"- Si entregas **a tiempo** tus {len(upcoming)} actividad(es) en curso: **{ins['avg_upcoming_on_time']:.1f}**. Si no las entregas: **{ins['avg_upcoming_missed']:.1f}**.")
+        if ins['avg_recover_overdue'] is not None:
+            lines.append(f"- Si entregas tus {len(overdue)} actividad(es) atrasada(s), aunque sea tarde: **{ins['avg_recover_overdue']:.1f}**.")
+        if lines:
+            st.markdown("\n".join(lines))
+        st.caption("Estimación suponiendo que respondes todo correctamente y sin intentos extra. Las entregas tardías valen menos, ¡pero siempre suman!")
+        st.link_button("🚀 Ir a Khan Academy", "https://es.khanacademy.org/", type="primary", width='stretch')
+        st.divider()
+
+    # En curso, agrupadas por fecha de entrega
+    st.markdown(f"#### ⏳ Por entregar ({len(upcoming)})")
+    if upcoming.empty:
+        st.caption("No tienes actividades en curso. 🎉")
+    else:
+        for due_label, grp in upcoming.groupby('Fecha de entrega', sort=False):
+            due_dt = grp['dt_entrega'].iloc[0]
+            rel = relative_days_label(due_dt)
+            urgent = rel in ("hoy", "mañana")
+            st.markdown(f"**📅 Vence {format_short_date(due_dt)}** · {'🔴 ' if urgent else ''}{rel}")
+            cards = [
+                _task_card_html(
+                    r['Nombre de la tarea'],
+                    html.escape(str(r['Tipo de tarea'])),
+                    f"Vale<br><strong>{r['potential_max']:.1f} pts</strong>",
+                    '#dc2626' if urgent else '#2563eb'
+                ) for _, r in grp.iterrows()
+            ]
+            st.markdown("".join(cards), unsafe_allow_html=True)
+
+    st.markdown(f"#### ⚠️ Atrasadas — aún puedes entregarlas ({len(overdue)})")
+    if overdue.empty:
+        st.caption("No tienes actividades atrasadas. ¡Muy bien!")
+    else:
+        cards = [
+            _task_card_html(
+                r['Nombre de la tarea'],
+                f"{html.escape(str(r['Tipo de tarea']))} · Venció {format_short_date(r['dt_entrega'], with_time=False)} ({relative_days_label(r['dt_entrega'])})",
+                f"Recuperas<br><strong>{r['potential_late']:.1f} pts</strong>",
+                '#d97706'
+            ) for _, r in overdue.iterrows()
+        ]
+        st.markdown("".join(cards), unsafe_allow_html=True)
+
+    if not scheduled.empty:
+        next_start = scheduled['dt_inicio'].iloc[0]
+        st.caption(f"📅 Próximamente: {len(scheduled)} actividad(es) programada(s). La siguiente se habilita el {format_short_date(next_start)}.")
+
+
+def render_student_experience(student_name, tasks, criteria_config, key_prefix="student", updated_at=None):
+    """Vista completa del alumno. El docente la ve igual desde el drill-down (key_prefix='admin')."""
+    if tasks.empty:
+        st.info("Todavía no hay actividades registradas para ti en esta asignatura. Si crees que es un error, avísale a tu docente.")
+        return
+
+    ins = build_student_insights(tasks, criteria_config)
+    if updated_at is not None and pd.notna(updated_at):
+        st.caption(f"🔄 Datos actualizados al {format_short_date(updated_at)}. Lo que entregues después aparecerá cuando tu docente actualice los reportes de Khan Academy.")
+
+    n_pend = len(ins['upcoming']) + len(ins['overdue'])
+    tab_home, tab_pend, tab_detail = st.tabs([
+        "🏠 Inicio",
+        f"📝 Pendientes ({n_pend})" if n_pend else "📝 Pendientes",
+        "📋 Mis calificaciones",
+    ])
+    with tab_home:
+        render_student_home(ins)
+    with tab_pend:
+        render_student_pending(ins, key_prefix)
+    with tab_detail:
+        render_student_dashboard(student_name, tasks, criteria_config=criteria_config, is_admin_drilldown=(key_prefix == 'admin'))
 
 
 # ==============================================================================
@@ -2289,6 +2817,11 @@ def render_admin():
         columns='Fecha de entrega',
         values='all_future'
     ).reset_index()
+    not_eval_pivot = block_summary.pivot(
+        index=['Grupo', 'Nombre del estudiante'],
+        columns='Fecha de entrega',
+        values='not_evaluated'
+    ).reset_index()
 
     # Columnas de fecha existentes en el pivote
     existing_date_cols = [c for c in date_order if c in pivot_df.columns]
@@ -2342,11 +2875,15 @@ def render_admin():
     future_flags = future_pivot.set_index(['Grupo', 'Nombre del estudiante']).reindex(
         pd.MultiIndex.from_frame(display_pivot[['Grupo', 'Nombre del estudiante']])
     )
+    not_eval_flags = not_eval_pivot.set_index(['Grupo', 'Nombre del estudiante']).reindex(
+        pd.MultiIndex.from_frame(display_pivot[['Grupo', 'Nombre del estudiante']])
+    )
     for col in existing_date_cols:
         is_future_block = future_flags[col].fillna(False).astype(bool).to_numpy()
+        is_not_eval_block = not_eval_flags[col].fillna(False).astype(bool).to_numpy()
         display_pivot[col] = [
-            f"{x:.1f}" if pd.notna(x) else ("Programada" if fut else fill_option)
-            for x, fut in zip(display_pivot[col], is_future_block)
+            f"{x:.1f}" if pd.notna(x) else ("Programada" if fut else ("En curso" if ne else fill_option))
+            for x, fut, ne in zip(display_pivot[col], is_future_block, is_not_eval_block)
         ]
     display_pivot['Promedio General'] = display_pivot['Promedio General'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "0.0")
 
@@ -2431,7 +2968,7 @@ def render_admin():
     # TABLA COMPLETA CON FORMATO CONDICIONAL (.style)
     # --------------------------------------------------------------------------
     st.markdown("#### 📋 Listado Completo de Actividades del Alumno")
-    st.caption("Semáforo de detección rápida: 🟥 **Rojo tenue:** Calificación de 0 puntos (sin entrega o penalizada) | 🟨 **Amarillo tenue:** Actividad realizada con intentos que superan el límite permitido | ⚪ **Gris/Cursiva:** Actividad futura programada.")
+    st.caption("Semáforo de detección rápida: 🟥 **Rojo tenue:** Calificación de 0 puntos (sin entrega o penalizada) | 🟨 **Amarillo tenue:** Actividad realizada con intentos que superan el límite permitido | ⚪ **Gris/Cursiva:** Actividad programada o en curso (aún no vence).")
 
     # Ordenar por fecha de entrega y nombre
     all_tasks_sorted = student_tasks_data.sort_values(by=['dt_entrega', 'Nombre de la tarea']).copy()
@@ -2439,9 +2976,9 @@ def render_admin():
     # Columnas requeridas: 'Nombre de la tarea', 'Tipo', 'Parcial', 'Fecha de entrega', 'Número de intentos', 'Puntos Obtenidos'
     drill_rows = []
     for _, task_r in all_tasks_sorted.iterrows():
-        is_prog = (task_r.get('status') == 'Programada')
+        is_prog = task_r.get('status') in NOT_EVALUATED_STATUSES
         if is_prog:
-            pts_display = "Programada"
+            pts_display = task_r.get('status')
             attempts_display = "—"
         else:
             pts_display = f"{task_r['earned_points']:.1f}"
@@ -2466,7 +3003,7 @@ def render_admin():
     # Función de formato condicional con Pandas .style
     def highlight_drilldown_rows(row):
         status = row.get('_status', '')
-        if status == 'Programada':
+        if status in NOT_EVALUATED_STATUSES:
             return ['background-color: #f8fafc; color: #64748b; font-style: italic;'] * len(row)
 
         score = row.get('_earned_points', 0)
@@ -2512,8 +3049,9 @@ def render_admin():
     st.write("")
 
     # Visualización complementaria: Dashboard idéntico con desglose por bloques y filtros
-    with st.expander("👁️ Ver Vista Detallada por Bloques (Vista del Estudiante)", expanded=True):
-        render_student_dashboard(selected_student, student_tasks_data, criteria_config=active_criteria_config, is_admin_drilldown=True)
+    with st.expander("👁️ Vista del alumno (así ve su portal este estudiante)", expanded=True):
+        updated_at = student_tasks_data['Archivo_Modificado'].max() if 'Archivo_Modificado' in student_tasks_data.columns else None
+        render_student_experience(selected_student, student_tasks_data, active_criteria_config, key_prefix="admin", updated_at=updated_at)
 
 
 # ==============================================================================
@@ -2553,8 +3091,8 @@ def render_student():
     with header_col1:
         st.markdown(f"""
         <div class="main-header">
-            <h1>🎓 Calificaciones: {html.escape(str(student_name))}</h1>
-            <p>Grupo: <strong>{html.escape(str(student_group))}</strong> | Usuario: <code>{html.escape(str(username))}</code> | Asignatura: <strong>{html.escape(str(asignatura))}</strong> | Docente: <strong>{html.escape(str(teacher_name))}</strong></p>
+            <h1>🎓 {html.escape(str(student_name))}</h1>
+            <p><strong>{html.escape(str(asignatura))}</strong> · Grupo {html.escape(str(student_group))} · Docente: {html.escape(str(teacher_name))}</p>
         </div>
         """, unsafe_allow_html=True)
     with header_col2:
@@ -2568,7 +3106,8 @@ def render_student():
         st.warning("No hay tareas registradas en el sistema para esta asignatura. Contacta al docente.")
         return
 
-    render_student_dashboard(student_name, student_tasks, criteria_config=criterios_data, is_admin_drilldown=False)
+    updated_at = student_tasks['Archivo_Modificado'].max() if 'Archivo_Modificado' in student_tasks.columns and not student_tasks.empty else None
+    render_student_experience(student_name, student_tasks, criterios_data, key_prefix="student", updated_at=updated_at)
 
 
 
