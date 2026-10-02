@@ -33,6 +33,10 @@ credenciales de alumnos al repositorio).
 
 - Carpeta raíz (`ROOT_FOLDER_ID` en `app.py`) con `docentes.xlsx`
   (`usuario_docente`, `password`, `asignatura`, `carpeta_nombre`, `Nombre del Docente`, `e_mail`).
+  Columnas opcionales para **tutoría académica**: `rol` (`docente`, `tutor` o `directivo`) y
+  `grupos_tutoria` (p. ej. `5°H, 5°J`; vacío o `todos` = todos los grupos). Un tutor o directivo
+  sin `carpeta_nombre` entra directo a la vista de tutoría (todas las materias de sus grupos);
+  un docente que además es tutor ve la sección **🧭 Tutoría** en su panel.
 - Una subcarpeta por docente/asignatura con:
   - Los reportes CSV de Khan Academy (el grupo se toma del nombre, p. ej. `5°H`).
     Si un grupo se descarga más de una vez, se usa la versión más reciente de cada tarea.
@@ -48,6 +52,12 @@ credenciales de alumnos al repositorio).
     **Evaluación del parcial**): sellos de evidencia por bloque, examen y producto del parcial,
     y pase de lista. Los pesos de cada componente y la asistencia mínima se configuran en
     **Configuración → Componentes y asistencia** y se guardan en `criterios.json`.
+  - `metas.xlsx` (opcional): metas que cada alumno se pone por parcial desde su portal (🎯 Mi meta).
+  - `temas.xlsx` (opcional, **Ajustes → 📚 Temas**): tema de cada actividad de Khan. Con él,
+    los alumnos ven su dominio por tema (📚 Mis temas) y el docente ve **Calificaciones → Por tema**.
+
+  Las plantillas de todos estos archivos se descargan en **Ajustes → 🚀 Primeros pasos**.
+  El reporte de avance para la familia (PDF) se genera en **🔍 Alumno** y en **🧭 Tutoría**.
 
   Estos archivos se pueden abrir y corregir con Google Sheets, pero deben conservar el
   formato `.xlsx` y su nombre (no "Guardar como Hojas de cálculo de Google").

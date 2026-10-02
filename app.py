@@ -204,6 +204,14 @@ st.markdown("""
         .student-cards { grid-template-columns: 1fr; }
         .sc-body { grid-template-columns: 1fr; }
     }
+.topic-list { display: flex; flex-direction: column; gap: 10px; margin: 6px 0 14px; }
+.topic-row { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px 12px; }
+.topic-head { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.topic-name { font-weight: 600; color: #0f172a; }
+.topic-pct { font-weight: 600; font-size: 0.9rem; }
+.topic-meta { color: #64748b; font-size: 0.85rem; }
+.topic-track { height: 10px; background: #f1f5f9; border-radius: 6px; overflow: hidden; }
+.topic-fill { height: 100%; border-radius: 6px; }
     .badge-parcial {
         display: inline-block;
         background-color: #dbeafe;
@@ -1169,13 +1177,17 @@ def list_drive_csvs(service, folder_id):
         return []
 
 
+DOCENTES_COLS = ['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail', 'rol', 'grupos_tutoria']
+
+
 @st.cache_data(ttl=3600)
 def load_docentes_master():
     """
     Carga el archivo maestro docentes.xlsx ubicado en la carpeta raíz de Drive.
     Columnas requeridas: 'usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail'.
+    Opcionales: 'rol' (docente, tutor o directivo) y 'grupos_tutoria' (ej. "5°H, 5°J"; vacío o "todos" = todos los grupos).
     """
-    default_empty = pd.DataFrame(columns=['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail'])
+    default_empty = pd.DataFrame(columns=DOCENTES_COLS)
     try:
         service = get_drive_service()
         if not service or str(ROOT_FOLDER_ID).startswith('PEGA_AQUÍ'):
@@ -1195,6 +1207,10 @@ def load_docentes_master():
             cl = col.lower().strip()
             if 'usuario' in cl:
                 rename_map[col] = 'usuario_docente'
+            elif cl.startswith('rol') or cl in ('perfil', 'cargo'):
+                rename_map[col] = 'rol'
+            elif 'grupo' in cl or 'tutor' in cl:
+                rename_map[col] = 'grupos_tutoria'
             elif 'pass' in cl or 'contrase' in cl:
                 rename_map[col] = 'password'
             elif 'asig' in cl or 'materia' in cl:
@@ -1214,7 +1230,7 @@ def load_docentes_master():
         if 'e_mail' not in df.columns:
             df['e_mail'] = ''
 
-        for req in ['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail']:
+        for req in DOCENTES_COLS:
             if req not in df.columns:
                 df[req] = ''
             else:
@@ -1230,7 +1246,8 @@ def load_docentes_master():
             axis=1
         )
 
-        return df[['usuario_docente', 'password', 'asignatura', 'carpeta_nombre', 'Nombre del Docente', 'e_mail']]
+        df['rol'] = df['rol'].str.lower()
+        return df[DOCENTES_COLS]
     except HttpError as e:
         if getattr(e, 'resp', None) and e.resp.status in [429, 500, 503]:
             st.error("⚠️ El servidor está experimentando alto tráfico. Por favor, recarga la página en unos segundos.")
@@ -2214,10 +2231,18 @@ def render_student_experience(student_name, tasks, criteria_config, key_prefix="
         any(float(v) > 0 for v in (cfg.get('componentes') or {}).values())
         or any(not t.empty and (t['ID alumno'] == student_id).any() for t in (eval_ctx['evid'], eval_ctx['extra'], eval_ctx['att']))
     )
+    folder_id = eval_ctx.get('folder_id') if eval_ctx else None
+    topics_map = load_topics_map(folder_id) if eval_ctx else {}
+    show_goals = bool(eval_ctx) and bool(student_id)
     tab_labels = ["🏠 Inicio", f"📝 Pendientes ({n_pend})" if n_pend else "📝 Pendientes", "📋 Mis calificaciones"]
     if show_eval:
         tab_labels.append("🧾 Mi evaluación")
+    if topics_map:
+        tab_labels.append("📚 Mis temas")
+    if show_goals:
+        tab_labels.append("🎯 Mi meta")
     tabs = st.tabs(tab_labels)
+    tab_of = dict(zip(tab_labels, tabs))
     with tabs[0]:
         render_student_home(ins)
     with tabs[1]:
@@ -2227,8 +2252,14 @@ def render_student_experience(student_name, tasks, criteria_config, key_prefix="
     with tabs[2]:
         render_student_dashboard(student_name, tasks, criteria_config=criteria_config, is_admin_drilldown=(key_prefix == 'admin'))
     if show_eval:
-        with tabs[3]:
+        with tab_of["🧾 Mi evaluación"]:
             render_student_evaluation({**eval_ctx, 'tasks': tasks}, student_id, criteria_config, key_prefix)
+    if topics_map:
+        with tab_of["📚 Mis temas"]:
+            render_student_topics(tasks, topics_map)
+    if show_goals:
+        with tab_of["🎯 Mi meta"]:
+            render_student_goals(folder_id, student_id, tasks, cfg, key_prefix, eval_ctx)
 
 
 # ==============================================================================
@@ -3906,6 +3937,10 @@ def setup_files_spec(raw_khan, unique_task_types):
         roster = ensure_roster_ids(normalize_roster(seed))
         return table_to_xlsx_bytes(roster.sort_values(['Grupo', 'Nombre']), "Lista")
 
+    def topics_seed():
+        acts = sorted(raw_khan['Nombre de la tarea'].dropna().astype(str).unique()) if not raw_khan.empty else []
+        return table_to_xlsx_bytes(pd.DataFrame({'Actividad': acts, 'Tema': [''] * len(acts)}, columns=TEMAS_COLS), "Temas")
+
     def criterios_bytes():
         crit = get_default_teacher_criterios(unique_task_types)
         return json.dumps(crit, indent=4, ensure_ascii=False, default=str).encode('utf-8')
@@ -3917,6 +3952,8 @@ def setup_files_spec(raw_khan, unique_task_types):
         (ATT_FILE, "🙋 Pase de lista (lo llena la app).", lambda: table_to_xlsx_bytes(pd.DataFrame(columns=ATT_COLS), "Asistencia")),
         (EVID_FILE, "📓 Sellos de evidencia (lo llena la app).", lambda: table_to_xlsx_bytes(pd.DataFrame(columns=EVID_COLS), "Evidencias")),
         (EXTRA_FILE, "📝 Examen y producto del parcial (lo llena la app).", lambda: table_to_xlsx_bytes(pd.DataFrame(columns=EXTRA_COLS), "Calificaciones")),
+        (METAS_FILE, "🎯 Metas que se ponen tus alumnos en cada parcial (lo llenan ellos desde su portal).", lambda: table_to_xlsx_bytes(pd.DataFrame(columns=METAS_COLS), "Metas")),
+        (TEMAS_FILE, "📚 Tema de cada actividad. Ya viene con tus actividades de Khan: llénalo aquí o en Ajustes → 📚 Temas.", topics_seed),
     ]
 
 
@@ -3977,6 +4014,636 @@ def render_setup_section(folder_id, raw_khan, unique_task_types, carpeta_nombre)
 
 
 # ==============================================================================
+# FASE 6: TUTORÍA (VARIAS MATERIAS), REPORTE PARA LA FAMILIA (PDF), METAS Y TEMAS
+# ==============================================================================
+SCHOOL_NAME = "CBTA No. 24"
+STATUS_DOT = {'Excelente': '🟢', 'Bien': '🟢', 'Regular': '🟡', 'En riesgo': '🔴'}
+
+
+def parse_tutor_groups(value):
+    """'5°H, 5J; todos' -> ['5°H', '5°J'] o ['*'] para todos los grupos."""
+    parts = [p.strip() for p in re.split(r'[,;/]', str(value or '')) if p.strip()]
+    if any(p.lower() in ('todos', 'todas', '*', 'all') for p in parts):
+        return ['*']
+    return sorted({_normalize_group(p) for p in parts})
+
+
+def tutoria_subjects():
+    """Materias registradas en docentes.xlsx (una por carpeta). En modo local, la carpeta datos/."""
+    docentes = load_docentes_master()
+    subjects = []
+    if not docentes.empty:
+        rows = docentes[docentes['carpeta_nombre'] != ''].drop_duplicates('carpeta_nombre')
+        for _, r in rows.iterrows():
+            fid = get_cached_folder_id(r['carpeta_nombre'])
+            if fid:
+                subjects.append({'materia': r['asignatura'] or r['carpeta_nombre'], 'docente': r['Nombre del Docente'],
+                                 'email': r.get('e_mail', ''), 'folder_id': fid})
+    if not subjects and not _drive_ready('x'):
+        subjects.append({'materia': st.session_state.get('asignatura') or 'Materia (modo local)', 'docente': 'Docente',
+                         'email': '', 'folder_id': None})
+    return subjects
+
+
+def subject_student_summary(subject, groups, parcial):
+    """Resumen por alumno de una materia: promedio, estatus, atrasadas y asistencia."""
+    folder_id = subject['folder_id']
+    raw_khan = load_teacher_raw_assignments(folder_id)
+    roster, links = load_roster_and_links(folder_id)
+    raw = apply_roster_links(raw_khan, roster, links)
+    if groups != ['*']:
+        raw = raw[raw['Grupo'].isin(groups)] if not raw.empty else raw
+        roster = roster[roster['Grupo'].isin(groups)] if not roster.empty else roster
+    types = sorted(t for t in raw['Tipo de tarea'].dropna().astype(str).unique() if t) if (not raw.empty and 'Tipo de tarea' in raw.columns) else []
+    cfg = khan_view_config(load_teacher_criterios(folder_id, types))
+    rows = {}
+    if not raw.empty:
+        graded = assign_parciales_vectorized(apply_dynamic_grading(raw.copy(), cfg), cfg)
+        if parcial:
+            graded = graded[graded['Parcial'] == parcial]
+        if not graded.empty:
+            blocks = compute_student_block_grades(graded, cfg)
+            avg = blocks.dropna(subset=['block_grade']).groupby(['Grupo', 'Nombre del estudiante'])['block_grade'].mean()
+            overdue = graded[graded['status'] == 'No completado'].groupby(['Grupo', 'Nombre del estudiante']).size()
+            for (g, n) in graded.groupby(['Grupo', 'Nombre del estudiante']).size().index:
+                rows[(g, n)] = {'Grupo': g, 'Nombre': n, 'Promedio': avg.get((g, n)), 'Atrasadas': int(overdue.get((g, n), 0))}
+    # Alumnos de la lista sin actividad en Khan también cuentan (son los más invisibles)
+    for _, r in roster.iterrows():
+        rows.setdefault((r['Grupo'], r['Nombre']), {'Grupo': r['Grupo'], 'Nombre': r['Nombre'], 'Promedio': None, 'Atrasadas': 0, 'sin_khan': True})
+
+    evid, extra, att = load_eval_tables(folder_id)
+    att_map = attendance_by_name(roster, att, cfg, parcial) if not roster.empty else {}
+    finals = {}
+    # En un parcial concreto se usa la calificación del parcial (con evidencias, examen, etc.);
+    # en "Todo el semestre", el promedio de Khan, que es lo único comparable entre parciales.
+    if parcial and uses_components(cfg) and not roster.empty:
+        p_eval = parcial
+        comps = compute_components(roster, evid, extra, att, cfg, p_eval)
+        khan_names = {}
+        if not raw.empty:
+            g_all = assign_parciales_vectorized(apply_dynamic_grading(raw.copy(), cfg), cfg)
+            khan_names = _khan_avg_by_name(g_all, cfg, p_eval)
+        fin = compute_final_grades(comps, khan_names, cfg)
+        finals = dict(zip(fin['Nombre'], fin['Final']))
+
+    out = []
+    scale = int(cfg.get('escala_maxima', 10))
+    for (g, n), r in rows.items():
+        value = finals.get(n) if pd.notna(finals.get(n)) else r['Promedio']
+        out.append({
+            'Grupo': g, 'Nombre': n, 'Materia': subject['materia'], 'Docente': subject['docente'], 'Correo': subject['email'],
+            'Promedio': round(value, 1) if value is not None and not pd.isna(value) else None,
+            'Estatus': classify_student(value, cfg.get('thresholds', {}), scale) if value is not None and not pd.isna(value) else 'Sin datos',
+            'Atrasadas': r['Atrasadas'],
+            'Asistencia %': round(att_map[n]) if n in att_map else None,
+            'Asistencia mínima': float(cfg.get('asistencia_minima', 80)),
+            'Sin Khan': bool(r.get('sin_khan')),
+            '_key': f"{g}|{' '.join(name_tokens(n))}",
+        })
+    return out
+
+
+def build_tutoria_data(groups, parcial):
+    data = []
+    for subj in tutoria_subjects():
+        try:
+            data.extend(subject_student_summary(subj, groups, parcial))
+        except Exception as e:
+            st.warning(f"No se pudo leer la materia {subj['materia']}: {e}")
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    # Nombre a mostrar: el más frecuente para cada alumno (normalmente el de la lista oficial)
+    display = df.groupby('_key')['Nombre'].agg(lambda s: s.value_counts().index[0])
+    df['Alumno'] = df['_key'].map(display)
+    return df
+
+
+def tutoria_priorities(df):
+    rows = []
+    for key, g in df.groupby('_key'):
+        risk = g[g['Estatus'] == 'En riesgo']
+        low_att = g[g['Asistencia %'].notna() & (g['Asistencia %'] < g['Asistencia mínima'])]
+        no_khan = g[g['Sin Khan']]
+        n_risk = len(risk)
+        if n_risk == 0 and low_att.empty and no_khan.empty:
+            continue
+        if n_risk >= 3:
+            action = "Reunión con la familia y canalizar a orientación educativa"
+        elif n_risk == 2:
+            action = "Entrevista de tutoría y plan de recuperación con los docentes de esas materias"
+        elif n_risk == 1:
+            action = f"Dar seguimiento con el docente de {risk.iloc[0]['Materia']}"
+        elif low_att.empty:
+            action = "Ayudarle a entrar a Khan Academy y avisar a sus docentes"
+        else:
+            action = "Platicar con el alumno sobre sus faltas"
+        if not low_att.empty:
+            action += "; revisar faltas y justificantes con la familia"
+        rows.append({
+            'Alumno': g['Alumno'].iloc[0], 'Grupo': g['Grupo'].iloc[0], 'n_risk': n_risk,
+            'risk': [f"{r['Materia']} ({r['Promedio']:.1f})" if pd.notna(r['Promedio']) else r['Materia'] for _, r in risk.iterrows()],
+            'att': [f"{r['Materia']} ({r['Asistencia %']:.0f}%)" for _, r in low_att.iterrows()],
+            'no_khan': list(no_khan['Materia']),
+            'atrasadas': int(g['Atrasadas'].sum()),
+            'action': action,
+            'min_att': low_att['Asistencia %'].min() if not low_att.empty else 101,
+        })
+    return sorted(rows, key=lambda r: (-r['n_risk'], r['min_att'], -r['atrasadas']))
+
+
+def _pdf_txt(text):
+    """fpdf con fuentes base solo admite latin-1: se limpian emojis y guiones largos."""
+    text = str(text).replace('—', '-').replace('–', '-').replace('•', '-').replace('“', '"').replace('”', '"')
+    return text.encode('latin-1', 'ignore').decode('latin-1')
+
+
+def build_report_pdf(student, group, subtitle, tables, paragraphs):
+    """
+    Reporte de avance para la familia. tables: [(título, [encabezados], [[celdas]], [anchos])];
+    paragraphs: [(título, texto)].
+    """
+    from fpdf import FPDF
+    pdf = FPDF(orientation='P', unit='mm', format='Letter')
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_fill_color(30, 58, 138)
+    pdf.rect(0, 0, 216, 28, 'F')
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font('Helvetica', 'B', 16)
+    pdf.set_xy(12, 7)
+    pdf.cell(0, 8, _pdf_txt(f"{SCHOOL_NAME} - Reporte de avance"))
+    pdf.set_font('Helvetica', '', 10)
+    pdf.set_xy(12, 16)
+    pdf.cell(0, 6, _pdf_txt(subtitle))
+    pdf.set_text_color(15, 23, 42)
+    pdf.set_xy(12, 34)
+    pdf.set_font('Helvetica', 'B', 13)
+    pdf.cell(0, 7, _pdf_txt(str(student).title()), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font('Helvetica', '', 10)
+    pdf.set_x(12)
+    pdf.cell(0, 6, _pdf_txt(f"Grupo {group}  -  Fecha: {now_local().strftime('%d/%m/%Y')}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+    for title, headers, rows, widths in tables:
+        pdf.set_x(12)
+        pdf.set_font('Helvetica', 'B', 11)
+        pdf.cell(0, 7, _pdf_txt(title), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.set_fill_color(226, 232, 240)
+        pdf.set_x(12)
+        for h, w in zip(headers, widths):
+            pdf.cell(w, 7, _pdf_txt(h), border=1, fill=True)
+        pdf.ln()
+        pdf.set_font('Helvetica', '', 9)
+        for row in rows:
+            pdf.set_x(12)
+            for c, w in zip(row, widths):
+                txt = _pdf_txt(c)
+                while pdf.get_string_width(txt) > w - 2 and len(txt) > 3:
+                    txt = txt[:-4] + '...'
+                pdf.cell(w, 7, txt, border=1)
+            pdf.ln()
+        pdf.ln(3)
+    for title, text in paragraphs:
+        pdf.set_x(12)
+        pdf.set_font('Helvetica', 'B', 11)
+        pdf.cell(0, 7, _pdf_txt(title), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font('Helvetica', '', 10)
+        pdf.set_x(12)
+        pdf.multi_cell(190, 5.5, _pdf_txt(text))
+        pdf.ln(2)
+    # Las firmas siempre juntas al final (sin quedar solas en otra hoja si caben)
+    if pdf.get_y() > pdf.h - 35:
+        pdf.add_page()
+    pdf.ln(8)
+    pdf.set_x(12)
+    pdf.set_font('Helvetica', '', 9)
+    pdf.cell(90, 6, "______________________________")
+    pdf.cell(90, 6, "______________________________", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_x(12)
+    pdf.cell(90, 5, _pdf_txt("Firma del docente / tutor(a)"))
+    pdf.cell(90, 5, _pdf_txt("Firma de madre, padre o tutor"))
+    return bytes(pdf.output())
+
+
+def tutoria_report_pdf(df, key_name, group):
+    g = df[df['Alumno'] == key_name]
+    rows = [[r['Materia'], r['Docente'], f"{r['Promedio']:.1f}" if pd.notna(r['Promedio']) else "-",
+             r['Estatus'], str(r['Atrasadas']), f"{r['Asistencia %']:.0f}%" if pd.notna(r['Asistencia %']) else "-"]
+            for _, r in g.sort_values('Materia').iterrows()]
+    n_risk = int((g['Estatus'] == 'En riesgo').sum())
+    if n_risk:
+        text = (f"{str(key_name).title()} presenta riesgo en {n_risk} materia(s). Le pedimos su apoyo para revisar juntos sus "
+                "actividades pendientes y acordar un plan de recuperación con los docentes.")
+    else:
+        text = f"{str(key_name).title()} no presenta materias en riesgo en este periodo. Le agradecemos su acompañamiento."
+    return build_report_pdf(key_name, group, "Resumen por materia (tutoría académica)",
+                            [("Avance por materia", ["Materia", "Docente", "Promedio", "Estatus", "Atrasadas", "Asistencia"], rows,
+                              [52, 48, 22, 26, 20, 24])],
+                            [("Observaciones", text)])
+
+
+def render_tutoria(groups, show_title=True):
+    """Vista de tutoría académica / orientación / subdirección: varias materias a la vez."""
+    if show_title:
+        st.markdown("### 🧭 Tutoría académica")
+    st.caption("Reúne lo que registran todos los docentes: así se ve a quién atender primero, aunque en cada materia "
+               "parezca un caso aislado. " + ("Grupos: todos." if groups == ['*'] else f"Grupos: {', '.join(groups)}."))
+    p_opts = ["Todo el semestre"] + PARCIALES
+    c1, c2 = st.columns(2)
+    with c2:
+        p_sel = st.selectbox("Periodo:", p_opts, index=p_opts.index(current_parcial({})) if current_parcial({}) in p_opts else 0, key="tut_parcial")
+    parcial = None if p_sel == "Todo el semestre" else p_sel
+    with st.spinner("Reuniendo la información de todas las materias..."):
+        df = build_tutoria_data(groups, parcial)
+    if df.empty:
+        st.info("Aún no hay información de las materias de estos grupos.")
+        return
+    with c1:
+        g_opts = sorted(df['Grupo'].dropna().unique())
+        grupo = st.selectbox("Grupo:", g_opts, key="tut_group")
+    df = df[df['Grupo'] == grupo]
+    pri = tutoria_priorities(df)
+    n_al = df['_key'].nunique()
+    n2 = sum(1 for p in pri if p['n_risk'] >= 2)
+    n1 = sum(1 for p in pri if p['n_risk'] == 1)
+    natt = sum(1 for p in pri if p['att'])
+    stats = [("👥 Alumnos", f"{n_al}"), ("🔴 En riesgo en 2+ materias", f"{n2}"),
+             ("🟠 En riesgo en 1 materia", f"{n1}"), ("🙋 Asistencia baja", f"{natt}")]
+    st.markdown(compact_html("<div class='mini-stats teacher-stats'>" + "".join(
+        f"<div class='mini-stat'><div class='mini-label'>{l}</div><div class='mini-val'>{v}</div></div>" for l, v in stats) + "</div>"),
+        unsafe_allow_html=True)
+
+    st.markdown("#### 🆘 A quién atender primero")
+    if not pri:
+        st.success("🎉 Nadie del grupo tiene materias en riesgo ni asistencia baja en este periodo.")
+    else:
+        cards = []
+        for p in pri:
+            high = p['n_risk'] >= 2 or bool(p['att'])
+            items = []
+            if p['risk']:
+                items.append(f"<li>En riesgo en <strong>{p['n_risk']}</strong>: {html.escape(', '.join(p['risk']))}</li>")
+            if p['att']:
+                items.append(f"<li>Asistencia baja en: {html.escape(', '.join(p['att']))}</li>")
+            if p['no_khan']:
+                items.append(f"<li>Sin actividad en Khan en: {html.escape(', '.join(p['no_khan']))}</li>")
+            if p['atrasadas']:
+                items.append(f"<li>{p['atrasadas']} actividad(es) atrasada(s) en total</li>")
+            cards.append(f"""
+            <div class="student-card" style="border-left-color: {'#dc2626' if high else '#d97706'};">
+                <div class="sc-head"><div><span class="sc-name">{html.escape(p['Alumno'])}</span>
+                <span class="sc-meta">{html.escape(str(p['Grupo']))}</span></div></div>
+                <div class="sc-body"><div><div class="sc-label">Situación</div><ul>{''.join(items)}</ul></div>
+                <div><div class="sc-label">Acción sugerida</div><ul><li>{html.escape(p['action'])}</li></ul></div></div>
+            </div>""")
+        st.markdown(compact_html("<div class='student-cards'>" + "".join(cards) + "</div>"), unsafe_allow_html=True)
+
+    st.markdown("#### 📋 Concentrado por materia")
+    st.caption("En un parcial se muestra la calificación del parcial de cada materia (con evidencias, examen, etc., si el "
+               "docente los usa); en todo el semestre, el promedio de Khan Academy. ⚪ = sin datos todavía.")
+    mat = df.pivot_table(index='Alumno', columns='Materia', values='Promedio', aggfunc='first')
+    stat = df.pivot_table(index='Alumno', columns='Materia', values='Estatus', aggfunc='first')
+    view = mat.copy().astype(object)
+    for c in mat.columns:
+        view[c] = [f"{STATUS_DOT.get(s, '⚪')} {v:.1f}" if pd.notna(v) else "⚪ —" for v, s in zip(mat[c], stat[c])]
+    view['Materias en riesgo'] = (stat == 'En riesgo').sum(axis=1)
+    view = view.sort_values('Materias en riesgo', ascending=False).reset_index()
+    st.dataframe(view, hide_index=True, width='stretch', height=min(560, 40 + len(view) * 36))
+    st.download_button("📥 Descargar concentrado (Excel)", table_to_xlsx_bytes(mat.reset_index(), "Tutoria"),
+                       file_name=f"Tutoria_{grupo.replace('°', '')}_{now_local().strftime('%Y%m%d')}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_tutoria")
+
+    st.markdown("#### 🔍 Detalle de un alumno")
+    al = st.selectbox("Alumno:", sorted(df['Alumno'].unique()), key="tut_student")
+    det = df[df['Alumno'] == al][['Materia', 'Docente', 'Correo', 'Promedio', 'Estatus', 'Atrasadas', 'Asistencia %']].sort_values('Materia')
+    det_view = det.copy()
+    det_view['Promedio'] = det_view['Promedio'].apply(lambda v: f"{v:.1f}" if v is not None and pd.notna(v) else "—")
+    det_view['Asistencia %'] = det_view['Asistencia %'].apply(lambda v: f"{v:.0f}%" if v is not None and pd.notna(v) else "—")
+    st.dataframe(det_view, hide_index=True, width='stretch')
+    st.download_button("📄 Reporte para la familia (PDF)", tutoria_report_pdf(df, al, grupo),
+                       file_name=f"Reporte_{re.sub(r'[^A-Za-z0-9]+', '_', str(al))}.pdf", mime="application/pdf",
+                       type="primary", key="dl_tutoria_pdf")
+
+
+def render_tutor_only():
+    """Sesión de tutor(a) o directivo sin materia propia: solo la vista de tutoría."""
+    name = st.session_state.get('teacher_name', 'Tutor(a)')
+    h1, h2 = st.columns([5, 1])
+    with h1:
+        st.markdown(f"""
+        <div class="main-header" style="background: linear-gradient(135deg, #064e3b 0%, #0f766e 100%);">
+            <h1>🧭 Tutoría académica</h1><p>{html.escape(str(name))}</p>
+        </div>""", unsafe_allow_html=True)
+    with h2:
+        st.write("")
+        st.write("")
+        if st.button("🚪 Cerrar Sesión", width='stretch', key="tutor_logout"):
+            st.session_state.clear()
+            st.rerun()
+    render_tutoria(st.session_state.get('tutor_groups') or ['*'], show_title=False)
+
+
+
+# ------------------------------------------------------------------------------
+# Metas del alumno por parcial
+# ------------------------------------------------------------------------------
+METAS_FILE = "metas.xlsx"
+METAS_COLS = ['ID alumno', 'Parcial', 'Meta', 'Plan', 'Actualizado']
+
+
+def load_goals(folder_id):
+    return _norm_table(load_teacher_table(folder_id, METAS_FILE), METAS_COLS)
+
+
+def student_goal(goals, student_id, parcial):
+    if goals is None or goals.empty or not student_id:
+        return None
+    g = goals[(goals['ID alumno'] == student_id) & (goals['Parcial'] == parcial)]
+    if g.empty:
+        return None
+    r = g.iloc[-1]
+    meta = pd.to_numeric(r['Meta'], errors='coerce')
+    return {'meta': None if pd.isna(meta) else float(meta), 'plan': r['Plan'], 'actualizado': r['Actualizado']}
+
+
+def parcial_average(tasks, criteria_config, parcial):
+    """Promedio de los bloques ya evaluados del parcial (escala de la vista)."""
+    t = tasks[tasks['Parcial'] == parcial] if 'Parcial' in tasks.columns else tasks
+    if t.empty:
+        return None
+    b = compute_student_block_grades(t, criteria_config)['block_grade'].dropna()
+    return float(b.mean()) if not b.empty else None
+
+
+def student_parcial_value(eval_ctx, student_id, tasks, criteria_config, parcial):
+    """Calificación del parcial hasta hoy: la final (con componentes) si el docente los usa, si no el promedio de Khan."""
+    cfg = criteria_config or {}
+    roster = (eval_ctx or {}).get('roster')
+    if uses_components(cfg) and roster is not None and not roster.empty and student_id in set(roster['ID']):
+        comps = compute_components(roster[roster['ID'] == student_id], eval_ctx['evid'], eval_ctx['extra'], eval_ctx['att'], cfg, parcial)
+        name = roster.set_index('ID').at[student_id, 'Nombre']
+        khan = _khan_avg_by_name(tasks.assign(**{'Nombre del estudiante': name}), cfg, parcial)
+        fin = compute_final_grades(comps, khan, cfg)
+        if not fin.empty and fin.iloc[0]['Final'] is not None and pd.notna(fin.iloc[0]['Final']):
+            return float(fin.iloc[0]['Final'])
+        return None
+    return parcial_average(tasks, cfg, parcial)
+
+
+def render_student_goals(folder_id, student_id, tasks, criteria_config, key_prefix, eval_ctx=None):
+    """Pestaña 🎯 Mi meta: el alumno se pone una meta para el parcial y escribe qué hará para lograrla."""
+    cfg = criteria_config or {}
+    scale = float(cfg.get('escala_maxima', 10))
+    parcial = current_parcial(cfg)
+    goals = load_goals(folder_id)
+    goal = student_goal(goals, student_id, parcial)
+    avg = student_parcial_value(eval_ctx, student_id, tasks, cfg, parcial)
+    readonly = key_prefix == 'admin'
+
+    st.markdown(f"#### 🎯 Mi meta para el {parcial}")
+    st.caption("Ponerte una meta concreta y escribir cómo la vas a lograr ayuda mucho más que solo \"echarle ganas\". "
+               "Tu docente puede verla para apoyarte.")
+    if goal and goal['meta'] is not None:
+        if avg is None:
+            st.info(f"Tu meta: **{goal['meta']:g}**. Aún no hay actividades evaluadas en este parcial.")
+        else:
+            gap = goal['meta'] - avg
+            st.progress(min(1.0, max(0.0, avg / goal['meta'])) if goal['meta'] else 1.0,
+                        text=f"Llevas {avg:.1f} de tu meta de {goal['meta']:g} (calificación del parcial hasta hoy)")
+            if gap <= 0:
+                st.success(f"🎉 ¡Vas por encima de tu meta! (+{-gap:.1f}). ¿Te animas a subirla?")
+            else:
+                st.warning(f"Te faltan **{gap:.1f}** puntos para tu meta. Revisa **📝 Pendientes**: ahí ves cuánto puedes recuperar.")
+        if goal['plan']:
+            st.markdown(f"**Mi plan:** {html.escape(goal['plan'])}")
+    elif readonly:
+        st.info("El alumno todavía no registra una meta para este parcial.")
+
+    if readonly:
+        return
+    if _drive_ready(folder_id) and METAS_FILE not in set(list_teacher_file_names(folder_id)):
+        st.info("Tu docente aún no activa las metas en esta materia.")
+        return
+    with st.form(f"{key_prefix}_goal_form"):
+        min_pass = float((cfg.get('thresholds') or {}).get('regular', scale * 0.6))
+        if goal and goal['meta'] is not None:
+            default = goal['meta']
+        elif avg is None:
+            default = scale * 0.8
+        else:
+            # Si va reprobando, la primera meta es aprobar; si no, subir un punto (o 10 en escala de 100)
+            default = min_pass if avg < min_pass else min(scale, round(avg + scale / 10, 1))
+        meta = st.number_input(f"¿Qué calificación quieres lograr en el {parcial}?", min_value=0.0, max_value=scale,
+                               value=float(default), step=0.5 if scale == 10 else 5.0, key=f"{key_prefix}_goal_val")
+        plan = st.text_area("¿Qué vas a hacer para lograrlo?", value=goal['plan'] if goal else "", max_chars=250,
+                            placeholder="Ej. Hacer los ejercicios de Khan el mismo día que los deja el profe y llevar mi libreta a revisión cada semana.",
+                            key=f"{key_prefix}_goal_plan")
+        if st.form_submit_button("💾 Guardar mi meta", type="primary", width='stretch'):
+            table = _norm_table(read_teacher_table(folder_id, METAS_FILE), METAS_COLS)
+            new = pd.DataFrame([{'ID alumno': student_id, 'Parcial': parcial, 'Meta': f"{meta:g}", 'Plan': plan.strip(),
+                                 'Actualizado': now_local().strftime('%Y-%m-%d %H:%M')}])
+            level, msg, saved = save_teacher_table(folder_id, METAS_FILE, upsert_rows(table, new, ['ID alumno', 'Parcial']), "Metas")
+            st.session_state.pop('_pending_upload', None)
+            if saved:
+                set_flash('success', "✅ ¡Meta guardada! Vuelve seguido para ver cómo vas.")
+                st.rerun()
+            else:
+                st.error("No se pudo guardar tu meta en este momento. Intenta más tarde o avísale a tu docente.")
+
+
+# ------------------------------------------------------------------------------
+# Dominio por tema
+# ------------------------------------------------------------------------------
+TEMAS_FILE = "temas.xlsx"
+TEMAS_COLS = ['Actividad', 'Tema']
+TOPIC_LEVELS = [(85, "🟢 Dominado", "#16a34a"), (60, "🟡 En camino", "#d97706"), (0, "🔴 Por reforzar", "#dc2626")]
+
+
+def load_topics_map(folder_id):
+    t = _norm_table(load_teacher_table(folder_id, TEMAS_FILE), TEMAS_COLS)
+    t = t[(t['Actividad'] != '') & (t['Tema'] != '')]
+    return dict(zip(t['Actividad'].str.strip(), t['Tema'].str.strip()))
+
+
+def topic_level(pct):
+    for lim, label, color in TOPIC_LEVELS:
+        if pct >= lim:
+            return label, color
+    return TOPIC_LEVELS[-1][1], TOPIC_LEVELS[-1][2]
+
+
+def topic_mastery(tasks, topics_map):
+    """Dominio (%) por tema con las actividades ya evaluadas: puntos obtenidos / puntos posibles."""
+    if tasks is None or tasks.empty or not topics_map:
+        return pd.DataFrame(columns=['Tema', 'Dominio %', 'Evaluadas', 'Por venir', 'Para repasar'])
+    t = tasks.copy()
+    t['Tema'] = t['Nombre de la tarea'].astype(str).str.strip().map(topics_map)
+    t = t.dropna(subset=['Tema'])
+    rows = []
+    for tema, g in t.groupby('Tema'):
+        ev = g[~g['status'].isin(NOT_EVALUATED_STATUSES)]
+        mx = ev['max_points'].sum()
+        pct = ev['earned_points'].sum() / mx * 100 if mx > 0 else None
+        weak = ev[ev['earned_points'] < ev['max_points'] * 0.7]
+        rows.append({'Tema': tema, 'Dominio %': round(pct) if pct is not None else None, 'Evaluadas': len(ev),
+                     'Por venir': int(g['status'].isin(NOT_EVALUATED_STATUSES).sum()),
+                     'Para repasar': list(weak['Nombre de la tarea'].astype(str).unique())[:4]})
+    return pd.DataFrame(rows).sort_values('Dominio %', na_position='last').reset_index(drop=True)
+
+
+def render_topic_bars(mastery):
+    bars = []
+    for _, r in mastery.iterrows():
+        if r['Dominio %'] is None or pd.isna(r['Dominio %']):
+            bars.append(f"<div class='topic-row'><div class='topic-name'>{html.escape(r['Tema'])}</div>"
+                        f"<div class='topic-meta'>⚪ Aún sin evaluar · {r['Por venir']} actividad(es) por venir</div></div>")
+            continue
+        label, color = topic_level(r['Dominio %'])
+        bars.append(f"""<div class='topic-row'><div class='topic-head'><span class='topic-name'>{html.escape(r['Tema'])}</span>
+            <span class='topic-pct' style='color:{color}'>{int(r['Dominio %'])}% · {label}</span></div>
+            <div class='topic-track'><div class='topic-fill' style='width:{int(r['Dominio %'])}%;background:{color}'></div></div></div>""")
+    st.markdown(compact_html("<div class='topic-list'>" + "".join(bars) + "</div>"), unsafe_allow_html=True)
+
+
+def render_student_topics(tasks, topics_map):
+    st.markdown("#### 📚 Mis temas")
+    st.caption("Qué tan bien dominas cada tema, según tus resultados en las actividades ya evaluadas. "
+               "🟢 85% o más · 🟡 60 a 84% · 🔴 menos de 60%.")
+    mastery = topic_mastery(tasks, topics_map)
+    if mastery.empty:
+        st.info("Tu docente aún no ha organizado las actividades por tema.")
+        return
+    render_topic_bars(mastery)
+    weak = mastery[mastery['Dominio %'].notna() & (mastery['Dominio %'] < 60)]
+    if not weak.empty:
+        r = weak.iloc[0]
+        tip = f"💡 **Para reforzar {r['Tema']}**, vuelve a practicar: " + ", ".join(f"*{a}*" for a in r['Para repasar']) + "." \
+            if r['Para repasar'] else f"💡 Pídele a tu docente material extra de **{r['Tema']}**."
+        st.info(tip + " En Khan Academy puedes repetir los ejercicios para practicar aunque ya hayan vencido.")
+    elif mastery['Dominio %'].notna().any():
+        st.success("🎉 No tienes temas por reforzar. ¡Excelente trabajo!")
+
+
+def render_topics_setup(folder_id, raw_khan):
+    """Ajustes → 📚 Temas: el docente asigna un tema a cada actividad de Khan."""
+    st.markdown("#### 📚 Temas de tu materia")
+    st.caption("Escribe el tema de cada actividad (por ejemplo, *Distancia entre dos puntos* o *Pendiente de una recta*). "
+               "Con esto, cada alumno ve qué temas domina y cuáles debe reforzar, y tú ves los temas que más le cuestan al grupo. "
+               "Tip: escribe el tema igual en todas sus actividades; las que dejes vacías no cuentan.")
+    if raw_khan.empty:
+        st.info("Primero sube tus reportes de Khan Academy.")
+        return
+    acts = (raw_khan.assign(_d=pd.to_datetime(raw_khan.get('dt_entrega'), errors='coerce'))
+            .groupby('Nombre de la tarea', as_index=False).agg(Tipo=('Tipo de tarea', 'first'), Entrega=('_d', 'min'))
+            .sort_values(['Entrega', 'Nombre de la tarea']))
+    current = load_topics_map(folder_id)
+    editor = pd.DataFrame({
+        'Actividad': acts['Nombre de la tarea'].astype(str).values,
+        'Tipo': acts['Tipo'].astype(str).values,
+        'Entrega': acts['Entrega'].apply(lambda d: format_short_date(d, with_time=False) if pd.notna(d) else '').values,
+        'Tema': [current.get(a.strip(), '') for a in acts['Nombre de la tarea'].astype(str)],
+    })
+    known = sorted(set(current.values()))
+    if known:
+        st.caption("Temas que ya usas: " + " · ".join(f"`{k}`" for k in known))
+    edited = st.data_editor(editor, hide_index=True, width='stretch', key="topics_editor",
+                            disabled=['Actividad', 'Tipo', 'Entrega'],
+                            column_config={'Tema': st.column_config.TextColumn("Tema", width="medium"),
+                                           'Actividad': st.column_config.TextColumn("Actividad", width="large")},
+                            height=min(600, 40 + len(editor) * 35))
+    done = int((edited['Tema'].fillna('').str.strip() != '').sum())
+    st.caption(f"{done} de {len(edited)} actividades con tema.")
+    if st.button("💾 Guardar temas", type="primary", width='stretch', key="save_topics_btn"):
+        out = edited[['Actividad', 'Tema']].copy()
+        out['Tema'] = out['Tema'].fillna('').astype(str).str.strip()
+        # Conservar temas de actividades que ya no aparecen en los reportes actuales
+        prev = _norm_table(read_teacher_table(folder_id, TEMAS_FILE), TEMAS_COLS)
+        prev = prev[~prev['Actividad'].isin(out['Actividad']) & (prev['Tema'] != '')]
+        level, msg, saved = save_teacher_table(folder_id, TEMAS_FILE, pd.concat([prev, out], ignore_index=True), "Temas")
+        _finish_save([(level, msg, saved)])
+    _show_pending_upload("dl_pending_topics")
+
+
+def render_group_topics(tasks, topics_map):
+    """Calificaciones → Por tema: dominio promedio de cada tema por grupo y alumnos por reforzar."""
+    st.markdown("#### 📚 Dominio por tema")
+    if not topics_map:
+        st.info("Asigna un tema a tus actividades en **⚙️ Ajustes → 📚 Temas** para ver este análisis.")
+        return
+    rows = []
+    for (grupo, alumno), g in tasks.groupby(['Grupo', 'Nombre del estudiante']):
+        m = topic_mastery(g, topics_map)
+        for _, r in m.iterrows():
+            if r['Dominio %'] is not None and pd.notna(r['Dominio %']):
+                rows.append({'Grupo': grupo, 'Alumno': alumno, 'Tema': r['Tema'], 'Dominio %': r['Dominio %']})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.info("Todavía no hay actividades evaluadas con tema asignado.")
+        return
+    summary = df.groupby('Tema').agg(**{'Dominio promedio %': ('Dominio %', 'mean'),
+                                         'Alumnos por reforzar': ('Dominio %', lambda s: int((s < 60).sum())),
+                                         'Alumnos': ('Dominio %', 'size')}).sort_values('Dominio promedio %')
+    summary['Dominio promedio %'] = summary['Dominio promedio %'].round(0)
+    st.caption("Los temas con menor dominio aparecen primero: buenos candidatos para repasar en clase.")
+    render_topic_bars(summary.reset_index().rename(columns={'Dominio promedio %': 'Dominio %'}).assign(**{'Por venir': 0}))
+    by_group = df.pivot_table(index='Tema', columns='Grupo', values='Dominio %', aggfunc='mean').round(0)
+    st.dataframe(by_group.reset_index(), hide_index=True, width='stretch')
+    tema = st.selectbox("Ver alumnos por reforzar en el tema:", list(summary.index), key="topic_detail_sel")
+    weak = df[(df['Tema'] == tema) & (df['Dominio %'] < 60)].sort_values('Dominio %')
+    if weak.empty:
+        st.success("Nadie está por debajo de 60% en este tema.")
+    else:
+        st.dataframe(weak[['Grupo', 'Alumno', 'Dominio %']], hide_index=True, width='stretch')
+
+
+# ------------------------------------------------------------------------------
+# Reporte de una materia para la familia (desde el panel docente)
+# ------------------------------------------------------------------------------
+def subject_report_pdf(student, group, asignatura, teacher_name, tasks, criteria_config, final_row=None, att_pct=None,
+                       goal=None, mastery=None):
+    cfg = criteria_config or {}
+    ins = build_student_insights(tasks, cfg)
+    scale = int(cfg.get('escala_maxima', 10))
+    tables, paragraphs = [], []
+    rows = []
+    for p in PARCIALES:
+        avg = parcial_average(tasks, cfg, p)
+        if avg is not None:
+            rows.append([p, f"{avg:.1f} / {scale}", classify_student(avg, cfg.get('thresholds', {}), scale)])
+    if rows:
+        tables.append(("Khan Academy por parcial", ["Parcial", "Promedio", "Estatus"], rows, [50, 50, 50]))
+    if final_row is not None:
+        weights = {**DEFAULT_COMPONENTES, **(cfg.get('componentes') or {})}
+        used = {'Khan': khan_weight(cfg), 'Evidencias': weights['evidencias'], 'Examen': weights['examen'],
+                'Producto': weights['producto'], 'Asistencia %': weights['asistencia']}
+        keys = [k for k, w in used.items() if w > 0] + ['Final']
+        cells = ["-" if final_row.get(k) is None or pd.isna(final_row.get(k)) else
+                 (f"{final_row[k]:.0f}%" if k == 'Asistencia %' else f"{final_row[k]:g}") for k in keys]
+        heads = [f"{'Asistencia' if k == 'Asistencia %' else k} ({used[k]:g}%)" if k in used else "Calificación" for k in keys]
+        tables.append((f"Calificación del {current_parcial(cfg)}", heads, [cells], [round(186 / len(keys))] * len(keys)))
+        if final_row.get('Pendiente'):
+            paragraphs.append(("Nota", f"Aún falta registrar: {final_row['Pendiente']}. La calificación puede cambiar."))
+    if mastery is not None and not mastery.empty:
+        trows = [[r['Tema'], "-" if r['Dominio %'] is None or pd.isna(r['Dominio %']) else f"{int(r['Dominio %'])}%",
+                  "Sin evaluar" if r['Dominio %'] is None or pd.isna(r['Dominio %']) else topic_level(r['Dominio %'])[0][2:]]
+                 for _, r in mastery.iterrows()]
+        tables.append(("Dominio por tema", ["Tema", "Dominio", "Nivel"], trows, [100, 30, 50]))
+    pend = ins['overdue'].head(8)
+    if not pend.empty:
+        tables.append(("Actividades vencidas que aún puede hacer", ["Actividad", "Venció"],
+                       [[r['Nombre de la tarea'], format_short_date(r['dt_entrega'], with_time=False)] for _, r in pend.iterrows()], [140, 40]))
+    if att_pct is not None:
+        minimum = float(cfg.get('asistencia_minima', 80))
+        paragraphs.append(("Asistencia", f"Asistencia en el periodo: {att_pct:.0f}% (mínimo requerido: {minimum:.0f}%)."))
+    if goal and goal.get('meta') is not None:
+        paragraphs.append(("Meta del alumno", f"Se propuso obtener {goal['meta']:g} en el {current_parcial(cfg)}."
+                           + (f" Su plan: {goal['plan']}" if goal.get('plan') else "")))
+    paragraphs.append(("Mensaje del docente", build_student_message(ins, student, asignatura, teacher_name, 'familia')))
+    return build_report_pdf(student, group, f"{asignatura} - Docente: {teacher_name}", tables, paragraphs)
+
+
+# ==============================================================================
 # VISTA: INICIO DE SESIÓN CON ENRUTAMIENTO DINÁMICO (GOOGLE DRIVE)
 # ==============================================================================
 def render_login():
@@ -4017,8 +4684,10 @@ def render_login():
             st.caption("Selecciona a tu docente e ingresa con tu **matrícula y PIN** (te los da tu docente) o con tu usuario y contraseña de Khan Academy:")
 
             # Opciones de docentes disponibles desde docentes.xlsx
-            if not docentes_df.empty and 'Nombre del Docente' in docentes_df.columns:
-                available_teachers = sorted([t for t in docentes_df['Nombre del Docente'].unique() if str(t).strip()])
+            subject_docentes = docentes_df[docentes_df['carpeta_nombre'] != ''] if not docentes_df.empty else docentes_df
+            if not subject_docentes.empty and 'Nombre del Docente' in subject_docentes.columns:
+                # Solo quienes tienen una materia con carpeta (no los tutores o directivos sin grupo a cargo)
+                available_teachers = sorted([t for t in subject_docentes['Nombre del Docente'].unique() if str(t).strip()])
             else:
                 available_teachers = ["Docente General"]
 
@@ -4029,7 +4698,7 @@ def render_login():
             )
 
             # Filtrar las asignaturas que imparte el docente seleccionado
-            teacher_df = docentes_df[docentes_df['Nombre del Docente'] == selected_teacher] if not docentes_df.empty else pd.DataFrame()
+            teacher_df = subject_docentes[subject_docentes['Nombre del Docente'] == selected_teacher] if not subject_docentes.empty else pd.DataFrame()
             teacher_subjects = sorted([s for s in teacher_df['asignatura'].unique() if str(s).strip()]) if not teacher_df.empty else []
 
             # Si el docente imparte más de una materia, permitir elegirla; de lo contrario, auto-asignar
@@ -4147,8 +4816,28 @@ def render_login():
                                 (docentes_df['password'] == doc_pass_input)
                             ]
 
+                        # Tutor(a) académico(a), orientación o subdirección: se unen los grupos de todas sus filas
+                        tutor_groups = []
+                        if not matched_doc.empty:
+                            for _, r in matched_doc.iterrows():
+                                if r['rol'] in ('tutor', 'tutora', 'directivo', 'directiva', 'orientacion', 'orientación', 'subdireccion', 'subdirección'):
+                                    g = parse_tutor_groups(r['grupos_tutoria']) or ['*']
+                                    tutor_groups = ['*'] if '*' in g or tutor_groups == ['*'] else sorted(set(tutor_groups) | set(g))
+                            with_subject = matched_doc[matched_doc['carpeta_nombre'] != '']
+                            if with_subject.empty and tutor_groups:
+                                doc_row = matched_doc.iloc[0]
+                                st.session_state['logged_in'] = True
+                                st.session_state['role'] = 'tutor'
+                                st.session_state['username'] = doc_row['usuario_docente']
+                                st.session_state['teacher_name'] = doc_row['Nombre del Docente']
+                                st.session_state['tutor_groups'] = tutor_groups
+                                st.rerun()
+                            if not with_subject.empty:
+                                matched_doc = with_subject
+
                         if not matched_doc.empty:
                             doc_row = matched_doc.iloc[0]
+                            st.session_state['tutor_groups'] = tutor_groups
                             folder_name = doc_row['carpeta_nombre']
                             asig_name = doc_row['asignatura']
                             teacher_full_name = doc_row.get('Nombre del Docente', doc_row['usuario_docente'])
@@ -4194,9 +4883,11 @@ def render_login():
 # ==============================================================================
 NAV_INICIO, NAV_LISTA, NAV_EVAL, NAV_CALIF, NAV_ALUMNO, NAV_AJUSTES = (
     "🏠 Inicio", "🙋 Pase de lista", "📓 Evaluar", "📊 Calificaciones", "🔍 Alumno", "⚙️ Ajustes")
+NAV_TUTORIA = "🧭 Tutoría"
 ADMIN_SECTIONS = [NAV_INICIO, NAV_LISTA, NAV_EVAL, NAV_CALIF, NAV_ALUMNO, NAV_AJUSTES]
-AJ_INICIO, AJ_CRITERIOS, AJ_ALUMNOS, AJ_ARCHIVOS = "🚀 Primeros pasos", "Criterios y componentes", "👥 Alumnos y cuentas", "☁️ Archivos y Drive"
-CALIF_CONC, CALIF_FINAL, CALIF_ACT = "Concentrado Khan", "Calificación del parcial", "Por actividad"
+AJ_INICIO, AJ_CRITERIOS, AJ_ALUMNOS, AJ_TEMAS, AJ_ARCHIVOS = ("🚀 Primeros pasos", "Criterios y componentes", "👥 Alumnos y cuentas",
+                                                         "📚 Temas", "☁️ Archivos y Drive")
+CALIF_CONC, CALIF_FINAL, CALIF_ACT, CALIF_TEMAS = "Concentrado Khan", "Calificación del parcial", "Por actividad", "Por tema"
 
 
 def render_admin():
@@ -4234,11 +4925,16 @@ def render_admin():
 
     # Navegación por secciones (en lugar de pestañas): solo se dibuja la sección elegida,
     # lo que la hace más rápida y cómoda en el celular.
-    section = st.segmented_control("Sección", ADMIN_SECTIONS, default=NAV_INICIO, key="admin_section",
+    tutor_groups = st.session_state.get('tutor_groups') or []
+    sections = ADMIN_SECTIONS[:-1] + [NAV_TUTORIA, NAV_AJUSTES] if tutor_groups else ADMIN_SECTIONS
+    section = st.segmented_control("Sección", sections, default=NAV_INICIO, key="admin_section",
                                    label_visibility="collapsed") or NAV_INICIO
+    if section == NAV_TUTORIA:
+        render_tutoria(tutor_groups)
+        return
     ajustes_sub = None
     if section == NAV_AJUSTES:
-        ajustes_sub = st.segmented_control("Ajustes", [AJ_INICIO, AJ_CRITERIOS, AJ_ALUMNOS, AJ_ARCHIVOS], default=AJ_INICIO,
+        ajustes_sub = st.segmented_control("Ajustes", [AJ_INICIO, AJ_CRITERIOS, AJ_ALUMNOS, AJ_TEMAS, AJ_ARCHIVOS], default=AJ_INICIO,
                                            key="ajustes_sub", label_visibility="collapsed") or AJ_INICIO
 
     # Cargar datos base crudos aislados de la carpeta del docente
@@ -4678,6 +5374,8 @@ def render_admin():
             render_roster_tab(teacher_folder_id, raw_khan, roster, roster_links, carpeta_nombre)
         elif ajustes_sub == AJ_INICIO:
             render_setup_section(teacher_folder_id, raw_khan, unique_task_types, carpeta_nombre)
+        elif ajustes_sub == AJ_TEMAS:
+            render_topics_setup(teacher_folder_id, raw_khan)
         return
 
     # Criterios activos completos en tiempo real
@@ -4827,7 +5525,7 @@ def render_admin():
 
     calif_sub = None
     if section == NAV_CALIF:
-        calif_sub = st.segmented_control("Vista", [CALIF_CONC, CALIF_FINAL, CALIF_ACT], default=CALIF_CONC,
+        calif_sub = st.segmented_control("Vista", [CALIF_CONC, CALIF_FINAL, CALIF_ACT, CALIF_TEMAS], default=CALIF_CONC,
                                          key="calif_sub", label_visibility="collapsed") or CALIF_CONC
 
     # Evidencias, calificaciones del parcial y asistencia (archivos en la carpeta del docente)
@@ -4853,6 +5551,9 @@ def render_admin():
 
     if section == NAV_CALIF and calif_sub == CALIF_ACT:
         render_task_analysis(active_master)
+
+    if section == NAV_CALIF and calif_sub == CALIF_TEMAS:
+        render_group_topics(active_master, load_topics_map(teacher_folder_id))
 
     if section == NAV_CALIF and calif_sub == CALIF_CONC:
         # Controles propios del concentrado
@@ -5006,6 +5707,33 @@ def render_admin():
             )
             render_copy_message(msg_text, key="wa_student_msg")
 
+        # Metas, dominio por tema y reporte imprimible para la familia
+        sel_ids = roster.loc[roster['Nombre'] == selected_student, 'ID'] if not roster.empty else pd.Series(dtype=str)
+        sel_id = sel_ids.iloc[0] if not sel_ids.empty else None
+        p_now = current_parcial(active_criteria_config)
+        goal = student_goal(load_goals(teacher_folder_id), sel_id, p_now)
+        topics_map = load_topics_map(teacher_folder_id)
+        mastery = topic_mastery(student_tasks_data, topics_map)
+        if goal and goal['meta'] is not None:
+            st.markdown(f"#### 🎯 Meta del alumno ({p_now}): **{goal['meta']:g}**" + (f"  \n*\"{goal['plan']}\"*" if goal['plan'] else ""))
+        if not mastery.empty:
+            st.markdown("#### 📚 Dominio por tema")
+            render_topic_bars(mastery)
+        final_row = None
+        if uses_components(active_criteria_config) and sel_id:
+            comps = compute_components(roster[roster['ID'] == sel_id], eval_evid, eval_extra, eval_att, active_criteria_config, p_now)
+            fin = compute_final_grades(comps, _khan_avg_by_name(student_tasks_data, active_criteria_config, p_now), active_criteria_config)
+            final_row = fin.iloc[0].to_dict() if not fin.empty else None
+        pdf_att = attendance_by_name(roster, eval_att, active_criteria_config, p_now).get(selected_student)
+        try:
+            pdf_bytes = subject_report_pdf(selected_student, student_group, asignatura, teacher_name, student_tasks_data,
+                                           active_criteria_config, final_row, pdf_att, goal, mastery)
+            st.download_button("📄 Reporte de avance para la familia (PDF imprimible)", pdf_bytes,
+                               file_name=f"Reporte_{re.sub(r'[^A-Za-z0-9]+', '_', str(selected_student))}.pdf",
+                               mime="application/pdf", key="dl_student_pdf", width='stretch')
+        except Exception as e:
+            st.caption(f"No se pudo generar el PDF: {e}")
+
         st.markdown("#### 📋 Listado Completo de Actividades del Alumno")
         st.caption("Semáforo de detección rápida: 🟥 **Rojo tenue:** Calificación de 0 puntos (sin entrega o penalizada) | 🟨 **Amarillo tenue:** Actividad realizada con intentos que superan el límite permitido | ⚪ **Gris/Cursiva:** Actividad programada o en curso (aún no vence).")
 
@@ -5090,9 +5818,8 @@ def render_admin():
         # Visualización complementaria: Dashboard idéntico con desglose por bloques y filtros
         with st.expander("👁️ Ver como alumno (vista previa de su portal, útil para explicarle su avance)", expanded=False):
             updated_at = student_tasks_data['Archivo_Modificado'].max() if 'Archivo_Modificado' in student_tasks_data.columns else None
-            sel_ids = roster.loc[roster['Nombre'] == selected_student, 'ID'] if not roster.empty else pd.Series(dtype=str)
             render_student_experience(selected_student, student_tasks_data, active_criteria_config, key_prefix="admin", updated_at=updated_at,
-                                      eval_ctx=eval_ctx, student_id=sel_ids.iloc[0] if not sel_ids.empty else None)
+                                      eval_ctx={**eval_ctx, 'folder_id': teacher_folder_id}, student_id=sel_id)
 
 
 # ==============================================================================
@@ -5167,7 +5894,7 @@ def render_student():
         ids = roster.loc[roster['Nombre'] == student_name, 'ID']
         my_id = ids.iloc[0] if not ids.empty else None
     eval_evid, eval_extra, eval_att = load_eval_tables(teacher_folder_id) if my_id else (None, None, None)
-    eval_ctx = {'roster': roster, 'evid': eval_evid, 'extra': eval_extra, 'att': eval_att} if my_id else None
+    eval_ctx = {'roster': roster, 'evid': eval_evid, 'extra': eval_extra, 'att': eval_att, 'folder_id': teacher_folder_id} if my_id else None
     render_student_experience(student_name, student_tasks, criterios_data, key_prefix="student", updated_at=updated_at,
                               eval_ctx=eval_ctx, student_id=my_id)
 
@@ -5193,6 +5920,8 @@ def main():
     else:
         if st.session_state.get('role') == 'admin':
             render_admin()
+        elif st.session_state.get('role') == 'tutor':
+            render_tutor_only()
         else:
             render_student()
 
