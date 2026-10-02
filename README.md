@@ -38,3 +38,11 @@ credenciales de alumnos al repositorio).
     Si un grupo se descarga más de una vez, se usa la versión más reciente de cada tarea.
   - `credenciales.xlsx` (`Usuario`, `Contraseña`, `Nombre del estudiante`).
   - `criterios.json`, que la app crea al guardar la configuración del docente.
+  - `lista_alumnos.xlsx` (opcional, pestaña **Alumnos y cuentas**): lista oficial con
+    `ID`, `Matrícula`, `Código provisional`, `Nombre`, `Grupo` y `PIN`. Permite que los
+    alumnos entren con matrícula (o código provisional) y PIN, y une cuentas duplicadas de Khan.
+  - `vinculos_khan.xlsx` (opcional): qué cuenta de Khan corresponde a cada alumno de la lista.
+    Las coincidencias exactas de nombre se vinculan solas.
+
+  Ambos archivos se pueden abrir y corregir con Google Sheets, pero deben conservar el
+  formato `.xlsx` y su nombre (no "Guardar como Hojas de cálculo de Google").

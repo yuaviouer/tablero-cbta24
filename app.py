@@ -2747,6 +2747,501 @@ def render_copy_message(text, key):
 
 
 # ==============================================================================
+# FASE 4: LISTA OFICIAL DEL GRUPO, VÍNCULO DE CUENTAS DE KHAN Y ACCESO CON PIN
+# ==============================================================================
+ROSTER_FILE = "lista_alumnos.xlsx"
+LINKS_FILE = "vinculos_khan.xlsx"
+ROSTER_COLS = ['ID', 'Matrícula', 'Código provisional', 'Nombre', 'Grupo', 'PIN']
+LINK_COLS = ['Cuenta de Khan', 'Grupo Khan', 'ID alumno']
+NO_LINK_LABEL = "— Sin vincular —"
+_NAME_STOPWORDS = {'de', 'del', 'la', 'las', 'los', 'y', 'da', 'do', 'van', 'von'}
+
+
+def _drive_ready(folder_id):
+    return bool(get_drive_service()) and bool(folder_id) and not str(folder_id).startswith('PEGA_AQUÍ')
+
+
+@st.cache_data(ttl=600)
+def load_teacher_table(folder_id, filename):
+    """Lee una tabla (.xlsx) de la carpeta del docente en Drive, o de datos/ en modo local. Todo como texto."""
+    try:
+        if _drive_ready(folder_id):
+            service = get_drive_service()
+            item = find_drive_item(service, filename, folder_id, is_folder=False)
+            if not item:
+                return pd.DataFrame()
+            df = read_drive_excel(service, item['id'], dtype=str)
+        else:
+            path = os.path.join(DATA_DIR, filename)
+            if not os.path.exists(path):
+                return pd.DataFrame()
+            df = pd.read_excel(path, dtype=str)
+        df.columns = [str(c).strip() for c in df.columns]
+        return df.fillna('')
+    except Exception as e:
+        st.warning(f"No se pudo leer {filename}: {e}")
+        return pd.DataFrame()
+
+
+def table_to_xlsx_bytes(df, sheet_name="Hoja1"):
+    buff = io.BytesIO()
+    with pd.ExcelWriter(buff, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+    return buff.getvalue()
+
+
+def save_teacher_table(folder_id, filename, df, sheet_name="Hoja1"):
+    """
+    Guarda una tabla como .xlsx en la carpeta del docente (o en datos/ en modo local).
+    Retorna (nivel, mensaje, guardado). Si Drive no permite crear el archivo, deja los bytes
+    listos para que el docente lo descargue y lo suba él mismo a su carpeta.
+    """
+    data = table_to_xlsx_bytes(df, sheet_name)
+    mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    if not _drive_ready(folder_id):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(os.path.join(DATA_DIR, filename), "wb") as f:
+                f.write(data)
+            load_teacher_table.clear()
+            return ('success', f"✅ {filename} guardado (modo local).", True)
+        except Exception as e:
+            return ('error', f"No se pudo guardar {filename}: {e}", False)
+
+    service = get_drive_service()
+    try:
+        existing = find_drive_item(service, filename, folder_id, is_folder=False)
+        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mimetype, resumable=True)
+        if existing:
+            service.files().update(fileId=existing['id'], media_body=media, supportsAllDrives=True).execute()
+        else:
+            service.files().create(body={'name': filename, 'parents': [folder_id]}, media_body=media,
+                                   supportsAllDrives=True).execute()
+        load_teacher_table.clear()
+        pending = st.session_state.get('_pending_upload')
+        if pending and pending[0] == filename:
+            st.session_state.pop('_pending_upload', None)
+        return ('success', f"✅ {filename} guardado en tu carpeta de Google Drive.", True)
+    except HttpError as e:
+        status = getattr(getattr(e, 'resp', None), 'status', None)
+        if 'storage quota' in str(e).lower() or status == 403:
+            st.session_state['_pending_upload'] = (filename, data)
+            return ('warning', f"⚠️ Google Drive no permitió crear {filename} automáticamente. Descárgalo con el botón de abajo y súbelo a tu carpeta; a partir de ahí el sistema lo actualizará solo.", False)
+        if status in (429, 500, 503):
+            return ('error', "⚠️ Google Drive está ocupado. Intenta de nuevo en unos segundos.", False)
+        return ('error', f"Error al guardar {filename} en Google Drive: {e}", False)
+    except Exception as e:
+        return ('error', f"Error inesperado al guardar {filename}: {e}", False)
+
+
+def name_tokens(name):
+    """'ALBORES CLEMENTE Paulo César' -> ('albores', 'cesar', 'clemente', 'paulo') sin acentos ni orden."""
+    import unicodedata
+    s = unicodedata.normalize('NFKD', str(name)).encode('ascii', 'ignore').decode().lower()
+    return tuple(sorted(t for t in re.findall(r'[a-z]+', s) if len(t) > 1 and t not in _NAME_STOPWORDS))
+
+
+def name_similarity(a, b):
+    """0..1. Considera el orden distinto de nombre/apellidos y nombres abreviados en Khan."""
+    from difflib import SequenceMatcher
+    if not a or not b:
+        return 0.0
+    sa, sb = set(a), set(b)
+    jaccard = len(sa & sb) / len(sa | sb)
+    if len(sa & sb) >= 2 and (sa <= sb or sb <= sa):
+        jaccard = max(jaccard, 0.85)  # p. ej. "Paulo Albores" dentro de "Albores Clemente Paulo Cesar"
+    seq = SequenceMatcher(None, " ".join(a), " ".join(b)).ratio()
+    return round(max(jaccard, 0.5 * jaccard + 0.5 * seq), 3)
+
+
+def _normalize_group(value):
+    value = str(value or '').strip()
+    return extract_group(value) if value else ''
+
+
+def normalize_roster(df):
+    """Detecta columnas (matrícula, nombre, grupo...) y regresa la lista con las columnas estándar."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=ROSTER_COLS)
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    rename = {}
+    for c in df.columns:
+        cl = c.lower()
+        if cl == 'id':
+            rename[c] = 'ID'
+        elif 'matr' in cl:
+            rename[c] = 'Matrícula'
+        elif 'provisional' in cl or cl.startswith('código') or cl.startswith('codigo'):
+            rename[c] = 'Código provisional'
+        elif 'nombre' in cl or 'alumno' in cl or 'estudiante' in cl:
+            rename[c] = 'Nombre'
+        elif 'grupo' in cl:
+            rename[c] = 'Grupo'
+        elif 'pin' in cl:
+            rename[c] = 'PIN'
+    df = df.rename(columns=rename)
+    for col in ROSTER_COLS:
+        if col not in df.columns:
+            df[col] = ''
+        df[col] = df[col].fillna('').astype(str).str.strip().replace({'nan': ''})
+    df['Matrícula'] = df['Matrícula'].str.replace(r'\.0$', '', regex=True)
+    df['PIN'] = df['PIN'].str.replace(r'\.0$', '', regex=True)
+    df['Grupo'] = df['Grupo'].apply(_normalize_group)
+    df = df[df['Nombre'] != ''].copy()
+    return ensure_roster_ids(df[ROSTER_COLS].reset_index(drop=True))
+
+
+def ensure_roster_ids(roster):
+    """Asigna ID interno estable y código provisional a quien aún no tiene matrícula."""
+    roster = roster.copy()
+    used_ids = set(roster.loc[roster['ID'] != '', 'ID'])
+    n = 1
+    for i in roster.index[roster['ID'] == '']:
+        while f"A{n:04d}" in used_ids:
+            n += 1
+        roster.at[i, 'ID'] = f"A{n:04d}"
+        used_ids.add(f"A{n:04d}")
+    used_codes = set(roster.loc[roster['Código provisional'] != '', 'Código provisional'].str.upper())
+    for i in roster.index[(roster['Matrícula'] == '') & (roster['Código provisional'] == '')]:
+        base = "P" + re.sub(r'[^0-9A-Za-z]', '', roster.at[i, 'Grupo']).upper()
+        k = 1
+        while f"{base}{k:02d}" in used_codes:
+            k += 1
+        roster.at[i, 'Código provisional'] = f"{base}{k:02d}"
+        used_codes.add(f"{base}{k:02d}")
+    return roster
+
+
+def roster_login_id(row):
+    return row['Matrícula'] if str(row['Matrícula']).strip() else row['Código provisional']
+
+
+def roster_label(row):
+    who = roster_login_id(row)
+    return f"{row['Nombre']} ({row['Grupo'] or 'sin grupo'} · {who})"
+
+
+def generate_missing_pins(roster):
+    import secrets
+    roster = roster.copy()
+    count = 0
+    for i in roster.index[roster['PIN'] == '']:
+        roster.at[i, 'PIN'] = f"{secrets.randbelow(10**6):06d}"
+        count += 1
+    return roster, count
+
+
+def merge_roster_upload(current, uploaded):
+    """Agrega o actualiza alumnos sin perder su ID, PIN ni sus vínculos con Khan."""
+    current = normalize_roster(current)
+    uploaded = normalize_roster(uploaded)
+    if current.empty:
+        return uploaded
+    merged = current.copy()
+    for _, u in uploaded.iterrows():
+        match = pd.Series(False, index=merged.index)
+        if u['Matrícula']:
+            match = merged['Matrícula'] == u['Matrícula']
+        if not match.any():
+            toks = name_tokens(u['Nombre'])
+            match = merged['Nombre'].apply(name_tokens).eq(toks) & ((merged['Grupo'] == u['Grupo']) | (u['Grupo'] == ''))
+        if match.any():
+            i = merged.index[match][0]
+            for col in ['Matrícula', 'Nombre', 'Grupo']:
+                if u[col]:
+                    merged.at[i, col] = u[col]
+        else:
+            new_row = u.copy()
+            new_row['ID'] = ''
+            new_row['PIN'] = u['PIN']
+            merged = pd.concat([merged, new_row.to_frame().T], ignore_index=True)
+    return ensure_roster_ids(merged)
+
+
+def normalize_links(df):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=LINK_COLS)
+    df = df.copy()
+    for col in LINK_COLS:
+        if col not in df.columns:
+            df[col] = ''
+        df[col] = df[col].fillna('').astype(str).str.strip()
+    df['Grupo Khan'] = df['Grupo Khan'].apply(_normalize_group)
+    return df[LINK_COLS][df['Cuenta de Khan'] != ''].drop_duplicates(['Cuenta de Khan', 'Grupo Khan'], keep='last')
+
+
+def khan_accounts(raw_df):
+    """Cuentas de Khan presentes en los reportes: (nombre, grupo, actividades)."""
+    if raw_df.empty or 'Nombre del estudiante' not in raw_df.columns:
+        return pd.DataFrame(columns=['Cuenta de Khan', 'Grupo Khan', 'Actividades'])
+    acc = raw_df.groupby(['Nombre del estudiante', 'Grupo']).size().reset_index(name='Actividades')
+    return acc.rename(columns={'Nombre del estudiante': 'Cuenta de Khan', 'Grupo': 'Grupo Khan'})
+
+
+def build_link_map(raw_df, roster, links):
+    """
+    (cuenta de Khan, grupo) -> ID del alumno. Usa los vínculos guardados por el docente y,
+    para el resto, las coincidencias exactas de nombre (mismas palabras en cualquier orden).
+    """
+    if roster.empty:
+        return {}
+    link_map = {}
+    saved = {(r['Cuenta de Khan'], r['Grupo Khan']): r['ID alumno'] for _, r in links.iterrows()}
+    roster_tokens = [(r['ID'], r['Grupo'], name_tokens(r['Nombre'])) for _, r in roster.iterrows()]
+    for _, a in khan_accounts(raw_df).iterrows():
+        key = (a['Cuenta de Khan'], a['Grupo Khan'])
+        if key in saved:
+            if saved[key]:
+                link_map[key] = saved[key]
+            continue
+        toks = name_tokens(a['Cuenta de Khan'])
+        exact = [rid for rid, grp, rt in roster_tokens if rt == toks and (not grp or grp == a['Grupo Khan'])]
+        if len(exact) == 1:
+            link_map[key] = exact[0]
+    return link_map
+
+
+def apply_roster_links(raw_df, roster, links):
+    """
+    Reemplaza el nombre de Khan por el de la lista oficial y combina las cuentas duplicadas
+    de un mismo alumno, conservando el mejor resultado de cada actividad.
+    """
+    if raw_df.empty or roster.empty:
+        return raw_df
+    link_map = build_link_map(raw_df, roster, links)
+    if not link_map:
+        return raw_df
+    by_id = roster.set_index('ID')
+    df = raw_df.copy()
+    df['Cuenta Khan'] = df['Nombre del estudiante']
+    keys = list(zip(df['Nombre del estudiante'], df['Grupo']))
+    ids = [link_map.get(k) for k in keys]
+    df['ID alumno'] = ids
+    linked = df['ID alumno'].notna() & df['ID alumno'].isin(by_id.index)
+    df.loc[linked, 'Nombre del estudiante'] = df.loc[linked, 'ID alumno'].map(by_id['Nombre'])
+    roster_group = df.loc[linked, 'ID alumno'].map(by_id['Grupo'])
+    df.loc[linked, 'Grupo'] = roster_group.where(roster_group != '', df.loc[linked, 'Grupo'])
+
+    # Mejor resultado por actividad: completada, más aciertos, entregada antes
+    done = df['Última fecha de terminación'].astype(str).str.strip().replace({'nan': ''}).ne('') if 'Última fecha de terminación' in df.columns else pd.Series(False, index=df.index)
+    correct = pd.to_numeric(df.get('Mayor número de preguntas correctas hasta ahora'), errors='coerce').fillna(-1) if 'Mayor número de preguntas correctas hasta ahora' in df.columns else pd.Series(0, index=df.index)
+    df['_done'] = done.astype(int)
+    df['_correct'] = correct
+    df['_when'] = df['dt_terminacion'] if 'dt_terminacion' in df.columns else pd.NaT
+    df = df.sort_values(['_done', '_correct', '_when'], ascending=[False, False, True], na_position='last')
+    key_cols = [c for c in ASSIGNMENT_KEY_COLS if c in df.columns]
+    df = df.drop_duplicates(subset=key_cols, keep='first').drop(columns=['_done', '_correct', '_when'])
+    return df.sort_index()
+
+
+def load_roster_and_links(folder_id):
+    roster = normalize_roster(load_teacher_table(folder_id, ROSTER_FILE))
+    links = normalize_links(load_teacher_table(folder_id, LINKS_FILE))
+    return roster, links
+
+
+def build_link_table(raw_df, roster, links):
+    """Tabla para el docente: cada cuenta de Khan con su estado de vínculo o una sugerencia."""
+    accounts = khan_accounts(raw_df)
+    if accounts.empty:
+        return accounts
+    saved = {(r['Cuenta de Khan'], r['Grupo Khan']): r['ID alumno'] for _, r in links.iterrows()}
+    link_map = build_link_map(raw_df, roster, links)
+    labels = {r['ID']: roster_label(r) for _, r in roster.iterrows()}
+    roster_rows = [(r['ID'], r['Grupo'], name_tokens(r['Nombre'])) for _, r in roster.iterrows()]
+    rows = []
+    for _, a in accounts.iterrows():
+        key = (a['Cuenta de Khan'], a['Grupo Khan'])
+        toks = name_tokens(a['Cuenta de Khan'])
+        if key in saved and saved[key]:
+            estado, rid = "✅ Vinculada", saved[key]
+        elif key in saved:
+            estado, rid = "🚫 Marcada sin vínculo", ''
+        elif key in link_map:
+            estado, rid = "✅ Coincidencia exacta", link_map[key]
+        else:
+            same_group = [x for x in roster_rows if x[1] == a['Grupo Khan']] or roster_rows
+            best = max(same_group, key=lambda x: name_similarity(toks, x[2]), default=None)
+            score = name_similarity(toks, best[2]) if best else 0
+            if best and score >= 0.6:
+                estado, rid = f"💡 Sugerencia ({score * 100:.0f}% parecido)", best[0]
+            else:
+                estado, rid = "❓ Sin vincular", ''
+        rows.append({
+            'Cuenta de Khan': a['Cuenta de Khan'],
+            'Grupo Khan': a['Grupo Khan'],
+            'Actividades': int(a['Actividades']),
+            'Estado': estado,
+            'Alumno de la lista': labels.get(rid, NO_LINK_LABEL),
+        })
+    df = pd.DataFrame(rows)
+    order = df['Estado'].str[0].map({'💡': 0, '❓': 1, '🚫': 2, '✅': 3}).fillna(4)
+    return df.assign(_o=order).sort_values(['_o', 'Grupo Khan', 'Cuenta de Khan']).drop(columns='_o').reset_index(drop=True)
+
+
+def roster_status(raw_df, roster, links):
+    """Resumen para avisos: cuentas sin vincular, alumnos sin cuenta y cuentas combinadas."""
+    accounts = khan_accounts(raw_df)
+    link_map = build_link_map(raw_df, roster, links)
+    # Las cuentas que el docente marcó a propósito como "sin vínculo" ya no se reportan como pendientes
+    dismissed = {(r['Cuenta de Khan'], r['Grupo Khan']) for _, r in links.iterrows() if not r['ID alumno']}
+    linked_ids = pd.Series(list(link_map.values()), dtype=str)
+    counts = linked_ids.value_counts()
+    return {
+        'n_accounts': len(accounts),
+        'n_linked': len(link_map),
+        'unlinked': [k for k in zip(accounts['Cuenta de Khan'], accounts['Grupo Khan']) if k not in link_map and k not in dismissed],
+        'without_account': roster[~roster['ID'].isin(set(link_map.values()))] if not roster.empty else roster,
+        'combined': {rid: [k[0] for k, v in link_map.items() if v == rid] for rid in counts[counts > 1].index},
+    }
+
+
+def roster_template_bytes():
+    sample = pd.DataFrame([
+        {'Matrícula': '24123456', 'Nombre': 'ALBORES CLEMENTE PAULO CESAR', 'Grupo': '5°H'},
+        {'Matrícula': '', 'Nombre': 'GONZÁLEZ MARTÍNEZ MARÍA FERNANDA', 'Grupo': '1°A'},
+    ])
+    return table_to_xlsx_bytes(sample, "Lista")
+
+
+def access_cards_bytes(roster):
+    cards = roster[roster['PIN'] != ''].copy()
+    cards['Usuario'] = cards.apply(roster_login_id, axis=1)
+    cards = cards[['Grupo', 'Nombre', 'Usuario', 'PIN']].sort_values(['Grupo', 'Nombre'])
+    return table_to_xlsx_bytes(cards, "Fichas de acceso")
+
+
+def _finish_save(results):
+    """Muestra el peor resultado de una o varias operaciones de guardado tras recargar la página."""
+    order = {'error': 0, 'warning': 1, 'success': 2}
+    level, message, _ = sorted(results, key=lambda r: order.get(r[0], 3))[0]
+    set_flash(level, message)
+    st.rerun()
+
+
+def render_roster_tab(folder_id, raw_df, roster, links, carpeta_nombre):
+    """Pestaña 'Alumnos y cuentas' del panel docente."""
+    pending = st.session_state.get('_pending_upload')
+    if pending:
+        st.download_button(f"📥 Descargar {pending[0]} para subirlo a tu carpeta", pending[1], file_name=pending[0],
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           type="primary", key="dl_pending_upload")
+
+    st.caption("La **lista oficial** es la base: une las cuentas de Khan de cada alumno (aunque tenga más de una) "
+               "y le permite entrar al portal con su **matrícula y un PIN**, sin depender de sus datos de Khan.")
+
+    status = roster_status(raw_df, roster, links)
+    stats = [
+        ("👥 Alumnos en la lista", f"{len(roster)}"),
+        ("🔗 Cuentas de Khan vinculadas", f"{status['n_linked']} <small>de {status['n_accounts']}</small>"),
+        ("❓ Cuentas sin vincular", f"{len(status['unlinked'])}"),
+        ("🚫 Alumnos sin cuenta de Khan", f"{len(status['without_account'])}"),
+    ]
+    st.markdown(compact_html("<div class='mini-stats teacher-stats'>" + "".join(
+        f"<div class='mini-stat'><div class='mini-label'>{lbl}</div><div class='mini-val'>{val}</div></div>" for lbl, val in stats
+    ) + "</div>"), unsafe_allow_html=True)
+
+    # --- Crear o actualizar la lista
+    with st.expander("📋 Crear o actualizar la lista oficial", expanded=roster.empty):
+        st.markdown("Sube tu lista con las columnas **Matrícula**, **Nombre** y **Grupo** (Excel o CSV). "
+                    "Si un alumno aún no tiene matrícula, déjala vacía: el sistema le asigna un **código provisional**. "
+                    "Puedes subir la lista de nuevo cuando quieras; se actualizan los datos sin perder PIN ni vínculos.")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button("📥 Plantilla de lista", roster_template_bytes(), file_name="plantilla_lista_alumnos.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width='stretch',
+                               key="dl_roster_template")
+        with c2:
+            if st.button("✨ Crear lista a partir de los reportes de Khan", width='stretch', key="roster_from_khan",
+                         help="Toma los nombres y grupos de los reportes. Después solo completas las matrículas."):
+                acc = khan_accounts(raw_df)
+                seed = pd.DataFrame({'Nombre': acc['Cuenta de Khan'], 'Grupo': acc['Grupo Khan']})
+                seed['_t'] = seed['Nombre'].apply(name_tokens)
+                seed = seed.drop_duplicates(['_t', 'Grupo']).drop(columns='_t')
+                _finish_save([save_teacher_table(folder_id, ROSTER_FILE, merge_roster_upload(roster, seed), "Lista")])
+        up = st.file_uploader("Lista oficial (Excel o CSV)", type=["xlsx", "csv"], key="roster_upload")
+        if up is not None and st.button(f"⬆️ Cargar '{up.name}'", type="primary", key="roster_upload_btn"):
+            try:
+                new = pd.read_csv(up, dtype=str) if up.name.lower().endswith('.csv') else pd.read_excel(up, dtype=str)
+                merged = merge_roster_upload(roster, new)
+                _finish_save([save_teacher_table(folder_id, ROSTER_FILE, merged, "Lista")])
+            except Exception as e:
+                st.error(f"No se pudo leer el archivo: {e}")
+
+    if roster.empty:
+        st.info("Aún no tienes lista oficial. Súbela o créala a partir de los reportes de Khan para empezar.")
+        return
+
+    # --- Vincular cuentas
+    st.markdown("#### 🔗 Vincular cuentas de Khan con tu lista")
+    st.caption("Las coincidencias exactas se vinculan solas. Revisa las **sugerencias** y asigna las cuentas **sin vincular**. "
+               "Si un alumno tiene dos cuentas, vincula ambas a él: sus actividades se combinan con el mejor resultado.")
+    table = build_link_table(raw_df, roster, links)
+    if table.empty:
+        st.caption("Aún no hay reportes de Khan para vincular.")
+    else:
+        show_all = st.toggle("Mostrar también las cuentas ya vinculadas", value=False, key="links_show_all")
+        view = table if show_all else table[~table['Estado'].str.startswith('✅')]
+        if view.empty:
+            st.success("✅ Todas las cuentas de Khan están vinculadas.")
+        else:
+            options = [NO_LINK_LABEL] + sorted(roster.apply(roster_label, axis=1).tolist())
+            edited = st.data_editor(
+                view, hide_index=True, width='stretch', key="links_editor",
+                disabled=['Cuenta de Khan', 'Grupo Khan', 'Actividades', 'Estado'],
+                column_config={
+                    'Alumno de la lista': st.column_config.SelectboxColumn(options=options, required=True, width="large"),
+                    'Estado': st.column_config.TextColumn(width="medium"),
+                },
+            )
+            if st.button("💾 Guardar vínculos", type="primary", key="save_links_btn"):
+                label_to_id = {roster_label(r): r['ID'] for _, r in roster.iterrows()}
+                new_links = links.copy()
+                for _, r in edited.iterrows():
+                    key_mask = (new_links['Cuenta de Khan'] == r['Cuenta de Khan']) & (new_links['Grupo Khan'] == r['Grupo Khan'])
+                    new_links = new_links[~key_mask]
+                    new_links = pd.concat([new_links, pd.DataFrame([{
+                        'Cuenta de Khan': r['Cuenta de Khan'], 'Grupo Khan': r['Grupo Khan'],
+                        'ID alumno': label_to_id.get(r['Alumno de la lista'], ''),
+                    }])], ignore_index=True)
+                _finish_save([save_teacher_table(folder_id, LINKS_FILE, normalize_links(new_links), "Vinculos")])
+
+    if status['combined']:
+        names = roster.set_index('ID')['Nombre']
+        items = "".join(f"<li><strong>{html.escape(names.get(rid, rid))}</strong>: {html.escape(', '.join(accs))}</li>"
+                        for rid, accs in status['combined'].items())
+        st.markdown(compact_html(f"<div class='student-card' style='border-left-color:#2563eb;'><div class='sc-label'>🔀 Cuentas combinadas (alumnos con más de una cuenta de Khan)</div><ul>{items}</ul></div>"),
+                    unsafe_allow_html=True)
+
+    if not status['without_account'].empty:
+        with st.expander(f"🚫 {len(status['without_account'])} alumno(s) de tu lista sin cuenta de Khan vinculada"):
+            st.caption("No aparecen en los reportes de Khan o su cuenta no está vinculada. Si no se han unido a la clase de Khan, "
+                       "no tendrán calificación: conviene buscarlos.")
+            st.dataframe(status['without_account'][['Grupo', 'Nombre', 'Matrícula', 'Código provisional']]
+                         .sort_values(['Grupo', 'Nombre']), hide_index=True, width='stretch')
+
+    # --- Acceso de los alumnos con PIN
+    st.markdown("#### 🔑 Acceso de los alumnos con matrícula y PIN")
+    n_without_pin = int((roster['PIN'] == '').sum())
+    st.caption("Los alumnos entran en **Acceso Estudiantes** con su matrícula (o código provisional) y su PIN de 6 dígitos. "
+               "No necesitan su usuario ni contraseña de Khan.")
+    p1, p2 = st.columns(2)
+    with p1:
+        if st.button(f"🔑 Generar PIN a {n_without_pin} alumno(s) que no tienen" if n_without_pin else "🔑 Todos tienen PIN",
+                     disabled=n_without_pin == 0, width='stretch', key="gen_pins_btn"):
+            updated, _ = generate_missing_pins(roster)
+            _finish_save([save_teacher_table(folder_id, ROSTER_FILE, updated, "Lista")])
+    with p2:
+        st.download_button("🖨️ Descargar fichas de acceso (Excel)", access_cards_bytes(roster),
+                           file_name=f"fichas_acceso_{now_local().strftime('%Y%m%d')}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           disabled=(roster['PIN'] == '').all(), width='stretch', key="dl_access_cards")
+    st.caption(f"Puedes corregir matrículas, nombres o PIN directamente en **{ROSTER_FILE}** dentro de tu carpeta "
+               f"`{carpeta_nombre}` (se abre con Google Sheets); después presiona **Sincronizar**.")
+
+
+# ==============================================================================
 # VISTA: INICIO DE SESIÓN CON ENRUTAMIENTO DINÁMICO (GOOGLE DRIVE)
 # ==============================================================================
 def render_login():
@@ -2784,7 +3279,7 @@ def render_login():
         # 1. ACCESO ESTUDIANTES (AISLAMIENTO POR DOCENTE / ASIGNATURA)
         # ----------------------------------------------------------------------
         with tab_student:
-            st.caption("Selecciona a tu docente e ingresa con tu usuario y contraseña de Khan Academy:")
+            st.caption("Selecciona a tu docente e ingresa con tu **matrícula y PIN** (te los da tu docente) o con tu usuario y contraseña de Khan Academy:")
 
             # Opciones de docentes disponibles desde docentes.xlsx
             if not docentes_df.empty and 'Nombre del Docente' in docentes_df.columns:
@@ -2825,10 +3320,12 @@ def render_login():
             cached_creds_df = load_teacher_credentials(cached_folder_id)
             if cached_creds_df.empty:
                 load_teacher_credentials.clear()
+            # Lista oficial con matrícula + PIN (precargada para no consultar Drive al presionar el botón)
+            cached_roster = normalize_roster(load_teacher_table(cached_folder_id, ROSTER_FILE)) if (cached_folder_id or not drive_ready) else pd.DataFrame(columns=ROSTER_COLS)
 
             with st.form("student_login_form", clear_on_submit=False):
-                username_input = st.text_input("Usuario Khan Academy", placeholder="ej. alboresclementepaulo", key="login_st_user").strip()
-                password_input = st.text_input("Contraseña", type="password", placeholder="••••••••", key="login_st_pass").strip()
+                username_input = st.text_input("Matrícula o usuario de Khan Academy", placeholder="ej. 24123456 o alboresclementepaulo", key="login_st_user").strip()
+                password_input = st.text_input("PIN o contraseña", type="password", placeholder="••••••", key="login_st_pass").strip()
                 submit_st_btn = st.form_submit_button("Ingresar como Estudiante", width='stretch', type="primary")
 
                 if submit_st_btn:
@@ -2839,33 +3336,52 @@ def render_login():
                         time.sleep(0.5)
                     st.session_state['last_student_login_ts'] = time.time()
 
-                    if not username_input or not password_input:
+                    lock_until = st.session_state.get('student_login_lock_until', 0)
+                    if time.time() < lock_until:
+                        st.error(f"Demasiados intentos. Espera {int(lock_until - time.time()) + 1} segundos e inténtalo de nuevo.")
+                    elif not username_input or not password_input:
                         st.error("Por favor completa tu usuario y contraseña.")
+                    elif cached_creds_df.empty and cached_roster.empty:
+                        st.error(f"No se encontraron credenciales para la asignatura '{selected_asig}' del docente '{selected_teacher}'. Contacta al docente.")
                     else:
-                        # Autenticación estrictamente en memoria contra el dataframe ya cargado en RAM
-                        if cached_creds_df.empty:
-                            st.error(f"No se encontraron credenciales para la asignatura '{selected_asig}' del docente '{selected_teacher}'. Contacta al docente.")
-                        else:
+                        # Autenticación estrictamente en memoria contra los datos ya cargados en RAM
+                        login = None
+                        if not cached_creds_df.empty:
                             matched = cached_creds_df[
                                 (cached_creds_df['Usuario'].str.lower() == username_input.lower()) &
                                 (cached_creds_df['Contraseña'] == password_input)
                             ]
                             if not matched.empty:
-                                student_name = matched.iloc[0]['Nombre del estudiante']
-                                teacher_email = matched_teacher_asig.iloc[0].get('e_mail', '') if not matched_teacher_asig.empty else ''
-                                st.session_state['logged_in'] = True
-                                st.session_state['role'] = 'student'
-                                st.session_state['username'] = username_input
-                                st.session_state['student_name'] = student_name
-                                st.session_state['teacher_name'] = selected_teacher
-                                st.session_state['teacher_email'] = teacher_email
-                                st.session_state['asignatura'] = selected_asig
-                                st.session_state['carpeta_nombre'] = folder_name
-                                st.session_state['teacher_folder_id'] = cached_folder_id
-                                st.success(f"Bienvenido(a), {student_name}")
-                                st.rerun()
-                            else:
-                                st.error(f"Usuario o contraseña incorrectos para el docente '{selected_teacher}'.")
+                                login = {'student_name': matched.iloc[0]['Nombre del estudiante'], 'student_id': None}
+                        if login is None and not cached_roster.empty:
+                            ids = cached_roster.apply(roster_login_id, axis=1).str.strip().str.upper()
+                            matched = cached_roster[(ids == username_input.upper()) & (cached_roster['PIN'] != '') &
+                                                    (cached_roster['PIN'] == password_input)]
+                            if not matched.empty:
+                                login = {'student_name': matched.iloc[0]['Nombre'], 'student_id': matched.iloc[0]['ID']}
+
+                        if login:
+                            teacher_email = matched_teacher_asig.iloc[0].get('e_mail', '') if not matched_teacher_asig.empty else ''
+                            st.session_state.pop('student_login_failures', None)
+                            st.session_state['logged_in'] = True
+                            st.session_state['role'] = 'student'
+                            st.session_state['username'] = username_input
+                            st.session_state['student_name'] = login['student_name']
+                            st.session_state['student_id'] = login['student_id']
+                            st.session_state['teacher_name'] = selected_teacher
+                            st.session_state['teacher_email'] = teacher_email
+                            st.session_state['asignatura'] = selected_asig
+                            st.session_state['carpeta_nombre'] = folder_name
+                            st.session_state['teacher_folder_id'] = cached_folder_id
+                            st.success(f"Bienvenido(a), {login['student_name']}")
+                            st.rerun()
+                        else:
+                            fails = st.session_state.get('student_login_failures', 0) + 1
+                            st.session_state['student_login_failures'] = fails
+                            if fails >= 5:
+                                st.session_state['student_login_lock_until'] = time.time() + 60
+                                st.session_state['student_login_failures'] = 0
+                            st.error(f"Usuario o contraseña incorrectos para el docente '{selected_teacher}'.")
 
         # ----------------------------------------------------------------------
         # 2. ACCESO DOCENTES (ENRUTAMIENTO MAESTRO)
@@ -2975,8 +3491,11 @@ def render_admin():
     show_flash()
 
     # Cargar datos base crudos aislados de la carpeta del docente
-    raw_assignments = load_teacher_raw_assignments(teacher_folder_id)
+    raw_khan = load_teacher_raw_assignments(teacher_folder_id)
     all_credentials = load_teacher_credentials(teacher_folder_id)
+    # Lista oficial: une cuentas duplicadas y usa el nombre oficial de cada alumno
+    roster, roster_links = load_roster_and_links(teacher_folder_id)
+    raw_assignments = apply_roster_links(raw_khan, roster, roster_links)
 
     # Detectar dinámicamente los tipos de tarea presentes en los datos
     if not raw_assignments.empty and 'Tipo de tarea' in raw_assignments.columns:
@@ -3459,7 +3978,23 @@ def render_admin():
     column_arrangement = ['Grupo', 'Nombre del estudiante', 'Estatus'] + existing_date_cols + ['Promedio General']
     pivot_df = pivot_df[column_arrangement]
 
-    tab_resumen, tab_conc, tab_actividad, tab_detalle = st.tabs(["🎯 Resumen y acciones", "📊 Concentrado", "🧩 Por actividad", "🔍 Detalle por alumno"])
+    if roster.empty:
+        st.info("👥 **Nuevo:** sube tu lista oficial del grupo en la pestaña **Alumnos y cuentas** para unir cuentas duplicadas de Khan "
+                "y que tus alumnos entren con su matrícula y un PIN.")
+    else:
+        r_status = roster_status(raw_khan, roster, roster_links)
+        pend = []
+        if r_status['unlinked']:
+            pend.append(f"{len(r_status['unlinked'])} cuenta(s) de Khan sin vincular")
+        if not r_status['without_account'].empty:
+            pend.append(f"{len(r_status['without_account'])} alumno(s) de tu lista sin cuenta de Khan")
+        if pend:
+            st.warning("👥 " + " y ".join(pend) + ". Revísalo en la pestaña **Alumnos y cuentas**.")
+
+    tab_resumen, tab_conc, tab_actividad, tab_detalle, tab_lista = st.tabs(["🎯 Resumen y acciones", "📊 Concentrado", "🧩 Por actividad", "🔍 Detalle por alumno", "👥 Alumnos y cuentas"])
+
+    with tab_lista:
+        render_roster_tab(teacher_folder_id, raw_khan, roster, roster_links, carpeta_nombre)
 
     with tab_resumen:
         render_teacher_summary(active_master, block_summary, active_criteria_config, group_color_map(available_groups), asignatura)
@@ -3716,7 +4251,21 @@ def render_student():
     teacher_folder_id = st.session_state.get('teacher_folder_id')
 
     # Cargar datos crudos exclusivamente de la carpeta de la asignatura/docente en Drive
-    raw_assignments = load_teacher_raw_assignments(teacher_folder_id)
+    raw_khan = load_teacher_raw_assignments(teacher_folder_id)
+    roster, roster_links = load_roster_and_links(teacher_folder_id)
+    raw_assignments = apply_roster_links(raw_khan, roster, roster_links)
+
+    # Nombre oficial del alumno: por su ID (acceso con PIN) o por su cuenta de Khan vinculada
+    student_id = st.session_state.get('student_id')
+    if not roster.empty:
+        if student_id and student_id in set(roster['ID']):
+            student_name = roster.set_index('ID').at[student_id, 'Nombre']
+        else:
+            linked_id = next((rid for (acc, _), rid in build_link_map(raw_khan, roster, roster_links).items()
+                              if acc.strip() == str(student_name).strip()), None)
+            if linked_id:
+                student_name = roster.set_index('ID').at[linked_id, 'Nombre']
+
     if not raw_assignments.empty and 'Tipo de tarea' in raw_assignments.columns:
         unique_task_types = sorted([
             t for t in raw_assignments['Tipo de tarea'].dropna().astype(str).str.strip().unique()
