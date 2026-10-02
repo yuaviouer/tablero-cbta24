@@ -2871,6 +2871,7 @@ def save_teacher_table(folder_id, filename, df, sheet_name="Hoja1"):
             with open(os.path.join(DATA_DIR, filename), "wb") as f:
                 f.write(data)
             load_teacher_table.clear()
+            list_teacher_file_names.clear()
             return ('success', f"✅ {filename} guardado (modo local).", True)
         except Exception as e:
             return ('error', f"No se pudo guardar {filename}: {e}", False)
@@ -2885,6 +2886,7 @@ def save_teacher_table(folder_id, filename, df, sheet_name="Hoja1"):
             service.files().create(body={'name': filename, 'parents': [folder_id]}, media_body=media,
                                    supportsAllDrives=True).execute()
         load_teacher_table.clear()
+        list_teacher_file_names.clear()
         pending = st.session_state.get('_pending_upload')
         if pending and pending[0] == filename:
             st.session_state.pop('_pending_upload', None)
@@ -2893,7 +2895,7 @@ def save_teacher_table(folder_id, filename, df, sheet_name="Hoja1"):
         status = getattr(getattr(e, 'resp', None), 'status', None)
         if 'storage quota' in str(e).lower() or status == 403:
             st.session_state['_pending_upload'] = (filename, data)
-            return ('warning', f"⚠️ Google Drive no permitió crear {filename} automáticamente. Descárgalo con el botón de abajo y súbelo a tu carpeta; a partir de ahí el sistema lo actualizará solo.", False)
+            return ('warning', f"⚠️ Google Drive no permitió crear {filename} automáticamente. Descárgalo con el botón de abajo y súbelo a tu carpeta (o usa **⚙️ Ajustes → 🚀 Primeros pasos** para descargar todas las plantillas); a partir de ahí el sistema lo actualizará solo.", False)
         if status in (429, 500, 503):
             return ('error', "⚠️ Google Drive está ocupado. Intenta de nuevo en unos segundos.", False)
         return ('error', f"Error al guardar {filename} en Google Drive: {e}", False)
@@ -3827,6 +3829,110 @@ def render_student_evaluation(ctx, student_id, criteria_config, key_prefix):
 
 
 # ==============================================================================
+# PRIMEROS PASOS: PLANTILLAS QUE EL DOCENTE SUBE UNA VEZ A SU CARPETA DE DRIVE
+# ==============================================================================
+@st.cache_data(ttl=300)
+def list_teacher_file_names(folder_id):
+    """Nombres de los archivos en la carpeta del docente (o en datos/ en modo local)."""
+    try:
+        if _drive_ready(folder_id):
+            res = get_drive_service().files().list(
+                q=f"'{folder_id}' in parents and trashed = false", fields='files(name)', pageSize=500,
+                supportsAllDrives=True, includeItemsFromAllDrives=True
+            ).execute(num_retries=3)
+            return sorted({f['name'] for f in res.get('files', [])})
+        return sorted(os.listdir(DATA_DIR)) if os.path.isdir(DATA_DIR) else []
+    except Exception:
+        return []
+
+
+def setup_files_spec(raw_khan, unique_task_types):
+    """
+    Archivos que usa el sistema, con una plantilla lista para subir. Google Drive no permite que la
+    aplicación cree archivos nuevos en carpetas personales, pero sí actualizar los que ya existen:
+    por eso el docente los sube una vez y a partir de ahí la app los mantiene.
+    """
+    def roster_seed():
+        acc = khan_accounts(raw_khan)
+        if acc.empty:
+            return table_to_xlsx_bytes(pd.DataFrame(columns=ROSTER_COLS), "Lista")
+        seed = pd.DataFrame({'Nombre': acc['Cuenta de Khan'], 'Grupo': acc['Grupo Khan']})
+        seed['_t'] = seed['Nombre'].apply(name_tokens)
+        seed = seed.drop_duplicates(['_t', 'Grupo']).drop(columns='_t')
+        roster = ensure_roster_ids(normalize_roster(seed))
+        return table_to_xlsx_bytes(roster.sort_values(['Grupo', 'Nombre']), "Lista")
+
+    def criterios_bytes():
+        crit = get_default_teacher_criterios(unique_task_types)
+        return json.dumps(crit, indent=4, ensure_ascii=False, default=str).encode('utf-8')
+
+    return [
+        ("criterios.json", "⚙️ Tu configuración: escala, pesos, fechas de parciales y criterios.", criterios_bytes),
+        (ROSTER_FILE, "👥 Lista oficial de alumnos. Ya viene con los nombres y grupos de tus reportes de Khan: solo agrega las matrículas.", roster_seed),
+        (LINKS_FILE, "🔗 Vínculos entre cuentas de Khan y tu lista (lo llena la app).", lambda: table_to_xlsx_bytes(pd.DataFrame(columns=LINK_COLS), "Vinculos")),
+        (ATT_FILE, "🙋 Pase de lista (lo llena la app).", lambda: table_to_xlsx_bytes(pd.DataFrame(columns=ATT_COLS), "Asistencia")),
+        (EVID_FILE, "📓 Sellos de evidencia (lo llena la app).", lambda: table_to_xlsx_bytes(pd.DataFrame(columns=EVID_COLS), "Evidencias")),
+        (EXTRA_FILE, "📝 Examen y producto del parcial (lo llena la app).", lambda: table_to_xlsx_bytes(pd.DataFrame(columns=EXTRA_COLS), "Calificaciones")),
+    ]
+
+
+def missing_setup_files(folder_id):
+    present = set(list_teacher_file_names(folder_id))
+    return [name for name in [f[0] for f in setup_files_spec(pd.DataFrame(), [])] if name not in present]
+
+
+def render_setup_section(folder_id, raw_khan, unique_task_types, carpeta_nombre):
+    """Ajustes → Primeros pasos: qué archivos faltan en la carpeta y cómo subirlos."""
+    import zipfile
+    spec = setup_files_spec(raw_khan, unique_task_types)
+    present = set(list_teacher_file_names(folder_id))
+    missing = [s for s in spec if s[0] not in present]
+
+    st.markdown("#### 🚀 Primeros pasos")
+    st.markdown(
+        "Por la configuración de Google, esta aplicación **puede actualizar** los archivos de tu carpeta, pero **no puede "
+        "crearlos**. Por eso, la primera vez debes subir unas plantillas vacías. Solo se hace una vez:\n\n"
+        "1. Descarga las plantillas que faltan (abajo).\n"
+        "2. Si descargaste el .zip, descomprímelo en tu computadora.\n"
+        f"3. Sube los archivos **tal cual, sin cambiarles el nombre**, a tu carpeta **{carpeta_nombre}** de Google Drive.\n"
+        "4. Regresa aquí y presiona **Verificar**."
+    )
+    if _drive_ready(folder_id):
+        st.link_button(f"📂 Abrir mi carpeta '{carpeta_nombre}' en Google Drive",
+                       f"https://drive.google.com/drive/folders/{folder_id}", width='stretch')
+
+    if not missing:
+        st.success("✅ Tu carpeta tiene todos los archivos. Ya puedes usar la lista, el pase de lista, los sellos y las calificaciones del parcial.")
+    else:
+        st.warning(f"Faltan {len(missing)} archivo(s) en tu carpeta.")
+        buff = io.BytesIO()
+        with zipfile.ZipFile(buff, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for name, _, builder in missing:
+                zf.writestr(name, builder())
+        st.download_button(f"📦 Descargar las {len(missing)} plantillas que faltan (.zip)", buff.getvalue(),
+                           file_name="plantillas_portal_cbta24.zip", mime="application/zip", type="primary",
+                           width='stretch', key="dl_setup_zip")
+
+    st.markdown("##### Archivos de tu carpeta")
+    for name, desc, builder in spec:
+        ok = name in present
+        c1, c2 = st.columns([4, 2], vertical_alignment="center")
+        with c1:
+            st.markdown(f"{'✅' if ok else '❌'} **`{name}`**  \n<span style='color:#64748b;font-size:0.85rem'>{html.escape(desc)}</span>",
+                        unsafe_allow_html=True)
+        with c2:
+            if not ok:
+                mime = "application/json" if name.endswith('.json') else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                st.download_button("📥 Descargar", builder(), file_name=name, mime=mime, width='stretch', key=f"dl_setup_{name}")
+    if st.button("🔄 Verificar", width='stretch', key="verify_setup_btn"):
+        list_teacher_file_names.clear()
+        load_teacher_table.clear()
+        load_teacher_criterios.clear()
+        st.rerun()
+    st.caption("💡 Los reportes CSV de Khan Academy y `credenciales.xlsx` (si los usas) también van en esta misma carpeta.")
+
+
+# ==============================================================================
 # VISTA: INICIO DE SESIÓN CON ENRUTAMIENTO DINÁMICO (GOOGLE DRIVE)
 # ==============================================================================
 def render_login():
@@ -4045,7 +4151,7 @@ def render_login():
 NAV_INICIO, NAV_LISTA, NAV_EVAL, NAV_CALIF, NAV_ALUMNO, NAV_AJUSTES = (
     "🏠 Inicio", "🙋 Pase de lista", "📓 Evaluar", "📊 Calificaciones", "🔍 Alumno", "⚙️ Ajustes")
 ADMIN_SECTIONS = [NAV_INICIO, NAV_LISTA, NAV_EVAL, NAV_CALIF, NAV_ALUMNO, NAV_AJUSTES]
-AJ_CRITERIOS, AJ_ALUMNOS, AJ_ARCHIVOS = "Criterios y componentes", "👥 Alumnos y cuentas", "☁️ Archivos y Drive"
+AJ_INICIO, AJ_CRITERIOS, AJ_ALUMNOS, AJ_ARCHIVOS = "🚀 Primeros pasos", "Criterios y componentes", "👥 Alumnos y cuentas", "☁️ Archivos y Drive"
 CALIF_CONC, CALIF_FINAL, CALIF_ACT = "Concentrado Khan", "Calificación del parcial", "Por actividad"
 
 
@@ -4088,8 +4194,8 @@ def render_admin():
                                    label_visibility="collapsed") or NAV_INICIO
     ajustes_sub = None
     if section == NAV_AJUSTES:
-        ajustes_sub = st.segmented_control("Ajustes", [AJ_CRITERIOS, AJ_ALUMNOS, AJ_ARCHIVOS], default=AJ_CRITERIOS,
-                                           key="ajustes_sub", label_visibility="collapsed") or AJ_CRITERIOS
+        ajustes_sub = st.segmented_control("Ajustes", [AJ_INICIO, AJ_CRITERIOS, AJ_ALUMNOS, AJ_ARCHIVOS], default=AJ_INICIO,
+                                           key="ajustes_sub", label_visibility="collapsed") or AJ_INICIO
 
     # Cargar datos base crudos aislados de la carpeta del docente
     raw_khan = load_teacher_raw_assignments(teacher_folder_id)
@@ -4508,6 +4614,8 @@ def render_admin():
     if section == NAV_AJUSTES:
         if ajustes_sub == AJ_ALUMNOS:
             render_roster_tab(teacher_folder_id, raw_khan, roster, roster_links, carpeta_nombre)
+        elif ajustes_sub == AJ_INICIO:
+            render_setup_section(teacher_folder_id, raw_khan, unique_task_types, carpeta_nombre)
         return
 
     # Criterios activos completos en tiempo real
@@ -4633,6 +4741,12 @@ def render_admin():
     # Organizar columnas: 'Estatus' al lado del nombre del estudiante
     column_arrangement = ['Grupo', 'Nombre del estudiante', 'Estatus'] + existing_date_cols + ['Promedio General']
     pivot_df = pivot_df[column_arrangement]
+
+    if section == NAV_INICIO and _drive_ready(teacher_folder_id):
+        faltan = missing_setup_files(teacher_folder_id)
+        if faltan:
+            st.info(f"🚀 **Para activar todas las funciones**, sube {len(faltan)} plantilla(s) a tu carpeta de Drive. "
+                    "Ve a **⚙️ Ajustes → 🚀 Primeros pasos**: ahí las descargas todas juntas.")
 
     if section == NAV_INICIO:
         if roster.empty:
@@ -4911,7 +5025,7 @@ def render_admin():
         st.write("")
 
         # Visualización complementaria: Dashboard idéntico con desglose por bloques y filtros
-        with st.expander("👁️ Vista del alumno (así ve su portal este estudiante)", expanded=True):
+        with st.expander("👁️ Ver como alumno (vista previa de su portal, útil para explicarle su avance)", expanded=False):
             updated_at = student_tasks_data['Archivo_Modificado'].max() if 'Archivo_Modificado' in student_tasks_data.columns else None
             sel_ids = roster.loc[roster['Nombre'] == selected_student, 'ID'] if not roster.empty else pd.Series(dtype=str)
             render_student_experience(selected_student, student_tasks_data, active_criteria_config, key_prefix="admin", updated_at=updated_at,
