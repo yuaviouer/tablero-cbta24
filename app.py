@@ -465,7 +465,8 @@ def get_default_teacher_criterios(unique_task_types=None, scale=10):
         'parciales': get_default_parciales_config(),
         'task_criteria': get_default_criteria_config(unique_task_types),
         'componentes': dict(DEFAULT_COMPONENTES),
-        'asistencia_minima': 80
+        'asistencia_minima': 80,
+        'rubrica_evidencias': default_rubrica()
     }
 
 
@@ -539,7 +540,8 @@ def load_teacher_criterios(folder_id, unique_task_types=None):
                         'parciales': parciales,
                         'task_criteria': merged_tasks,
                         'componentes': {**DEFAULT_COMPONENTES, **(saved.get('componentes') or {})},
-                        'asistencia_minima': float(saved.get('asistencia_minima', 80))
+                        'asistencia_minima': float(saved.get('asistencia_minima', 80)),
+                        'rubrica_evidencias': saved.get('rubrica_evidencias') or default_rubrica()
                     }
         except Exception as e:
             st.warning(f"No se pudo leer criterios.json desde Google Drive (se usarán valores por defecto): {e}")
@@ -569,7 +571,8 @@ def load_teacher_criterios(folder_id, unique_task_types=None):
                 'parciales': parciales,
                 'task_criteria': merged_tasks,
                 'componentes': {**DEFAULT_COMPONENTES, **(saved.get('componentes') or {})},
-                'asistencia_minima': float(saved.get('asistencia_minima', 80))
+                'asistencia_minima': float(saved.get('asistencia_minima', 80)),
+                'rubrica_evidencias': saved.get('rubrica_evidencias') or default_rubrica()
             }
         except Exception:
             pass
@@ -3329,6 +3332,44 @@ EVID_LEVELS = [
     ("3 · Dominio", 100, "Procedimiento correcto y lo explica, o resuelve una variante en el momento."),
 ]
 EVID_PCT = {lbl: pct for lbl, pct, _ in EVID_LEVELS}
+
+
+def default_rubrica():
+    return [{'nivel': lbl, 'valor': pct, 'descripcion': desc} for lbl, pct, desc in EVID_LEVELS]
+
+
+def evid_levels(cfg):
+    """
+    Rúbrica de sellos del docente: los nombres de los niveles son fijos (así se guardan los sellos),
+    pero cada docente puede cambiar la descripción y el valor (%) de cada nivel.
+    """
+    custom = {r.get('nivel'): r for r in ((cfg or {}).get('rubrica_evidencias') or []) if isinstance(r, dict)}
+    levels = []
+    for lbl, pct, desc in EVID_LEVELS:
+        c = custom.get(lbl, {})
+        try:
+            value = float(c.get('valor', pct))
+        except (TypeError, ValueError):
+            value = float(pct)
+        levels.append((lbl, value, str(c.get('descripcion') or desc).strip()))
+    return levels
+
+
+def evid_pct_map(cfg):
+    return {lbl: pct for lbl, pct, _ in evid_levels(cfg)}
+
+
+def evid_color(pct, cfg):
+    top = max(p for _, p, _ in evid_levels(cfg)) or 100
+    if pct is None or pd.isna(pct) or pct <= 0:
+        return '#dc2626'
+    if pct >= top:
+        return '#16a34a'
+    return '#d97706' if pct < 0.6 * top else '#2563eb'
+
+
+def rubric_markdown(cfg, suffix=""):
+    return "\n".join(f"- **{lbl}** ({pct:g}%{suffix}): {desc}" for lbl, pct, desc in evid_levels(cfg))
 ATT_STATES = ["✅ Asistió", "⏰ Retardo", "📝 Justificada", "❌ Falta"]
 PARCIALES = ['Parcial 1', 'Parcial 2', 'Parcial 3']
 
@@ -3390,7 +3431,7 @@ def compute_components(roster, evid, extra, att, criteria_config, parcial):
     if not ev.empty:
         ev['Parcial'] = ev['Fecha bloque'].apply(lambda d: parcial_of(d, cfg))
         ev = ev[ev['Parcial'] == parcial]
-        ev['pct'] = ev['Nivel'].map(EVID_PCT)
+        ev['pct'] = ev['Nivel'].map(evid_pct_map(cfg))
         g = ev.dropna(subset=['pct']).groupby('ID alumno')['pct']
         out['Evidencias %'] = g.mean()
         out['Bloques con evidencia'] = g.size()
@@ -3570,7 +3611,8 @@ def render_evidence_section(folder_id, roster, tasks, criteria_config):
     evid, _, _ = load_eval_tables(folder_id)
     grupo, parcial, students = _eval_selectors(roster, cfg, "evid")
     with st.expander("📏 Rúbrica (tus alumnos también la ven en su portal)"):
-        st.markdown("\n".join(f"- **{lbl}** ({pct}%): {desc}" for lbl, pct, desc in EVID_LEVELS) +
+        st.markdown(rubric_markdown(cfg) +
+                    "\n\n✏️ Puedes cambiar descripciones y valores en **⚙️ Ajustes → Criterios y componentes**."
                     "\n\n💡 Para distinguir a quien entendió de quien copió, pídele que resuelva una pequeña variante del ejercicio.")
     g_tasks = tasks[tasks['Grupo'] == grupo] if 'Grupo' in tasks.columns else tasks
     if 'Parcial' in g_tasks.columns:
@@ -3711,10 +3753,12 @@ def evidence_opportunities(ctx, student_id, criteria_config, parcial):
         return compute_final_grades(compute_components(me, ev, extra, att, cfg, parcial), khan, cfg).iloc[0]['Final']
 
     mine = evid[(evid['ID alumno'] == student_id) & (evid['Fecha bloque'].apply(lambda d: parcial_of(d, cfg)) == parcial)]
-    improvable = mine[mine['Nivel'].map(EVID_PCT).fillna(0) < 100]
+    pct_map = evid_pct_map(cfg)
+    top_pct = max(pct_map.values())
+    top = max(pct_map, key=pct_map.get)
+    improvable = mine[mine['Nivel'].map(pct_map).fillna(0) < top_pct]
     if improvable.empty:
         return {'current': final_with(evid), 'best': None, 'blocks': []}
-    top = EVID_LEVELS[-1][0]
     blocks = []
     for idx, r in improvable.sort_values('Fecha bloque').iterrows():
         sim = evid.copy()
@@ -3739,8 +3783,7 @@ def render_evidence_motivation(ctx, student_id, criteria_config, parcial, compac
         return True
     cards = []
     for b in opp['blocks']:
-        pct = EVID_PCT.get(b['nivel'], 0)
-        color = {0: '#dc2626', 50: '#d97706', 80: '#2563eb'}.get(pct, '#64748b')
+        color = evid_color(evid_pct_map(criteria_config).get(b['nivel'], 0), criteria_config)
         right = (f"Con Dominio<br><strong>{b['final']:.1f}</strong>" if b['final'] is not None else "")
         cards.append(_task_card_html(f"Bloque {format_short_date(pd.to_datetime(b['fecha']), with_time=False)}",
                                      f"Ahora: {html.escape(b['nivel'])}", right, color))
@@ -3788,7 +3831,7 @@ def render_student_evaluation(ctx, student_id, criteria_config, key_prefix):
 
     # Sellos por bloque
     with st.expander("📏 ¿Cómo se evalúan los sellos de evidencia?"):
-        st.markdown("\n".join(f"- **{lbl}** ({pct}% del sello): {desc}" for lbl, pct, desc in EVID_LEVELS) + f"\n\n💡 {EVID_TIPS}")
+        st.markdown("Esta es la rúbrica de tu docente:\n\n" + rubric_markdown(cfg, " del sello") + f"\n\n💡 {EVID_TIPS}")
     if float(weights.get('evidencias', 0)) > 0:
         render_evidence_motivation(ctx, student_id, cfg, parcial)
     my_ev = evid[evid['ID alumno'] == student_id].copy() if not evid.empty else evid
@@ -3802,12 +3845,13 @@ def render_student_evaluation(ctx, student_id, criteria_config, key_prefix):
         else:
             st.caption("Aún no tienes sellos registrados en este parcial.")
     else:
-        desc = {lbl: d for lbl, _, d in EVID_LEVELS}
+        desc = {lbl: d for lbl, _, d in evid_levels(cfg)}
+        pct_map = evid_pct_map(cfg)
         cards = []
         for _, r in my_ev.iterrows():
             lvl = r['Nivel']
-            color = {0: '#dc2626', 50: '#d97706', 80: '#2563eb', 100: '#16a34a'}.get(EVID_PCT.get(lvl), '#64748b')
-            tip = " Preséntalo para obtener tu sello." if EVID_PCT.get(lvl) == 0 else ""
+            color = evid_color(pct_map.get(lvl), cfg)
+            tip = " Preséntalo para obtener tu sello." if not pct_map.get(lvl) else ""
             cards.append(_task_card_html(f"Bloque {format_short_date(pd.to_datetime(r['Fecha bloque']), with_time=False)}",
                                          html.escape(desc.get(lvl, '') + tip), f"<strong>{html.escape(lvl)}</strong>", color))
         st.markdown(compact_html("".join(cards)), unsafe_allow_html=True)
@@ -4376,6 +4420,22 @@ def render_admin():
                 value=int(float(criterios_data.get('asistencia_minima', 80))), key="cfg_asist_min",
                 help="Se avisa al docente y al alumno cuando su asistencia está por debajo de este porcentaje o cerca de él."
             )
+            st.markdown("---")
+            st.markdown("##### 📏 Rúbrica de los sellos de evidencia")
+            st.caption("Ajusta la descripción y el valor de cada nivel. Tus alumnos ven esta misma rúbrica en su portal. "
+                       "Los nombres de los niveles no cambian para no afectar los sellos ya registrados.")
+            rub_df = pd.DataFrame([{'Nivel': l, 'Valor (%)': p, 'Descripción': d} for l, p, d in evid_levels(criterios_data)])
+            rub_edit = st.data_editor(
+                rub_df, hide_index=True, width='stretch', disabled=['Nivel'], key="cfg_rubrica_editor",
+                column_config={'Nivel': st.column_config.TextColumn(width="small"),
+                               'Valor (%)': st.column_config.NumberColumn(min_value=0, max_value=100, step=5, required=True, width="small"),
+                               'Descripción': st.column_config.TextColumn(width="large", required=True)}
+            )
+            rubrica_values = [{'nivel': r['Nivel'], 'valor': float(r['Valor (%)']), 'descripcion': str(r['Descripción']).strip()}
+                              for _, r in rub_edit.iterrows()]
+            vals = [r['valor'] for r in rubrica_values]
+            if any(b < a for a, b in zip(vals, vals[1:])):
+                st.warning("⚠️ Los valores deberían ir de menor a mayor (No presentó ≤ En proceso ≤ Suficiente ≤ Dominio).")
 
         with tab_tasks:
             st.markdown("##### 📌 Criterios de Calificación por Tipo de Tarea")
@@ -4470,7 +4530,8 @@ def render_admin():
                     },
                     'task_criteria': current_task_criteria,
                     'componentes': {k: float(v) for k, v in comp_values.items()},
-                    'asistencia_minima': float(sel_asist_min)
+                    'asistencia_minima': float(sel_asist_min),
+                    'rubrica_evidencias': rubrica_values
                 }
 
                 level, message = save_teacher_criterios(teacher_folder_id, updated_criterios)
@@ -4503,6 +4564,7 @@ def render_admin():
         current_task_criteria = {t: saved_task_criteria.get(t, get_default_criteria_config([t])[t]) for t in unique_task_types}
         comp_values = {k: float(v) for k, v in {**DEFAULT_COMPONENTES, **(criterios_data.get('componentes') or {})}.items()}
         sel_asist_min = float(criterios_data.get('asistencia_minima', 80))
+        rubrica_values = criterios_data.get('rubrica_evidencias') or default_rubrica()
 
     show_files = (section == NAV_AJUSTES and ajustes_sub == AJ_ARCHIVOS) or (raw_khan.empty and section == NAV_INICIO)
     if show_files:
@@ -4635,7 +4697,8 @@ def render_admin():
         },
         'task_criteria': current_task_criteria,
         'componentes': {k: float(v) for k, v in comp_values.items()},
-        'asistencia_minima': float(sel_asist_min)
+        'asistencia_minima': float(sel_asist_min),
+        'rubrica_evidencias': rubrica_values
     }
     active_criteria_config = khan_view_config(active_criteria_config)
 
