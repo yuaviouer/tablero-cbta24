@@ -44,5 +44,10 @@ credenciales de alumnos al repositorio).
   - `vinculos_khan.xlsx` (opcional): qué cuenta de Khan corresponde a cada alumno de la lista.
     Las coincidencias exactas de nombre se vinculan solas.
 
-  Ambos archivos se pueden abrir y corregir con Google Sheets, pero deben conservar el
+  - `evidencias.xlsx`, `calificaciones_parcial.xlsx` y `asistencia.xlsx` (opcionales, pestaña
+    **Evaluación del parcial**): sellos de evidencia por bloque, examen y producto del parcial,
+    y pase de lista. Los pesos de cada componente y la asistencia mínima se configuran en
+    **Configuración → Componentes y asistencia** y se guardan en `criterios.json`.
+
+  Estos archivos se pueden abrir y corregir con Google Sheets, pero deben conservar el
   formato `.xlsx` y su nombre (no "Guardar como Hojas de cálculo de Google").
