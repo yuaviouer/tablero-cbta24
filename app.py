@@ -701,7 +701,8 @@ def save_teacher_criterios(folder_id, criterios_dict):
         except Exception as e:
             result = ('error', f"Error inesperado al guardar criterios.json en Google Drive: {e}")
 
-    st.cache_data.clear()
+    # Solo se recarga la configuración (no los reportes ni las listas, que no cambiaron)
+    load_teacher_criterios.clear()
     return result
 
 
@@ -712,10 +713,13 @@ def set_flash(level, message):
 
 def show_flash():
     """Muestra (una sola vez) el mensaje pendiente guardado con set_flash."""
+    # El contenedor se crea siempre (aunque no haya mensaje) para que los elementos de abajo no cambien de
+    # posición entre recargas: si se movieran, Streamlit regresaría las pestañas abiertas a la primera.
+    box = st.container()
     flash = st.session_state.pop('_flash', None)
     if flash:
         level, message = flash
-        getattr(st, level, st.info)(message)
+        getattr(box, level, box.info)(message)
 
 
 # Prefijos de las claves de widgets del panel de configuración. Se borran al guardar o
@@ -4758,7 +4762,8 @@ def render_group_criteria(folder_id, criterios, groups):
         return
 
     scale = int(criterios.get('escala_maxima', 10))
-    grupos = {k: dict(v) for k, v in (criterios.get('grupos') or {}).items()}
+    # Copia independiente: los cambios no deben tocar la configuración en memoria hasta guardarse
+    grupos = json.loads(json.dumps(criterios.get('grupos') or {}, default=str))
     c1, c2 = st.columns(2)
     with c1:
         grupo = st.selectbox("Grupo:", groups, key="grp_sel")
@@ -4826,7 +4831,10 @@ def render_group_criteria(folder_id, criterios, groups):
                               'thresholds': base_view.get('thresholds')})
                 g.setdefault('parciales', {})[parcial] = values
             grupos[grupo] = g
-            level, message = save_teacher_criterios(folder_id, {**criterios, 'criterios_por_grupo': True, 'grupos': grupos})
+            try:
+                level, message = save_teacher_criterios(folder_id, {**criterios, 'criterios_por_grupo': True, 'grupos': grupos})
+            except Exception as e:
+                level, message = 'error', f"No se pudieron guardar los criterios de {grupo}: {e}"
             set_flash(level, message if level != 'success' else f"✅ Criterios de {grupo} guardados" + (f" para {parcial}." if parcial else "."))
             st.rerun()
     with b2:
