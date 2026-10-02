@@ -474,7 +474,9 @@ def get_default_teacher_criterios(unique_task_types=None, scale=10):
         'task_criteria': get_default_criteria_config(unique_task_types),
         'componentes': dict(DEFAULT_COMPONENTES),
         'asistencia_minima': 80,
-        'rubrica_evidencias': default_rubrica()
+        'rubrica_evidencias': default_rubrica(),
+        'criterios_por_grupo': False,
+        'grupos': {}
     }
 
 
@@ -507,6 +509,47 @@ def khan_view_config(cfg):
     if not uses_components(cfg):
         return cfg
     return {**cfg, 'peso_khan': 100, 'peso_khan_final': khan_weight(cfg)}
+
+
+def group_overrides(cfg, grupo, parcial=None):
+    """Criterios propios guardados para el grupo (y el parcial), o None si usa los generales."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    if not cfg.get('criterios_por_grupo') or not grupo:
+        return None
+    over = (cfg.get('grupos') or {}).get(str(grupo))
+    if not over:
+        return None
+    p_over = (over.get('parciales') or {}).get(parcial) if parcial else None
+    return {
+        'peso_khan': float((p_over or over).get('peso_khan', over.get('peso_khan', 100))),
+        'componentes': {**DEFAULT_COMPONENTES, **((p_over or over).get('componentes') or over.get('componentes') or {})},
+        'thresholds': over.get('thresholds'),
+        'del_parcial': bool(p_over),
+    }
+
+
+def group_config(cfg, grupo=None, parcial=None):
+    """
+    Criterios que aplican a un grupo (y parcial) cuando el docente los define por grupo: peso de Khan,
+    componentes y umbrales de clasificación. La escala, las fechas, la asistencia mínima y la rúbrica
+    son las mismas para todos. Regresa la configuración en formato de vista (ver khan_view_config).
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    over = group_overrides(cfg, grupo, parcial)
+    if not over:
+        return cfg
+    base = {k: v for k, v in cfg.items() if k != 'peso_khan_final'}
+    base['peso_khan'] = over['peso_khan']
+    base['componentes'] = over['componentes']
+    if over['thresholds']:
+        base['thresholds'] = {**(cfg.get('thresholds') or {}), **over['thresholds']}
+    return khan_view_config(base)
+
+
+def classify_for(score, cfg, grupo=None):
+    """Clasificación con los umbrales del grupo (si tiene criterios propios)."""
+    g_cfg = group_config(cfg, grupo)
+    return classify_student(score, g_cfg.get('thresholds', {}), g_cfg.get('escala_maxima', 10))
 
 
 @st.cache_data(ttl=3600)
@@ -549,7 +592,9 @@ def load_teacher_criterios(folder_id, unique_task_types=None):
                         'task_criteria': merged_tasks,
                         'componentes': {**DEFAULT_COMPONENTES, **(saved.get('componentes') or {})},
                         'asistencia_minima': float(saved.get('asistencia_minima', 80)),
-                        'rubrica_evidencias': saved.get('rubrica_evidencias') or default_rubrica()
+                        'rubrica_evidencias': saved.get('rubrica_evidencias') or default_rubrica(),
+                        'criterios_por_grupo': bool(saved.get('criterios_por_grupo', False)),
+                        'grupos': saved.get('grupos') if isinstance(saved.get('grupos'), dict) else {}
                     }
         except Exception as e:
             st.warning(f"No se pudo leer criterios.json desde Google Drive (se usarán valores por defecto): {e}")
@@ -580,7 +625,9 @@ def load_teacher_criterios(folder_id, unique_task_types=None):
                 'task_criteria': merged_tasks,
                 'componentes': {**DEFAULT_COMPONENTES, **(saved.get('componentes') or {})},
                 'asistencia_minima': float(saved.get('asistencia_minima', 80)),
-                'rubrica_evidencias': saved.get('rubrica_evidencias') or default_rubrica()
+                'rubrica_evidencias': saved.get('rubrica_evidencias') or default_rubrica(),
+                'criterios_por_grupo': bool(saved.get('criterios_por_grupo', False)),
+                'grupos': saved.get('grupos') if isinstance(saved.get('grupos'), dict) else {}
             }
         except Exception:
             pass
@@ -1512,9 +1559,18 @@ def compute_student_block_grades(assignments_df, criterios_config=None):
         not_evaluated=('status', lambda s: s.isin(NOT_EVALUATED_STATUSES).all() if len(s) > 0 else False)
     )
 
+    # Con criterios por grupo, el peso de Khan (cuando escala la calificación) puede variar por grupo y parcial
+    per_group = isinstance(criterios_config, dict) and criterios_config.get('criterios_por_grupo') and criterios_config.get('grupos')
+    has_parcial = 'Parcial' in assignments_df.columns
+
+    def row_weight(r):
+        if not per_group:
+            return weight
+        return float(group_config(criterios_config, r['Grupo'], r['parcial'] if has_parcial else None).get('peso_khan', weight))
+
     def calc_grade(r):
         if r['max_sum'] > 0:
-            raw_grade = (r['earned_sum'] / r['max_sum']) * scale * (weight / 100.0)
+            raw_grade = (r['earned_sum'] / r['max_sum']) * scale * (row_weight(r) / 100.0)
             return round(raw_grade, 1)
         elif r.get('not_evaluated', False):
             return float('nan')
@@ -2329,7 +2385,7 @@ def build_class_insights(tasks, block_summary, criteria_config):
             'Grupo': grupo,
             'Nombre del estudiante': nombre,
             'avg': avg,
-            'status': classify_student(avg, cfg.get('thresholds', {}), cfg.get('escala_maxima', 10)) if avg is not None else None,
+            'status': classify_for(avg, cfg, grupo) if avg is not None else None,
             'last': last,
             'prev_avg': prev_avg,
             'trend': trend,
@@ -2361,7 +2417,8 @@ def build_attention_lists(class_df, criteria_config, attendance=None):
             actions.append("Contactarlo (y a su familia si es necesario); verificar que pueda entrar a Khan Academy")
             severity += 3
         if r['status'] == 'En riesgo':
-            reasons.append(f"Promedio {r['avg']:.1f}, bajo el mínimo ({min_pass:g})")
+            g_min = float((group_config(cfg, r['Grupo']).get('thresholds') or {}).get('regular', min_pass))
+            reasons.append(f"Promedio {r['avg']:.1f}, bajo el mínimo ({g_min:g})")
             actions.append(f"Plática individual y plan para entregar sus {r['n_overdue']} atrasada(s)" if r['n_overdue'] else "Plática individual y seguimiento semanal")
             severity += 2
         if r['trend'] is not None and r['trend'] <= -1.5 * step:
@@ -3494,17 +3551,19 @@ def compute_components(roster, evid, extra, att, criteria_config, parcial):
     return out.reset_index()
 
 
-def compute_final_grades(components, khan_by_name, criteria_config):
+def compute_final_grades(components, khan_by_name, criteria_config, parcial=None):
     """
     Calificación del parcial = promedio ponderado de los componentes con registro.
     Khan se lleva a escala completa (sin el factor de ponderación) y se pondera con su peso.
+    Con criterios por grupo, cada alumno usa los pesos de su grupo (y del parcial, si se definieron).
     """
-    cfg = criteria_config or {}
-    scale = float(cfg.get('escala_maxima', 10))
-    peso_khan = khan_weight(cfg)
-    weights = {**DEFAULT_COMPONENTES, **(cfg.get('componentes') or {})}
+    base_cfg = criteria_config or {}
+    scale = float(base_cfg.get('escala_maxima', 10))
     rows = []
     for _, r in components.iterrows():
+        cfg = group_config(base_cfg, r['Grupo'], parcial)
+        peso_khan = khan_weight(cfg)
+        weights = {**DEFAULT_COMPONENTES, **(cfg.get('componentes') or {})}
         khan_full = khan_by_name.get(r['Nombre'])
         values = {
             'khan': (peso_khan, khan_full),
@@ -3544,7 +3603,7 @@ def _khan_avg_by_name(tasks, criteria_config, parcial):
     t = tasks[tasks['Parcial'] == parcial] if 'Parcial' in tasks.columns else tasks
     if t.empty:
         return {}
-    blocks = compute_student_block_grades(t, {**(criteria_config or {}), 'peso_khan': 100})
+    blocks = compute_student_block_grades(t, {**(criteria_config or {}), 'peso_khan': 100, 'criterios_por_grupo': False})
     return blocks.dropna(subset=['block_grade']).groupby('Nombre del estudiante')['block_grade'].mean().to_dict()
 
 
@@ -3681,12 +3740,12 @@ def render_extra_section(folder_id, roster, criteria_config):
     """Calificaciones de examen y producto del parcial."""
     cfg = criteria_config or {}
     scale = int(cfg.get('escala_maxima', 10))
-    weights = {**DEFAULT_COMPONENTES, **(cfg.get('componentes') or {})}
     _show_pending_upload("dl_pending_extra")
     if _needs_roster(roster):
         return
     _, extra, _ = load_eval_tables(folder_id)
     grupo, parcial, students = _eval_selectors(roster, cfg, "extra")
+    weights = {**DEFAULT_COMPONENTES, **(group_config(cfg, grupo, parcial).get('componentes') or {})}
     off = [l for k, l in [('examen', '📝 Examen'), ('producto', '📦 Producto del parcial')] if not weights.get(k)]
     if off:
         st.caption("⚠️ " + " y ".join(off) + " tiene(n) peso 0% en ⚙️ Ajustes: puedes registrar, pero no cuenta(n) en la calificación final.")
@@ -3716,21 +3775,27 @@ def render_extra_section(folder_id, roster, criteria_config):
 
 def render_final_section(folder_id, roster, tasks, criteria_config):
     """Calificación final del parcial ponderada por componentes."""
-    cfg = criteria_config or {}
-    scale = int(cfg.get('escala_maxima', 10))
-    weights = {**DEFAULT_COMPONENTES, **(cfg.get('componentes') or {})}
+    base_cfg = criteria_config or {}
+    scale = int(base_cfg.get('escala_maxima', 10))
     if _needs_roster(roster):
         return
     evid, extra, att = load_eval_tables(folder_id)
-    grupo, parcial, students = _eval_selectors(roster, cfg, "final")
+    grupo, parcial, students = _eval_selectors(roster, base_cfg, "final")
+    cfg = group_config(base_cfg, grupo, parcial)
+    weights = {**DEFAULT_COMPONENTES, **(cfg.get('componentes') or {})}
     total_w = khan_weight(cfg) + sum(float(v) for v in weights.values())
     parts = [f"Khan {khan_weight(cfg):g}%"] + [f"{l.split(' ', 1)[1]} {float(weights[k]):g}%" for k, l in COMPONENTES if float(weights[k])]
-    st.caption("Ponderación: " + " + ".join(parts) + ". Si a un alumno le falta algún componente, su calificación se calcula "
+    origin = ""
+    if base_cfg.get('criterios_por_grupo'):
+        over = group_overrides(base_cfg, grupo, parcial)
+        origin = (f" (acordada con {grupo} para {parcial})" if over and over['del_parcial'] else
+                  f" (acordada con {grupo})" if over else " (criterios generales)")
+    st.caption("Ponderación" + origin + ": " + " + ".join(parts) + ". Si a un alumno le falta algún componente, su calificación se calcula "
                "con lo registrado y el faltante aparece en **Pendiente**.")
     if abs(total_w - 100) > 0.01:
         st.warning(f"⚠️ Los pesos suman {total_w:g}%. Ajústalos en ⚙️ Ajustes → Criterios y componentes.")
     comps = compute_components(students, evid, extra, att, cfg, parcial)
-    final = compute_final_grades(comps, _khan_avg_by_name(tasks, cfg, parcial), cfg)
+    final = compute_final_grades(comps, _khan_avg_by_name(tasks, cfg, parcial), base_cfg, parcial)
     if final.empty:
         st.info("Sin alumnos en este grupo.")
         return
@@ -3776,12 +3841,14 @@ def evidence_opportunities(ctx, student_id, criteria_config, parcial):
     cfg = criteria_config or {}
     roster, evid, extra, att, tasks = ctx['roster'], ctx['evid'], ctx['extra'], ctx['att'], ctx['tasks']
     me = roster[roster['ID'] == student_id]
+    if not me.empty:
+        cfg = group_config(cfg, me.iloc[0]['Grupo'], parcial)
     if me.empty or evid is None or evid.empty or float((cfg.get('componentes') or {}).get('evidencias', 0)) <= 0:
         return None
     khan = _khan_avg_by_name(tasks, cfg, parcial)
 
     def final_with(ev):
-        return compute_final_grades(compute_components(me, ev, extra, att, cfg, parcial), khan, cfg).iloc[0]['Final']
+        return compute_final_grades(compute_components(me, ev, extra, att, cfg, parcial), khan, cfg, parcial).iloc[0]['Final']
 
     mine = evid[(evid['ID alumno'] == student_id) & (evid['Fecha bloque'].apply(lambda d: parcial_of(d, cfg)) == parcial)]
     pct_map = evid_pct_map(cfg)
@@ -3836,8 +3903,10 @@ def render_student_evaluation(ctx, student_id, criteria_config, key_prefix):
         return
     cur = current_parcial(cfg)
     parcial = st.selectbox("Parcial:", PARCIALES, index=PARCIALES.index(cur), key=f"{key_prefix}_my_eval_parcial")
+    cfg = group_config(cfg, me.iloc[0]['Grupo'], parcial)
+    weights = {**DEFAULT_COMPONENTES, **(cfg.get('componentes') or {})}
     comps = compute_components(me, evid, extra, att, cfg, parcial)
-    final = compute_final_grades(comps, _khan_avg_by_name(tasks, cfg, parcial), cfg).iloc[0]
+    final = compute_final_grades(comps, _khan_avg_by_name(tasks, cfg, parcial), cfg, parcial).iloc[0]
 
     peso_khan = khan_weight(cfg)
     items = [("🎓 Khan Academy", peso_khan, final['Khan'])]
@@ -4076,14 +4145,15 @@ def subject_student_summary(subject, groups, parcial):
     finals = {}
     # En un parcial concreto se usa la calificación del parcial (con evidencias, examen, etc.);
     # en "Todo el semestre", el promedio de Khan, que es lo único comparable entre parciales.
-    if parcial and uses_components(cfg) and not roster.empty:
+    uses_any = uses_components(cfg) or any(uses_components(group_config(cfg, g, parcial)) for g in roster['Grupo'].unique())
+    if parcial and uses_any and not roster.empty:
         p_eval = parcial
         comps = compute_components(roster, evid, extra, att, cfg, p_eval)
         khan_names = {}
         if not raw.empty:
             g_all = assign_parciales_vectorized(apply_dynamic_grading(raw.copy(), cfg), cfg)
             khan_names = _khan_avg_by_name(g_all, cfg, p_eval)
-        fin = compute_final_grades(comps, khan_names, cfg)
+        fin = compute_final_grades(comps, khan_names, cfg, p_eval)
         finals = dict(zip(fin['Nombre'], fin['Final']))
 
     out = []
@@ -4093,7 +4163,7 @@ def subject_student_summary(subject, groups, parcial):
         out.append({
             'Grupo': g, 'Nombre': n, 'Materia': subject['materia'], 'Docente': subject['docente'], 'Correo': subject['email'],
             'Promedio': round(value, 1) if value is not None and not pd.isna(value) else None,
-            'Estatus': classify_student(value, cfg.get('thresholds', {}), scale) if value is not None and not pd.isna(value) else 'Sin datos',
+            'Estatus': classify_for(value, cfg, g) if value is not None and not pd.isna(value) else 'Sin datos',
             'Atrasadas': r['Atrasadas'],
             'Asistencia %': round(att_map[n]) if n in att_map else None,
             'Asistencia mínima': float(cfg.get('asistencia_minima', 80)),
@@ -4380,11 +4450,13 @@ def student_parcial_value(eval_ctx, student_id, tasks, criteria_config, parcial)
     """Calificación del parcial hasta hoy: la final (con componentes) si el docente los usa, si no el promedio de Khan."""
     cfg = criteria_config or {}
     roster = (eval_ctx or {}).get('roster')
+    if roster is not None and not roster.empty and student_id in set(roster['ID']):
+        cfg = group_config(cfg, roster.set_index('ID').at[student_id, 'Grupo'], parcial)
     if uses_components(cfg) and roster is not None and not roster.empty and student_id in set(roster['ID']):
         comps = compute_components(roster[roster['ID'] == student_id], eval_ctx['evid'], eval_ctx['extra'], eval_ctx['att'], cfg, parcial)
         name = roster.set_index('ID').at[student_id, 'Nombre']
         khan = _khan_avg_by_name(tasks.assign(**{'Nombre del estudiante': name}), cfg, parcial)
-        fin = compute_final_grades(comps, khan, cfg)
+        fin = compute_final_grades(comps, khan, cfg, parcial)
         if not fin.empty and fin.iloc[0]['Final'] is not None and pd.notna(fin.iloc[0]['Final']):
             return float(fin.iloc[0]['Final'])
         return None
@@ -4641,6 +4713,137 @@ def subject_report_pdf(student, group, asignatura, teacher_name, tasks, criteria
                            + (f" Su plan: {goal['plan']}" if goal.get('plan') else "")))
     paragraphs.append(("Mensaje del docente", build_student_message(ins, student, asignatura, teacher_name, 'familia')))
     return build_report_pdf(student, group, f"{asignatura} - Docente: {teacher_name}", tables, paragraphs)
+
+
+def _group_criteria_rows(criterios, groups):
+    """Resumen de los criterios que usa cada grupo en cada parcial."""
+    view = khan_view_config(criterios)
+    rows = []
+    for g in groups:
+        for p in PARCIALES:
+            over = group_overrides(criterios, g, p)
+            cfg = group_config(view, g, p)
+            w = {**DEFAULT_COMPONENTES, **(cfg.get('componentes') or {})}
+            rows.append({'Grupo': g, 'Parcial': p,
+                         'Origen': ("Propios del parcial" if over and over['del_parcial'] else "Propios del grupo" if over else "Generales"),
+                         'Khan %': khan_weight(cfg), 'Evidencias %': w['evidencias'], 'Examen %': w['examen'],
+                         'Producto %': w['producto'], 'Asistencia %': w['asistencia'],
+                         'En riesgo si es menor a': float((cfg.get('thresholds') or {}).get('regular', 6))})
+    return pd.DataFrame(rows)
+
+
+def render_group_criteria(folder_id, criterios, groups):
+    """Ajustes → Criterios → 👥 Por grupo: pesos y clasificación acordados con cada grupo."""
+    st.markdown("##### 👥 Criterios por grupo")
+    st.caption("Si acuerdas la forma de evaluar con cada grupo, aquí defines el peso de Khan, los componentes del parcial y "
+               "la clasificación de cada uno. La escala, las fechas de los parciales, los criterios por tipo de tarea, la "
+               "asistencia mínima y la rúbrica de evidencias son las mismas para todos tus grupos.")
+    modes = ["Los mismos criterios para todos mis grupos", "Criterios diferentes para cada grupo"]
+    saved_on = bool(criterios.get('criterios_por_grupo'))
+    mode = st.radio("¿Cómo evalúas a tus grupos?", modes, index=1 if saved_on else 0, key="grp_mode")
+    want_on = mode == modes[1]
+    if want_on != saved_on:
+        msg = ("Al activarlo, cada grupo usará los criterios que le definas abajo (los que no tengan, usan los generales)."
+               if want_on else "Al desactivarlo, todos los grupos usarán los criterios generales. Los criterios por grupo "
+               "se conservan guardados por si vuelves a activarlos.")
+        st.info(msg)
+        if st.button("💾 Guardar este cambio", type="primary", key="save_grp_mode"):
+            level, message = save_teacher_criterios(folder_id, {**criterios, 'criterios_por_grupo': want_on})
+            set_flash(level, message)
+            st.rerun()
+    if not want_on:
+        return
+    if not groups:
+        st.info("Aún no hay grupos: sube tus reportes de Khan Academy o tu lista de alumnos.")
+        return
+
+    scale = int(criterios.get('escala_maxima', 10))
+    grupos = {k: dict(v) for k, v in (criterios.get('grupos') or {}).items()}
+    c1, c2 = st.columns(2)
+    with c1:
+        grupo = st.selectbox("Grupo:", groups, key="grp_sel")
+    with c2:
+        scopes = ["Todo el semestre"] + [f"Solo {p}" for p in PARCIALES]
+        scope = st.selectbox("Aplica a:", scopes, key="grp_scope",
+                             help="Si a partir de un parcial cambian los acuerdos, guárdalos solo para ese parcial: así no "
+                                  "cambian las calificaciones de los parciales anteriores.")
+    parcial = None if scope == scopes[0] else scope.replace("Solo ", "")
+    over = group_overrides(criterios, grupo, parcial)
+    cur = group_config(khan_view_config({**criterios, 'criterios_por_grupo': True}), grupo, parcial)
+    cur_w = {**DEFAULT_COMPONENTES, **(cur.get('componentes') or {})}
+    if over and (over['del_parcial'] or parcial is None):
+        st.caption(f"✏️ {grupo} ya tiene criterios propios" + (f" para {parcial}." if parcial else "."))
+    else:
+        st.caption(f"Ahora {grupo} usa los criterios " + ("de su grupo para todo el semestre." if over else "generales.")
+                   + " Ajusta y guarda para definir los suyos.")
+
+    k = f"grpc_{grupo}_{scope}"
+    cols = st.columns(len(COMPONENTES) + 1)
+    with cols[0]:
+        peso = st.number_input("🎓 Khan (%)", 0, 100, int(khan_weight(cur)), 5, key=f"{k}_khan")
+    comp = {}
+    for col, (ckey, clabel) in zip(cols[1:], COMPONENTES):
+        with col:
+            comp[ckey] = st.number_input(f"{clabel} (%)", 0, 100, int(float(cur_w.get(ckey, 0))), 5, key=f"{k}_{ckey}")
+    total = peso + sum(comp.values())
+    parts = [f"Khan {peso}%"] + [f"{lbl.split(' ', 1)[1]} {comp[c]}%" for c, lbl in COMPONENTES if comp[c]]
+    if total == 100:
+        st.success("✅ " + " + ".join(parts) + " = 100%")
+    else:
+        st.warning("⚠️ " + " + ".join(parts) + f" = **{total}%**. Deben sumar 100%.")
+
+    th = None
+    if parcial is None:
+        cur_th = cur.get('thresholds') or {}
+        step = 0.5 if scale == 10 else 1.0
+        t1, t2, t3 = st.columns(3)
+        with t1:
+            exc = st.number_input("🌟 'Excelente' (mínimo)", 0.0, float(scale), float(cur_th.get('excelente', 9.5)), step, key=f"{k}_exc")
+        with t2:
+            bien = st.number_input("👍 'Bien' (mínimo)", 0.0, float(scale), float(cur_th.get('bien', 8.0)), step, key=f"{k}_bien")
+        with t3:
+            reg = st.number_input("👌 'Regular' (mínimo)", 0.0, float(scale), float(cur_th.get('regular', 6.0)), step, key=f"{k}_reg")
+        th = {'excelente': exc, 'bien': bien, 'regular': reg, 'en_riesgo': reg}
+        if not (exc >= bien >= reg):
+            st.warning("⚠️ Los umbrales deben ir de mayor a menor: Excelente ≥ Bien ≥ Regular.")
+    else:
+        st.caption("La clasificación (Excelente, Bien, Regular) se define para todo el semestre del grupo.")
+
+    b1, b2 = st.columns(2)
+    with b1:
+        label = f"💾 Guardar criterios de {grupo}" + (f" ({parcial})" if parcial else "")
+        if st.button(label, type="primary", width='stretch', disabled=(total != 100), key=f"{k}_save"):
+            g = grupos.get(grupo) or {}
+            values = {'peso_khan': float(peso), 'componentes': {c: float(v) for c, v in comp.items()}}
+            if parcial is None:
+                g.update(values)
+                g['thresholds'] = th
+            else:
+                if 'peso_khan' not in g:
+                    # Primer acuerdo del grupo solo para un parcial: el resto del semestre sigue con los generales
+                    base_view = khan_view_config({k2: v for k2, v in criterios.items() if k2 != 'grupos'})
+                    g.update({'peso_khan': khan_weight(base_view), 'componentes': dict(base_view.get('componentes') or {}),
+                              'thresholds': base_view.get('thresholds')})
+                g.setdefault('parciales', {})[parcial] = values
+            grupos[grupo] = g
+            level, message = save_teacher_criterios(folder_id, {**criterios, 'criterios_por_grupo': True, 'grupos': grupos})
+            set_flash(level, message if level != 'success' else f"✅ Criterios de {grupo} guardados" + (f" para {parcial}." if parcial else "."))
+            st.rerun()
+    with b2:
+        can_reset = bool(over) and (parcial is None or over['del_parcial'])
+        reset_label = f"↩️ Quitar lo de {parcial}" if parcial else f"↩️ {grupo} usa los criterios generales"
+        if st.button(reset_label, width='stretch', disabled=not can_reset, key=f"{k}_reset"):
+            if parcial:
+                grupos[grupo].get('parciales', {}).pop(parcial, None)
+            else:
+                grupos.pop(grupo, None)
+            level, message = save_teacher_criterios(folder_id, {**criterios, 'criterios_por_grupo': True, 'grupos': grupos})
+            set_flash(level, message)
+            st.rerun()
+
+    st.markdown("###### Resumen de criterios por grupo y parcial")
+    st.dataframe(_group_criteria_rows(criterios, groups), hide_index=True, width='stretch')
+
 
 
 # ==============================================================================
@@ -4968,9 +5171,19 @@ def render_admin():
     if show_config:
         st.caption("Configura de forma persistente e independiente para tu materia la escala máxima, el peso de Khan Academy, los periodos de parciales, los umbrales de rendimiento y los criterios por actividad en tu Google Drive.")
 
-        tab_gral, tab_parciales, tab_tasks, tab_comp = st.tabs(["🎯 Escala, Peso y Clasificación", "📅 Fechas de Parciales", "📌 Criterios por Tipo de Tarea", "🧮 Componentes y asistencia"])
+        tab_gral, tab_parciales, tab_tasks, tab_comp, tab_grupos = st.tabs(["🎯 Escala, Peso y Clasificación", "📅 Fechas de Parciales", "📌 Criterios por Tipo de Tarea", "🧮 Componentes y asistencia", "👥 Por grupo"])
+        per_group_on = bool(criterios_data.get('criterios_por_grupo'))
+        general_note = ("👥 Tienes activados los **criterios por grupo**: estos valores son los **generales**, que se usan en los "
+                        "grupos a los que no les hayas definido criterios propios (pestaña **👥 Por grupo**).")
+
+        with tab_grupos:
+            config_groups = sorted({g for g in list(raw_assignments['Grupo'].dropna().unique() if not raw_assignments.empty else [])
+                                    + list(roster['Grupo'].unique() if not roster.empty else []) if g})
+            render_group_criteria(teacher_folder_id, criterios_data, config_groups)
 
         with tab_gral:
+            if per_group_on:
+                st.info(general_note)
             st.markdown("##### 📏 Escala de Calificación y Ponderación")
             cg1, cg2 = st.columns(2)
             with cg1:
@@ -5094,6 +5307,8 @@ def render_admin():
 
         with tab_comp:
             st.markdown("##### 🧮 Componentes de la calificación del parcial")
+            if per_group_on:
+                st.info(general_note)
             st.caption("Además de Khan Academy, puedes evaluar otros componentes. Los pesos deben sumar 100%. "
                        "Deja en 0% los que no uses. Las evidencias, el examen, el producto y la asistencia se registran "
                        "en las secciones **🙋 Pase de lista** y **📓 Evaluar** (requiere tu lista oficial de alumnos).")
@@ -5227,7 +5442,10 @@ def render_admin():
                     'task_criteria': current_task_criteria,
                     'componentes': {k: float(v) for k, v in comp_values.items()},
                     'asistencia_minima': float(sel_asist_min),
-                    'rubrica_evidencias': rubrica_values
+                    'rubrica_evidencias': rubrica_values,
+                    # Los criterios por grupo se editan en su propia pestaña; aquí se conservan tal cual
+                    'criterios_por_grupo': bool(criterios_data.get('criterios_por_grupo', False)),
+                    'grupos': criterios_data.get('grupos') or {}
                 }
 
                 level, message = save_teacher_criterios(teacher_folder_id, updated_criterios)
@@ -5238,6 +5456,9 @@ def render_admin():
         with b_col2:
             if st.button("🔄 Restablecer Predeterminados", width='stretch', key="reset_teacher_crit_btn"):
                 def_crit = get_default_teacher_criterios(unique_task_types, scale=sel_scale)
+                # Los criterios acordados con cada grupo no se borran al restablecer los generales
+                def_crit['criterios_por_grupo'] = bool(criterios_data.get('criterios_por_grupo', False))
+                def_crit['grupos'] = criterios_data.get('grupos') or {}
                 level, message = save_teacher_criterios(teacher_folder_id, def_crit)
                 reset_config_widgets()
                 if level == 'success':
@@ -5396,7 +5617,9 @@ def render_admin():
         'task_criteria': current_task_criteria,
         'componentes': {k: float(v) for k, v in comp_values.items()},
         'asistencia_minima': float(sel_asist_min),
-        'rubrica_evidencias': rubrica_values
+        'rubrica_evidencias': rubrica_values,
+        'criterios_por_grupo': bool(criterios_data.get('criterios_por_grupo', False)),
+        'grupos': criterios_data.get('grupos') or {}
     }
     active_criteria_config = khan_view_config(active_criteria_config)
 
@@ -5495,9 +5718,7 @@ def render_admin():
     pivot_df['Promedio General'] = numeric_only.mean(axis=1, skipna=True).round(1).fillna(0.0)
 
     # Clasificación de rendimiento (Estatus) usando la escala y umbrales configurados
-    pivot_df['Estatus'] = pivot_df['Promedio General'].apply(
-        lambda s: classify_student(s, active_criteria_config['thresholds'], active_criteria_config['escala_maxima'])
-    )
+    pivot_df['Estatus'] = [classify_for(s, active_criteria_config, g) for s, g in zip(pivot_df['Promedio General'], pivot_df['Grupo'])]
 
     # Organizar columnas: 'Estatus' al lado del nombre del estudiante
     column_arrangement = ['Grupo', 'Nombre del estudiante', 'Estatus'] + existing_date_cols + ['Promedio General']
@@ -5674,12 +5895,14 @@ def render_admin():
 
         student_tasks_data = assignments_tagged[assignments_tagged['Nombre del estudiante'] == selected_student].copy()
         student_group = student_tasks_data['Grupo'].iloc[0] if not student_tasks_data.empty else "N/A"
+        # Criterios del grupo del alumno (si el docente los define por grupo)
+        drill_cfg = group_config(active_criteria_config, student_group)
 
         # Calcular promedio del estudiante en todos los bloques (omitiendo futuros)
-        st_blocks = compute_student_block_grades(student_tasks_data, active_criteria_config)
+        st_blocks = compute_student_block_grades(student_tasks_data, drill_cfg)
         valid_st_blocks = st_blocks['block_grade'].dropna()
         st_avg = valid_st_blocks.mean() if not valid_st_blocks.empty else 0.0
-        st_estatus = classify_student(st_avg, active_criteria_config['thresholds'], active_criteria_config['escala_maxima'])
+        st_estatus = classify_student(st_avg, drill_cfg['thresholds'], drill_cfg['escala_maxima'])
 
         with drill_col2:
             st.write("")
@@ -5700,7 +5923,7 @@ def render_admin():
             help="Texto listo para copiar y enviar. Revísalo y ajústalo antes de mandarlo."
         )
         if not student_tasks_data.empty:
-            msg_ins = build_student_insights(student_tasks_data, active_criteria_config)
+            msg_ins = build_student_insights(student_tasks_data, drill_cfg)
             msg_text = build_student_message(
                 msg_ins, selected_student, asignatura, teacher_name,
                 'alumno' if msg_audience == "El alumno" else 'familia'
@@ -5710,7 +5933,7 @@ def render_admin():
         # Metas, dominio por tema y reporte imprimible para la familia
         sel_ids = roster.loc[roster['Nombre'] == selected_student, 'ID'] if not roster.empty else pd.Series(dtype=str)
         sel_id = sel_ids.iloc[0] if not sel_ids.empty else None
-        p_now = current_parcial(active_criteria_config)
+        p_now = current_parcial(drill_cfg)
         goal = student_goal(load_goals(teacher_folder_id), sel_id, p_now)
         topics_map = load_topics_map(teacher_folder_id)
         mastery = topic_mastery(student_tasks_data, topics_map)
@@ -5720,14 +5943,14 @@ def render_admin():
             st.markdown("#### 📚 Dominio por tema")
             render_topic_bars(mastery)
         final_row = None
-        if uses_components(active_criteria_config) and sel_id:
-            comps = compute_components(roster[roster['ID'] == sel_id], eval_evid, eval_extra, eval_att, active_criteria_config, p_now)
-            fin = compute_final_grades(comps, _khan_avg_by_name(student_tasks_data, active_criteria_config, p_now), active_criteria_config)
+        if uses_components(group_config(drill_cfg, student_group, p_now)) and sel_id:
+            comps = compute_components(roster[roster['ID'] == sel_id], eval_evid, eval_extra, eval_att, drill_cfg, p_now)
+            fin = compute_final_grades(comps, _khan_avg_by_name(student_tasks_data, drill_cfg, p_now), drill_cfg, p_now)
             final_row = fin.iloc[0].to_dict() if not fin.empty else None
-        pdf_att = attendance_by_name(roster, eval_att, active_criteria_config, p_now).get(selected_student)
+        pdf_att = attendance_by_name(roster, eval_att, drill_cfg, p_now).get(selected_student)
         try:
             pdf_bytes = subject_report_pdf(selected_student, student_group, asignatura, teacher_name, student_tasks_data,
-                                           active_criteria_config, final_row, pdf_att, goal, mastery)
+                                           group_config(drill_cfg, student_group, p_now), final_row, pdf_att, goal, mastery)
             st.download_button("📄 Reporte de avance para la familia (PDF imprimible)", pdf_bytes,
                                file_name=f"Reporte_{re.sub(r'[^A-Za-z0-9]+', '_', str(selected_student))}.pdf",
                                mime="application/pdf", key="dl_student_pdf", width='stretch')
@@ -5818,7 +6041,7 @@ def render_admin():
         # Visualización complementaria: Dashboard idéntico con desglose por bloques y filtros
         with st.expander("👁️ Ver como alumno (vista previa de su portal, útil para explicarle su avance)", expanded=False):
             updated_at = student_tasks_data['Archivo_Modificado'].max() if 'Archivo_Modificado' in student_tasks_data.columns else None
-            render_student_experience(selected_student, student_tasks_data, active_criteria_config, key_prefix="admin", updated_at=updated_at,
+            render_student_experience(selected_student, student_tasks_data, drill_cfg, key_prefix="admin", updated_at=updated_at,
                                       eval_ctx={**eval_ctx, 'folder_id': teacher_folder_id}, student_id=sel_id)
 
 
@@ -5867,6 +6090,10 @@ def render_student():
     # CRÍTICO: Asignar Parciales vectorialmente comparando .dt.date contra datetime.date de criterios.json del docente
     student_tasks = assign_parciales_vectorized(student_tasks, criterios_data)
     student_group = student_tasks['Grupo'].iloc[0] if not student_tasks.empty else ""
+    if not student_group and student_id and not roster.empty and student_id in set(roster['ID']):
+        student_group = roster.set_index('ID').at[student_id, 'Grupo']
+    # Criterios acordados con su grupo (si el docente los define por grupo)
+    criterios_data = group_config(criterios_data, student_group)
 
     teacher_name = st.session_state.get('teacher_name', 'Docente')
     header_col1, header_col2 = st.columns([5, 1])
