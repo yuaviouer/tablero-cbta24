@@ -463,8 +463,20 @@ def get_default_teacher_criterios(unique_task_types=None, scale=10):
         'peso_khan': 100,
         'thresholds': thresh,
         'parciales': get_default_parciales_config(),
-        'task_criteria': get_default_criteria_config(unique_task_types)
+        'task_criteria': get_default_criteria_config(unique_task_types),
+        'componentes': dict(DEFAULT_COMPONENTES),
+        'asistencia_minima': 80
     }
+
+
+# Componentes adicionales de la calificación (además de Khan Academy, cuyo peso es 'peso_khan')
+COMPONENTES = [
+    ('evidencias', '📓 Evidencias (sellos)'),
+    ('examen', '📝 Examen'),
+    ('producto', '📦 Producto del parcial'),
+    ('asistencia', '🙋 Asistencia'),
+]
+DEFAULT_COMPONENTES = {k: 0 for k, _ in COMPONENTES}
 
 
 @st.cache_data(ttl=3600)
@@ -504,7 +516,9 @@ def load_teacher_criterios(folder_id, unique_task_types=None):
                         'peso_khan': peso,
                         'thresholds': thresholds,
                         'parciales': parciales,
-                        'task_criteria': merged_tasks
+                        'task_criteria': merged_tasks,
+                        'componentes': {**DEFAULT_COMPONENTES, **(saved.get('componentes') or {})},
+                        'asistencia_minima': float(saved.get('asistencia_minima', 80))
                     }
         except Exception as e:
             st.warning(f"No se pudo leer criterios.json desde Google Drive (se usarán valores por defecto): {e}")
@@ -532,7 +546,9 @@ def load_teacher_criterios(folder_id, unique_task_types=None):
                 'peso_khan': peso,
                 'thresholds': thresholds,
                 'parciales': parciales,
-                'task_criteria': merged_tasks
+                'task_criteria': merged_tasks,
+                'componentes': {**DEFAULT_COMPONENTES, **(saved.get('componentes') or {})},
+                'asistencia_minima': float(saved.get('asistencia_minima', 80))
             }
         except Exception:
             pass
@@ -2156,7 +2172,7 @@ def render_student_pending(ins, key_prefix):
         st.caption(f"📅 Próximamente: {len(scheduled)} actividad(es) programada(s). La siguiente se habilita el {format_short_date(next_start)}.")
 
 
-def render_student_experience(student_name, tasks, criteria_config, key_prefix="student", updated_at=None):
+def render_student_experience(student_name, tasks, criteria_config, key_prefix="student", updated_at=None, eval_ctx=None, student_id=None):
     """Vista completa del alumno. El docente la ve igual desde el drill-down (key_prefix='admin')."""
     if tasks.empty:
         st.info("Todavía no hay actividades registradas para ti en esta asignatura. Si crees que es un error, avísale a tu docente.")
@@ -2167,17 +2183,25 @@ def render_student_experience(student_name, tasks, criteria_config, key_prefix="
         st.caption(f"🔄 Datos actualizados al {format_short_date(updated_at)}. Lo que entregues después aparecerá cuando tu docente actualice los reportes de Khan Academy.")
 
     n_pend = len(ins['upcoming']) + len(ins['overdue'])
-    tab_home, tab_pend, tab_detail = st.tabs([
-        "🏠 Inicio",
-        f"📝 Pendientes ({n_pend})" if n_pend else "📝 Pendientes",
-        "📋 Mis calificaciones",
-    ])
-    with tab_home:
+    # Pestaña de evaluación del parcial: solo si el docente usa otros componentes o registró algo del alumno
+    cfg = criteria_config if isinstance(criteria_config, dict) else {}
+    show_eval = bool(eval_ctx) and bool(student_id) and (
+        any(float(v) > 0 for v in (cfg.get('componentes') or {}).values())
+        or any(not t.empty and (t['ID alumno'] == student_id).any() for t in (eval_ctx['evid'], eval_ctx['extra'], eval_ctx['att']))
+    )
+    tab_labels = ["🏠 Inicio", f"📝 Pendientes ({n_pend})" if n_pend else "📝 Pendientes", "📋 Mis calificaciones"]
+    if show_eval:
+        tab_labels.append("🧾 Mi evaluación")
+    tabs = st.tabs(tab_labels)
+    with tabs[0]:
         render_student_home(ins)
-    with tab_pend:
+    with tabs[1]:
         render_student_pending(ins, key_prefix)
-    with tab_detail:
+    with tabs[2]:
         render_student_dashboard(student_name, tasks, criteria_config=criteria_config, is_admin_drilldown=(key_prefix == 'admin'))
+    if show_eval:
+        with tabs[3]:
+            render_student_evaluation({**eval_ctx, 'tasks': tasks}, student_id, criteria_config, key_prefix)
 
 
 # ==============================================================================
@@ -2263,7 +2287,7 @@ def build_class_insights(tasks, block_summary, criteria_config):
     return pd.DataFrame(rows)
 
 
-def build_attention_lists(class_df, criteria_config):
+def build_attention_lists(class_df, criteria_config, attendance=None):
     """Aplica reglas simples y explicables para las listas de atención y reconocimiento."""
     cfg = criteria_config if isinstance(criteria_config, dict) else {}
     scale = int(cfg.get('escala_maxima', 10))
@@ -2293,6 +2317,16 @@ def build_attention_lists(class_df, criteria_config):
         if r['n_excess_attempts'] >= 2:
             reasons.append(f"Excede los intentos en {r['n_excess_attempts']} ejercicios")
             actions.append("Repasar el tema con él; posible dificultad de comprensión")
+            severity += 1
+        att_pct = (attendance or {}).get(r['Nombre del estudiante'])
+        min_att = float(cfg.get('asistencia_minima', 80))
+        if att_pct is not None and att_pct < min_att:
+            reasons.append(f"Asistencia de {att_pct:.0f}% (mínimo {min_att:g}%)")
+            actions.append("Avisar a su tutor(a) académico(a) y revisar justificantes")
+            severity += 3
+        elif att_pct is not None and att_pct < min_att + 5:
+            reasons.append(f"Asistencia de {att_pct:.0f}%, cerca del mínimo ({min_att:g}%)")
+            actions.append("Recordarle la importancia de asistir")
             severity += 1
         if reasons:
             attention.append({
@@ -2377,14 +2411,14 @@ def render_group_trend_chart(block_summary, tasks, criteria_config, color_map):
     st.altair_chart((rule + rule_text + line).properties(height=280), width='stretch')
 
 
-def render_teacher_summary(tasks, block_summary, criteria_config, color_map, asignatura="la materia"):
+def render_teacher_summary(tasks, block_summary, criteria_config, color_map, asignatura="la materia", attendance=None):
     """Pestaña 'Resumen y acciones' del panel docente."""
     cfg = criteria_config if isinstance(criteria_config, dict) else {}
     class_df = build_class_insights(tasks, block_summary, cfg)
     if class_df.empty:
         st.info("Aún no hay información suficiente para el resumen.")
         return
-    att_df, rec_df = build_attention_lists(class_df, cfg)
+    att_df, rec_df = build_attention_lists(class_df, cfg, attendance)
     scale = int(cfg.get('escala_maxima', 10))
     step = 1.0 if scale == 10 else 10.0
 
@@ -2763,7 +2797,16 @@ def _drive_ready(folder_id):
 
 @st.cache_data(ttl=600)
 def load_teacher_table(folder_id, filename):
-    """Lee una tabla (.xlsx) de la carpeta del docente en Drive, o de datos/ en modo local. Todo como texto."""
+    """Versión en caché de read_teacher_table (para mostrar datos sin consultar Drive en cada clic)."""
+    return read_teacher_table(folder_id, filename)
+
+
+def read_teacher_table(folder_id, filename):
+    """
+    Lee una tabla (.xlsx) de la carpeta del docente en Drive, o de datos/ en modo local. Todo como texto.
+    Antes de guardar siempre se usa esta lectura directa (sin caché), para no sobrescribir cambios
+    hechos a mano en el archivo o desde otro dispositivo.
+    """
     try:
         if _drive_ready(folder_id):
             service = get_drive_service()
@@ -3159,12 +3202,13 @@ def render_roster_tab(folder_id, raw_df, roster, links, carpeta_nombre):
                 seed = pd.DataFrame({'Nombre': acc['Cuenta de Khan'], 'Grupo': acc['Grupo Khan']})
                 seed['_t'] = seed['Nombre'].apply(name_tokens)
                 seed = seed.drop_duplicates(['_t', 'Grupo']).drop(columns='_t')
-                _finish_save([save_teacher_table(folder_id, ROSTER_FILE, merge_roster_upload(roster, seed), "Lista")])
+                current = normalize_roster(read_teacher_table(folder_id, ROSTER_FILE))
+                _finish_save([save_teacher_table(folder_id, ROSTER_FILE, merge_roster_upload(current, seed), "Lista")])
         up = st.file_uploader("Lista oficial (Excel o CSV)", type=["xlsx", "csv"], key="roster_upload")
         if up is not None and st.button(f"⬆️ Cargar '{up.name}'", type="primary", key="roster_upload_btn"):
             try:
                 new = pd.read_csv(up, dtype=str) if up.name.lower().endswith('.csv') else pd.read_excel(up, dtype=str)
-                merged = merge_roster_upload(roster, new)
+                merged = merge_roster_upload(normalize_roster(read_teacher_table(folder_id, ROSTER_FILE)), new)
                 _finish_save([save_teacher_table(folder_id, ROSTER_FILE, merged, "Lista")])
             except Exception as e:
                 st.error(f"No se pudo leer el archivo: {e}")
@@ -3197,7 +3241,7 @@ def render_roster_tab(folder_id, raw_df, roster, links, carpeta_nombre):
             )
             if st.button("💾 Guardar vínculos", type="primary", key="save_links_btn"):
                 label_to_id = {roster_label(r): r['ID'] for _, r in roster.iterrows()}
-                new_links = links.copy()
+                new_links = normalize_links(read_teacher_table(folder_id, LINKS_FILE))
                 for _, r in edited.iterrows():
                     key_mask = (new_links['Cuenta de Khan'] == r['Cuenta de Khan']) & (new_links['Grupo Khan'] == r['Grupo Khan'])
                     new_links = new_links[~key_mask]
@@ -3230,7 +3274,7 @@ def render_roster_tab(folder_id, raw_df, roster, links, carpeta_nombre):
     with p1:
         if st.button(f"🔑 Generar PIN a {n_without_pin} alumno(s) que no tienen" if n_without_pin else "🔑 Todos tienen PIN",
                      disabled=n_without_pin == 0, width='stretch', key="gen_pins_btn"):
-            updated, _ = generate_missing_pins(roster)
+            updated, _ = generate_missing_pins(normalize_roster(read_teacher_table(folder_id, ROSTER_FILE)))
             _finish_save([save_teacher_table(folder_id, ROSTER_FILE, updated, "Lista")])
     with p2:
         st.download_button("🖨️ Descargar fichas de acceso (Excel)", access_cards_bytes(roster),
@@ -3239,6 +3283,415 @@ def render_roster_tab(folder_id, raw_df, roster, links, carpeta_nombre):
                            disabled=(roster['PIN'] == '').all(), width='stretch', key="dl_access_cards")
     st.caption(f"Puedes corregir matrículas, nombres o PIN directamente en **{ROSTER_FILE}** dentro de tu carpeta "
                f"`{carpeta_nombre}` (se abre con Google Sheets); después presiona **Sincronizar**.")
+
+
+# ==============================================================================
+# FASE 5: EVIDENCIAS (SELLOS), EXAMEN, PRODUCTO, ASISTENCIA Y CALIFICACIÓN FINAL
+# ==============================================================================
+EVID_FILE = "evidencias.xlsx"
+EXTRA_FILE = "calificaciones_parcial.xlsx"
+ATT_FILE = "asistencia.xlsx"
+EVID_COLS = ['ID alumno', 'Grupo', 'Bloque', 'Fecha bloque', 'Nivel', 'Actualizado']
+EXTRA_COLS = ['ID alumno', 'Parcial', 'Componente', 'Calificación', 'Actualizado']
+ATT_COLS = ['ID alumno', 'Grupo', 'Fecha', 'Estado']
+
+# Rúbrica de evidencias: nivel -> porcentaje del componente
+EVID_LEVELS = [
+    ("0 · No presentó", 0, "Sin evidencia del procedimiento."),
+    ("1 · En proceso", 50, "Procedimiento incompleto o con errores de fondo. Puede volver a presentarlo."),
+    ("2 · Suficiente", 80, "Procedimiento correcto, pero le cuesta explicarlo."),
+    ("3 · Dominio", 100, "Procedimiento correcto y lo explica, o resuelve una variante en el momento."),
+]
+EVID_PCT = {lbl: pct for lbl, pct, _ in EVID_LEVELS}
+ATT_STATES = ["✅ Asistió", "⏰ Retardo", "📝 Justificada", "❌ Falta"]
+PARCIALES = ['Parcial 1', 'Parcial 2', 'Parcial 3']
+
+
+def _norm_table(df, cols):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+    df = df.copy()
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ''
+        df[c] = df[c].fillna('').astype(str).str.strip().replace({'nan': ''})
+    return df[cols]
+
+
+def load_eval_tables(folder_id):
+    return (_norm_table(load_teacher_table(folder_id, EVID_FILE), EVID_COLS),
+            _norm_table(load_teacher_table(folder_id, EXTRA_FILE), EXTRA_COLS),
+            _norm_table(load_teacher_table(folder_id, ATT_FILE), ATT_COLS))
+
+
+def fresh_table(folder_id, filename, cols):
+    """Lectura directa (sin caché) justo antes de guardar."""
+    return _norm_table(read_teacher_table(folder_id, filename), cols)
+
+
+def upsert_rows(table, new_rows, key_cols):
+    """Reemplaza las filas con las mismas llaves y agrega las nuevas."""
+    if new_rows.empty:
+        return table
+    keys_new = set(map(tuple, new_rows[key_cols].astype(str).values))
+    keep = ~table[key_cols].astype(str).apply(tuple, axis=1).isin(keys_new) if not table.empty else pd.Series([], dtype=bool)
+    return pd.concat([table[keep] if not table.empty else table, new_rows], ignore_index=True)
+
+
+def parcial_of(d, criteria_config):
+    """Parcial al que pertenece una fecha (date, Timestamp o 'YYYY-MM-DD')."""
+    try:
+        d = pd.to_datetime(d).date()
+    except Exception:
+        return None
+    for p_name, rng in parse_parciales_dates((criteria_config or {}).get('parciales', {})).items():
+        if rng['start'] <= d <= rng['end']:
+            return p_name
+    return None
+
+
+def current_parcial(criteria_config):
+    return parcial_of(now_local().date(), criteria_config) or 'Parcial 1'
+
+
+def compute_components(roster, evid, extra, att, criteria_config, parcial):
+    """Una fila por alumno de la lista con el valor de cada componente en el parcial (NaN = sin registro)."""
+    cfg = criteria_config or {}
+    scale = float(cfg.get('escala_maxima', 10))
+    out = roster[['ID', 'Nombre', 'Grupo']].copy().set_index('ID')
+
+    ev = evid.copy()
+    if not ev.empty:
+        ev['Parcial'] = ev['Fecha bloque'].apply(lambda d: parcial_of(d, cfg))
+        ev = ev[ev['Parcial'] == parcial]
+        ev['pct'] = ev['Nivel'].map(EVID_PCT)
+        g = ev.dropna(subset=['pct']).groupby('ID alumno')['pct']
+        out['Evidencias %'] = g.mean()
+        out['Bloques con evidencia'] = g.size()
+    else:
+        out['Evidencias %'] = float('nan')
+        out['Bloques con evidencia'] = 0
+    out['Bloques con evidencia'] = out['Bloques con evidencia'].fillna(0).astype(int)
+
+    for comp, label in [('examen', 'Examen'), ('producto', 'Producto')]:
+        rows = extra[(extra['Parcial'] == parcial) & (extra['Componente'] == comp)] if not extra.empty else extra
+        vals = pd.to_numeric(rows['Calificación'], errors='coerce') if not rows.empty else pd.Series(dtype=float)
+        out[label] = pd.Series(vals.values, index=rows['ID alumno'].values).groupby(level=0).last() if not rows.empty else float('nan')
+        out[label] = out[label].clip(0, scale) if label in out else out[label]
+
+    a = att.copy()
+    if not a.empty:
+        a['Parcial'] = a['Fecha'].apply(lambda d: parcial_of(d, cfg))
+        a = a[a['Parcial'] == parcial]
+    if not a.empty:
+        g = a.groupby('ID alumno')['Estado']
+        out['Sesiones'] = g.size()
+        out['Faltas'] = g.apply(lambda s: int((s == "❌ Falta").sum()))
+    else:
+        out['Sesiones'] = 0
+        out['Faltas'] = 0
+    out['Sesiones'] = out['Sesiones'].fillna(0).astype(int)
+    out['Faltas'] = out['Faltas'].fillna(0).astype(int)
+    out['Asistencia %'] = ((out['Sesiones'] - out['Faltas']) / out['Sesiones'].where(out['Sesiones'] > 0) * 100)
+    return out.reset_index()
+
+
+def compute_final_grades(components, khan_by_name, criteria_config):
+    """
+    Calificación del parcial = promedio ponderado de los componentes con registro.
+    Khan se lleva a escala completa (sin el factor de ponderación) y se pondera con su peso.
+    """
+    cfg = criteria_config or {}
+    scale = float(cfg.get('escala_maxima', 10))
+    peso_khan = float(cfg.get('peso_khan', 100))
+    weights = {**DEFAULT_COMPONENTES, **(cfg.get('componentes') or {})}
+    rows = []
+    for _, r in components.iterrows():
+        khan_full = khan_by_name.get(r['Nombre'])
+        values = {
+            'khan': (peso_khan, khan_full),
+            'evidencias': (weights['evidencias'], r['Evidencias %'] / 100 * scale if pd.notna(r['Evidencias %']) else None),
+            'examen': (weights['examen'], r['Examen'] if pd.notna(r['Examen']) else None),
+            'producto': (weights['producto'], r['Producto'] if pd.notna(r['Producto']) else None),
+            'asistencia': (weights['asistencia'], r['Asistencia %'] / 100 * scale if pd.notna(r['Asistencia %']) else None),
+        }
+        used = [(w, v) for w, v in values.values() if w > 0 and v is not None]
+        pending = [k for k, (w, v) in values.items() if w > 0 and v is None]
+        final = sum(w * v for w, v in used) / sum(w for w, _ in used) if used else None
+        rows.append({
+            'ID': r['ID'], 'Grupo': r['Grupo'], 'Nombre': r['Nombre'],
+            'Khan': round(khan_full, 1) if khan_full is not None else None,
+            'Evidencias': round(values['evidencias'][1], 1) if values['evidencias'][1] is not None else None,
+            'Examen': r['Examen'] if pd.notna(r['Examen']) else None,
+            'Producto': r['Producto'] if pd.notna(r['Producto']) else None,
+            'Asistencia %': round(r['Asistencia %'], 0) if pd.notna(r['Asistencia %']) else None,
+            'Final': round(final, 1) if final is not None else None,
+            'Pendiente': ", ".join(dict(COMPONENTES).get(k, 'Khan').split(' ', 1)[-1] for k in pending),
+        })
+    return pd.DataFrame(rows)
+
+
+def attendance_flag(pct, minimum):
+    if pct is None or pd.isna(pct):
+        return ""
+    if pct < minimum:
+        return "🔴 Debajo del mínimo"
+    if pct < minimum + 5:
+        return "🟠 Cerca del mínimo"
+    return "🟢 Bien"
+
+
+def _khan_avg_by_name(tasks, criteria_config, parcial):
+    """Promedio de Khan por alumno en el parcial, en escala completa (sin el factor de ponderación)."""
+    t = tasks[tasks['Parcial'] == parcial] if 'Parcial' in tasks.columns else tasks
+    if t.empty:
+        return {}
+    blocks = compute_student_block_grades(t, {**(criteria_config or {}), 'peso_khan': 100})
+    return blocks.dropna(subset=['block_grade']).groupby('Nombre del estudiante')['block_grade'].mean().to_dict()
+
+
+def render_evaluation_tab(folder_id, roster, tasks, criteria_config):
+    """Pestaña '📝 Evaluación del parcial' del panel docente."""
+    cfg = criteria_config or {}
+    scale = int(cfg.get('escala_maxima', 10))
+    minimum = float(cfg.get('asistencia_minima', 80))
+    weights = {**DEFAULT_COMPONENTES, **(cfg.get('componentes') or {})}
+
+    pending = st.session_state.get('_pending_upload')
+    if pending:
+        st.download_button(f"📥 Descargar {pending[0]} para subirlo a tu carpeta", pending[1], file_name=pending[0],
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary",
+                           key="dl_pending_upload_eval")
+    if roster.empty:
+        st.info("Para registrar evidencias, examen, producto o asistencia necesitas tu **lista oficial**. "
+                "Créala en la pestaña **👥 Alumnos y cuentas**.")
+        return
+
+    evid, extra, att = load_eval_tables(folder_id)
+    groups = sorted(g for g in roster['Grupo'].unique() if g) or ['']
+    s1, s2 = st.columns(2)
+    with s1:
+        grupo = st.selectbox("Grupo:", groups, key="eval_group")
+    with s2:
+        cur = current_parcial(cfg)
+        parcial = st.selectbox("Parcial:", PARCIALES, index=PARCIALES.index(cur), key="eval_parcial")
+    students = roster[roster['Grupo'] == grupo].sort_values('Nombre')
+    stamp = now_local().strftime('%Y-%m-%d %H:%M')
+
+    t_ev, t_ex, t_as, t_fin = st.tabs(["📓 Evidencias", "📝 Examen y producto", "🙋 Asistencia", "🧾 Calificación final"])
+
+    # --- Evidencias (sellos con rúbrica)
+    with t_ev:
+        st.caption("Registra el sello de cada bloque cuando el alumno presente su procedimiento. Si sale **En proceso**, "
+                   "puede volver a presentarlo: solo cambia su nivel y guarda de nuevo.")
+        with st.expander("📏 Rúbrica (compártela con tus alumnos)"):
+            st.markdown("\n".join(f"- **{lbl}** ({pct}%): {desc}" for lbl, pct, desc in EVID_LEVELS) +
+                        "\n\n💡 Para distinguir a quien entendió de quien copió, pídele que resuelva una pequeña variante del ejercicio.")
+        g_tasks = tasks[(tasks['Grupo'] == grupo)] if 'Grupo' in tasks.columns else tasks
+        if 'Parcial' in g_tasks.columns:
+            g_tasks = g_tasks[g_tasks['Parcial'] == parcial]
+        blocks = g_tasks.dropna(subset=['dt_entrega']).drop_duplicates('Fecha de entrega').sort_values('dt_entrega')
+        if blocks.empty:
+            st.info(f"No hay bloques de Khan Academy del grupo {grupo} en {parcial}.")
+        else:
+            options = blocks['Fecha de entrega'].tolist()
+            labels = {b: f"{format_short_date(d, with_time=False)} · {b}" for b, d in zip(blocks['Fecha de entrega'], blocks['dt_entrega'])}
+            bloque = st.selectbox("Bloque de tareas:", options, format_func=lambda b: labels[b], key="eval_block")
+            fecha_bloque = blocks.loc[blocks['Fecha de entrega'] == bloque, 'dt_entrega'].iloc[0].date().isoformat()
+            current = evid[(evid['Grupo'] == grupo) & (evid['Bloque'] == bloque)].set_index('ID alumno')['Nivel'] if not evid.empty else pd.Series(dtype=str)
+            already = not current.empty
+            edit = pd.DataFrame({
+                'ID': students['ID'].values,
+                'Alumno': students['Nombre'].values,
+                'Nivel': [current.get(i, EVID_LEVELS[0][0]) for i in students['ID']],
+            })
+            st.caption("✅ Este bloque ya tiene sellos registrados; puedes actualizarlos." if already else
+                       "Este bloque aún no tiene sellos. Al guardar, quien quede en **0 · No presentó** cuenta como 0% en este bloque.")
+            edited = st.data_editor(edit, hide_index=True, width='stretch', disabled=['ID', 'Alumno'], key=f"evid_editor_{grupo}_{bloque}",
+                                    column_config={'ID': None, 'Nivel': st.column_config.SelectboxColumn(
+                                        options=[l for l, _, _ in EVID_LEVELS], required=True, width="medium")})
+            if st.button("💾 Guardar sellos del bloque", type="primary", key="save_evid_btn"):
+                new = pd.DataFrame({'ID alumno': edited['ID'], 'Grupo': grupo, 'Bloque': bloque,
+                                    'Fecha bloque': fecha_bloque, 'Nivel': edited['Nivel'], 'Actualizado': stamp})
+                base = fresh_table(folder_id, EVID_FILE, EVID_COLS)
+                _finish_save([save_teacher_table(folder_id, EVID_FILE, upsert_rows(base, new, ['ID alumno', 'Bloque']), "Evidencias")])
+
+    # --- Examen y producto
+    with t_ex:
+        active = [(k, l) for k, l in [('examen', '📝 Examen'), ('producto', '📦 Producto del parcial')]]
+        off = [l for k, l in active if not weights.get(k)]
+        if off:
+            st.caption("⚠️ " + " y ".join(off) + " tiene(n) peso 0% en tu configuración (pestaña 🧮 Componentes): "
+                       "puedes registrar, pero no cuenta(n) en la calificación final.")
+        cur_vals = {}
+        for k, _ in active:
+            rows = extra[(extra['Parcial'] == parcial) & (extra['Componente'] == k)] if not extra.empty else extra
+            cur_vals[k] = pd.to_numeric(rows.set_index('ID alumno')['Calificación'], errors='coerce') if not rows.empty else pd.Series(dtype=float)
+        edit = pd.DataFrame({
+            'ID': students['ID'].values, 'Alumno': students['Nombre'].values,
+            'Examen': [cur_vals['examen'].get(i) for i in students['ID']],
+            'Producto': [cur_vals['producto'].get(i) for i in students['ID']],
+        })
+        edited = st.data_editor(edit, hide_index=True, width='stretch', disabled=['ID', 'Alumno'], key=f"extra_editor_{grupo}_{parcial}",
+                                column_config={'ID': None,
+                                               'Examen': st.column_config.NumberColumn(f"Examen (0-{scale})", min_value=0, max_value=scale, step=0.1),
+                                               'Producto': st.column_config.NumberColumn(f"Producto (0-{scale})", min_value=0, max_value=scale, step=0.1)})
+        st.caption("Deja en blanco a quien aún no tenga calificación; aparecerá como pendiente.")
+        if st.button("💾 Guardar calificaciones", type="primary", key="save_extra_btn"):
+            new_rows = []
+            for _, r in edited.iterrows():
+                for k, col in [('examen', 'Examen'), ('producto', 'Producto')]:
+                    if pd.notna(r[col]):
+                        new_rows.append({'ID alumno': r['ID'], 'Parcial': parcial, 'Componente': k,
+                                         'Calificación': f"{float(r[col]):g}", 'Actualizado': stamp})
+            table = fresh_table(folder_id, EXTRA_FILE, EXTRA_COLS)
+            # Quitar registros borrados (celda vaciada) de este grupo y parcial
+            ids = set(students['ID'])
+            if not table.empty:
+                table = table[~(table['ID alumno'].isin(ids) & (table['Parcial'] == parcial))]
+            table = pd.concat([table, pd.DataFrame(new_rows, columns=EXTRA_COLS)], ignore_index=True)
+            _finish_save([save_teacher_table(folder_id, EXTRA_FILE, table, "Calificaciones")])
+
+    # --- Asistencia
+    with t_as:
+        fecha = st.date_input("Fecha de la clase:", value=now_local().date(), key="att_date")
+        f_iso = fecha.isoformat()
+        current = att[(att['Grupo'] == grupo) & (att['Fecha'] == f_iso)].set_index('ID alumno')['Estado'] if not att.empty else pd.Series(dtype=str)
+        edit = pd.DataFrame({'ID': students['ID'].values, 'Alumno': students['Nombre'].values,
+                             'Estado': [current.get(i, ATT_STATES[0]) for i in students['ID']]})
+        st.caption("✅ Ya hay pase de lista para esta fecha; puedes corregirlo." if not current.empty else
+                   "Todos aparecen como **Asistió**: solo cambia a quien faltó o llegó tarde. El retardo y la falta justificada no cuentan como falta.")
+        edited = st.data_editor(edit, hide_index=True, width='stretch', disabled=['ID', 'Alumno'], key=f"att_editor_{grupo}_{f_iso}",
+                                column_config={'ID': None, 'Estado': st.column_config.SelectboxColumn(options=ATT_STATES, required=True)})
+        if st.button("💾 Guardar asistencia", type="primary", key="save_att_btn"):
+            new = pd.DataFrame({'ID alumno': edited['ID'], 'Grupo': grupo, 'Fecha': f_iso, 'Estado': edited['Estado']})
+            base = fresh_table(folder_id, ATT_FILE, ATT_COLS)
+            _finish_save([save_teacher_table(folder_id, ATT_FILE, upsert_rows(base, new, ['ID alumno', 'Fecha']), "Asistencia")])
+
+        comps = compute_components(students, evid, extra, att, cfg, parcial)
+        summ = comps[comps['Sesiones'] > 0][['Nombre', 'Sesiones', 'Faltas', 'Asistencia %']].copy()
+        if not summ.empty:
+            summ['Asistencia %'] = summ['Asistencia %'].round(0)
+            summ['Estado'] = summ['Asistencia %'].apply(lambda p: attendance_flag(p, minimum))
+            n_low = int((summ['Asistencia %'] < minimum).sum())
+            st.markdown(f"##### Resumen de asistencia · {parcial} (mínimo {minimum:g}%)")
+            if n_low:
+                st.warning(f"🔴 {n_low} alumno(s) por debajo del {minimum:g}% de asistencia en {parcial}.")
+            st.dataframe(summ.sort_values('Asistencia %'), hide_index=True, width='stretch',
+                         column_config={'Asistencia %': st.column_config.ProgressColumn(format="%d%%", min_value=0, max_value=100)})
+
+    # --- Calificación final del parcial
+    with t_fin:
+        total_w = float(cfg.get('peso_khan', 100)) + sum(float(v) for v in weights.values())
+        parts = [f"Khan {float(cfg.get('peso_khan', 100)):g}%"] + [f"{l.split(' ', 1)[1]} {float(weights[k]):g}%" for k, l in COMPONENTES if float(weights[k])]
+        st.caption("Ponderación: " + " + ".join(parts) + ". Si a un alumno le falta algún componente, su calificación se calcula "
+                   "con lo registrado y el faltante aparece en **Pendiente**.")
+        if abs(total_w - 100) > 0.01:
+            st.warning(f"⚠️ Los pesos suman {total_w:g}%. Ajústalos en ⚙️ Configuración → 🧮 Componentes.")
+        comps = compute_components(students, evid, extra, att, cfg, parcial)
+        final = compute_final_grades(comps, _khan_avg_by_name(tasks, cfg, parcial), cfg)
+        if final.empty:
+            st.info("Sin alumnos en este grupo.")
+        else:
+            final['Estatus'] = final['Final'].apply(lambda v: classify_student(v, cfg.get('thresholds', {}), scale) if v is not None else "Sin datos")
+            show = final.drop(columns=['ID'])
+            for col in ['Khan', 'Evidencias', 'Examen', 'Producto', 'Asistencia %', 'Final']:
+                show[col] = pd.to_numeric(show[col], errors='coerce')
+            # Vista: celdas sin registro como "—" (Streamlit mostraría "None")
+            view = show.copy()
+            for col in ['Khan', 'Evidencias', 'Examen', 'Producto', 'Final']:
+                view[col] = view[col].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "—")
+            view['Asistencia %'] = view['Asistencia %'].apply(lambda v: f"{v:.0f}%" if pd.notna(v) else "—")
+            st.dataframe(view, hide_index=True, width='stretch', height=min(560, 40 + len(view) * 36))
+            st.download_button("📥 Descargar calificaciones del parcial (Excel)", table_to_xlsx_bytes(show, parcial),
+                               file_name=f"Calificaciones_{parcial.replace(' ', '')}_{grupo.replace('°', '')}_{now_local().strftime('%Y%m%d')}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_final_grades")
+
+
+def attendance_by_name(roster, att, criteria_config, parcial=None):
+    """{nombre: % de asistencia} en el parcial indicado (o en todo el semestre)."""
+    if roster.empty or att.empty:
+        return {}
+    a = att.copy()
+    if parcial:
+        a = a[a['Fecha'].apply(lambda d: parcial_of(d, criteria_config)) == parcial]
+    if a.empty:
+        return {}
+    g = a.groupby('ID alumno')['Estado']
+    pct = (g.size() - g.apply(lambda s: (s == "❌ Falta").sum())) / g.size() * 100
+    names = roster.set_index('ID')['Nombre']
+    return {names[i]: float(v) for i, v in pct.items() if i in names.index}
+
+
+def render_student_evaluation(ctx, student_id, criteria_config, key_prefix):
+    """Pestaña '🧾 Mi evaluación' del alumno: componentes, sellos y asistencia."""
+    cfg = criteria_config or {}
+    scale = int(cfg.get('escala_maxima', 10))
+    minimum = float(cfg.get('asistencia_minima', 80))
+    weights = {**DEFAULT_COMPONENTES, **(cfg.get('componentes') or {})}
+    roster, evid, extra, att, tasks = ctx['roster'], ctx['evid'], ctx['extra'], ctx['att'], ctx['tasks']
+    me = roster[roster['ID'] == student_id]
+    if me.empty:
+        st.info("Tu docente aún no te ha registrado en su lista oficial.")
+        return
+    cur = current_parcial(cfg)
+    parcial = st.selectbox("Parcial:", PARCIALES, index=PARCIALES.index(cur), key=f"{key_prefix}_my_eval_parcial")
+    comps = compute_components(me, evid, extra, att, cfg, parcial)
+    final = compute_final_grades(comps, _khan_avg_by_name(tasks, cfg, parcial), cfg).iloc[0]
+
+    peso_khan = float(cfg.get('peso_khan', 100))
+    items = [("🎓 Khan Academy", peso_khan, final['Khan'])]
+    for k, label in COMPONENTES:
+        val = {'evidencias': final['Evidencias'], 'examen': final['Examen'], 'producto': final['Producto'],
+               'asistencia': (final['Asistencia %'] / 100 * scale) if final['Asistencia %'] is not None else None}[k]
+        if float(weights.get(k, 0)) > 0:
+            items.append((label, float(weights[k]), val))
+    cards = "".join(
+        f"<div class='mini-stat'><div class='mini-label'>{html.escape(lbl)} · {w:g}%</div>"
+        f"<div class='mini-val'>{(f'{v:.1f}' if v is not None and not pd.isna(v) else '—')}<small> / {scale}</small></div></div>"
+        for lbl, w, v in items if w > 0
+    )
+    final_txt = f"{final['Final']:.1f}" if final['Final'] is not None else "—"
+    st.markdown(compact_html(f"""
+    <div class="hero-card" style="border-left-color:#2563eb;">
+        <div class="hero-label">Calificación estimada de {parcial}</div>
+        <div class="hero-grade">{final_txt}<span> / {scale}</span></div>
+        <div class="hero-msg">{('Pendiente por registrar: ' + html.escape(final['Pendiente']) + '.') if final['Pendiente'] else 'Todos los componentes están registrados.'}</div>
+    </div>
+    <div class="mini-stats teacher-stats">{cards}</div>"""), unsafe_allow_html=True)
+
+    # Sellos por bloque
+    my_ev = evid[evid['ID alumno'] == student_id].copy() if not evid.empty else evid
+    if not my_ev.empty:
+        my_ev = my_ev[my_ev['Fecha bloque'].apply(lambda d: parcial_of(d, cfg)) == parcial].sort_values('Fecha bloque')
+    st.markdown("#### 📓 Mis sellos de evidencia")
+    if my_ev.empty:
+        st.caption("Aún no tienes sellos registrados en este parcial.")
+    else:
+        desc = {lbl: d for lbl, _, d in EVID_LEVELS}
+        cards = []
+        for _, r in my_ev.iterrows():
+            lvl = r['Nivel']
+            color = {0: '#dc2626', 50: '#d97706', 80: '#2563eb', 100: '#16a34a'}.get(EVID_PCT.get(lvl), '#64748b')
+            tip = " Preséntalo para obtener tu sello." if EVID_PCT.get(lvl) == 0 else ""
+            cards.append(_task_card_html(f"Bloque {format_short_date(pd.to_datetime(r['Fecha bloque']), with_time=False)}",
+                                         html.escape(desc.get(lvl, '') + tip), f"<strong>{html.escape(lvl)}</strong>", color))
+        st.markdown(compact_html("".join(cards)), unsafe_allow_html=True)
+
+    # Asistencia
+    st.markdown("#### 🙋 Mi asistencia")
+    r = comps.iloc[0]
+    if r['Sesiones'] == 0:
+        st.caption("Aún no hay pase de lista registrado en este parcial.")
+    else:
+        pct = r['Asistencia %']
+        msg = f"{pct:.0f}% de asistencia ({r['Sesiones'] - r['Faltas']} de {r['Sesiones']} clases). Mínimo requerido: {minimum:g}%."
+        if pct < minimum:
+            st.error("🔴 " + msg + " Habla con tu docente o tu tutor(a) para ver cómo recuperarte.")
+        elif pct < minimum + 5:
+            st.warning("🟠 " + msg + " Estás cerca del mínimo: cuida tus próximas asistencias.")
+        else:
+            st.success("🟢 " + msg)
 
 
 # ==============================================================================
@@ -3520,7 +3973,7 @@ def render_admin():
     with st.expander("⚙️ Configuración de Evaluación y Criterios (criterios.json)", expanded=False):
         st.caption("Configura de forma persistente e independiente para tu materia la escala máxima, el peso de Khan Academy, los periodos de parciales, los umbrales de rendimiento y los criterios por actividad en tu Google Drive.")
 
-        tab_gral, tab_parciales, tab_tasks = st.tabs(["🎯 Escala, Peso y Clasificación", "📅 Fechas de Parciales", "📌 Criterios por Tipo de Tarea"])
+        tab_gral, tab_parciales, tab_tasks, tab_comp = st.tabs(["🎯 Escala, Peso y Clasificación", "📅 Fechas de Parciales", "📌 Criterios por Tipo de Tarea", "🧮 Componentes y asistencia"])
 
         with tab_gral:
             st.markdown("##### 📏 Escala de Calificación y Ponderación")
@@ -3644,6 +4097,31 @@ def render_admin():
             if parcial_issues:
                 st.warning("⚠️ Revisa las fechas: " + "; ".join(parcial_issues) + ".")
 
+        with tab_comp:
+            st.markdown("##### 🧮 Componentes de la calificación del parcial")
+            st.caption("Además de Khan Academy, puedes evaluar otros componentes. Los pesos deben sumar 100%. "
+                       "Deja en 0% los que no uses. Las evidencias, el examen, el producto y la asistencia se registran "
+                       "en la pestaña **📝 Evaluación del parcial** (requiere tu lista oficial de alumnos).")
+            saved_comp = {**DEFAULT_COMPONENTES, **(criterios_data.get('componentes') or {})}
+            comp_values = {}
+            cc = st.columns(len(COMPONENTES))
+            for col, (ckey, clabel) in zip(cc, COMPONENTES):
+                with col:
+                    comp_values[ckey] = st.number_input(f"{clabel} (%)", min_value=0, max_value=100, step=5,
+                                                        value=int(float(saved_comp.get(ckey, 0))), key=f"cfg_comp_{ckey}")
+            total_w = sel_peso + sum(comp_values.values())
+            parts = [f"Khan {sel_peso}%"] + [f"{lbl.split(' ', 1)[1]} {comp_values[k]}%" for k, lbl in COMPONENTES if comp_values[k]]
+            if total_w == 100:
+                st.success("✅ " + " + ".join(parts) + " = 100%")
+            else:
+                st.warning("⚠️ " + " + ".join(parts) + f" = **{total_w}%**. Ajusta los pesos (incluido el de Khan, en la primera pestaña) para que sumen 100%.")
+            st.markdown("---")
+            sel_asist_min = st.number_input(
+                "🙋 Asistencia mínima requerida (%)", min_value=0, max_value=100, step=5,
+                value=int(float(criterios_data.get('asistencia_minima', 80))), key="cfg_asist_min",
+                help="Se avisa al docente y al alumno cuando su asistencia está por debajo de este porcentaje o cerca de él."
+            )
+
         with tab_tasks:
             st.markdown("##### 📌 Criterios de Calificación por Tipo de Tarea")
             current_task_criteria = {}
@@ -3735,7 +4213,9 @@ def render_admin():
                             'end': p3_end.isoformat() if hasattr(p3_end, 'isoformat') else str(p3_end)
                         }
                     },
-                    'task_criteria': current_task_criteria
+                    'task_criteria': current_task_criteria,
+                    'componentes': {k: float(v) for k, v in comp_values.items()},
+                    'asistencia_minima': float(sel_asist_min)
                 }
 
                 level, message = save_teacher_criterios(teacher_folder_id, updated_criterios)
@@ -3753,7 +4233,7 @@ def render_admin():
                 set_flash(level, message)
                 st.rerun()
 
-    with st.expander("☁️ Sincronización con Google Drive", expanded=True):
+    with st.expander("☁️ Sincronización con Google Drive", expanded=raw_khan.empty):
         st.markdown(f"**Carpeta asignada en Google Drive:** `📁 {carpeta_nombre}`")
         if teacher_email:
             st.markdown(f"**Acceso exclusivo asignado a:** `📧 {teacher_email}`")
@@ -3886,7 +4366,9 @@ def render_admin():
             'Parcial 2': {'start': p2_start, 'end': p2_end},
             'Parcial 3': {'start': p3_start, 'end': p3_end}
         },
-        'task_criteria': current_task_criteria
+        'task_criteria': current_task_criteria,
+        'componentes': {k: float(v) for k, v in comp_values.items()},
+        'asistencia_minima': float(sel_asist_min)
     }
 
     # Calificación dinámica en tiempo real según los criterios activos
@@ -3991,13 +4473,22 @@ def render_admin():
         if pend:
             st.warning("👥 " + " y ".join(pend) + ". Revísalo en la pestaña **Alumnos y cuentas**.")
 
-    tab_resumen, tab_conc, tab_actividad, tab_detalle, tab_lista = st.tabs(["🎯 Resumen y acciones", "📊 Concentrado", "🧩 Por actividad", "🔍 Detalle por alumno", "👥 Alumnos y cuentas"])
+    tab_resumen, tab_conc, tab_actividad, tab_detalle, tab_eval, tab_lista = st.tabs(["🎯 Resumen y acciones", "📊 Concentrado", "🧩 Por actividad", "🔍 Detalle por alumno", "📝 Evaluación del parcial", "👥 Alumnos y cuentas"])
+
+    # Evidencias, calificaciones del parcial y asistencia (archivos en la carpeta del docente)
+    eval_evid, eval_extra, eval_att = load_eval_tables(teacher_folder_id)
+    eval_ctx = {'roster': roster, 'evid': eval_evid, 'extra': eval_extra, 'att': eval_att}
+    att_map = attendance_by_name(roster, eval_att, active_criteria_config,
+                                 None if filtro_parcial_master in ("Todos los Parciales", "Sin asignar") else filtro_parcial_master)
+
+    with tab_eval:
+        render_evaluation_tab(teacher_folder_id, roster, assignments_tagged, active_criteria_config)
 
     with tab_lista:
         render_roster_tab(teacher_folder_id, raw_khan, roster, roster_links, carpeta_nombre)
 
     with tab_resumen:
-        render_teacher_summary(active_master, block_summary, active_criteria_config, group_color_map(available_groups), asignatura)
+        render_teacher_summary(active_master, block_summary, active_criteria_config, group_color_map(available_groups), asignatura, att_map)
 
     with tab_actividad:
         render_task_analysis(active_master)
@@ -4238,7 +4729,9 @@ def render_admin():
         # Visualización complementaria: Dashboard idéntico con desglose por bloques y filtros
         with st.expander("👁️ Vista del alumno (así ve su portal este estudiante)", expanded=True):
             updated_at = student_tasks_data['Archivo_Modificado'].max() if 'Archivo_Modificado' in student_tasks_data.columns else None
-            render_student_experience(selected_student, student_tasks_data, active_criteria_config, key_prefix="admin", updated_at=updated_at)
+            sel_ids = roster.loc[roster['Nombre'] == selected_student, 'ID'] if not roster.empty else pd.Series(dtype=str)
+            render_student_experience(selected_student, student_tasks_data, active_criteria_config, key_prefix="admin", updated_at=updated_at,
+                                      eval_ctx=eval_ctx, student_id=sel_ids.iloc[0] if not sel_ids.empty else None)
 
 
 # ==============================================================================
@@ -4308,7 +4801,14 @@ def render_student():
         return
 
     updated_at = student_tasks['Archivo_Modificado'].max() if 'Archivo_Modificado' in student_tasks.columns and not student_tasks.empty else None
-    render_student_experience(student_name, student_tasks, criterios_data, key_prefix="student", updated_at=updated_at)
+    my_id = student_id
+    if not my_id and not roster.empty:
+        ids = roster.loc[roster['Nombre'] == student_name, 'ID']
+        my_id = ids.iloc[0] if not ids.empty else None
+    eval_evid, eval_extra, eval_att = load_eval_tables(teacher_folder_id) if my_id else (None, None, None)
+    eval_ctx = {'roster': roster, 'evid': eval_evid, 'extra': eval_extra, 'att': eval_att} if my_id else None
+    render_student_experience(student_name, student_tasks, criterios_data, key_prefix="student", updated_at=updated_at,
+                              eval_ctx=eval_ctx, student_id=my_id)
 
 
 
