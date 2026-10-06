@@ -56,6 +56,9 @@ credenciales de alumnos al repositorio).
     componentes del parcial y la clasificación pueden acordarse con cada grupo, para todo el semestre o
     solo a partir de un parcial. Se guardan en `criterios.json` (`criterios_por_grupo` y `grupos`). La
     escala, las fechas, la asistencia mínima y la rúbrica son las mismas para todos los grupos.
+  - `seguimiento.xlsx` (opcional): alumnos que el docente marcó como atendidos en **Inicio**, con su nota.
+    Salen de "Necesitan atención" hasta que se cierra una entrega posterior.
+  - `asistencia.xlsx` tiene una columna `Nota` (opcional) para retardos y justificantes.
   - `metas.xlsx` (opcional): metas que cada alumno se pone por parcial desde su portal (🎯 Mi meta).
   - `temas.xlsx` (opcional, **Ajustes → 📚 Temas**): tema de cada actividad de Khan. Con él,
     los alumnos ven su dominio por tema (📚 Mis temas) y el docente ve **Calificaciones → Por tema**.
