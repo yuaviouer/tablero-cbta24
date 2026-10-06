@@ -17,7 +17,7 @@ streamlit run app.py
 # Credenciales del Service Account de Google Drive (JSON completo)
 gcp_service_account = '''{ ... }'''
 
-# Opcional: acceso de administrador maestro (modo local).
+# Opcional: acceso al panel de Administración.
 # Si no se definen, este acceso queda deshabilitado.
 ADMIN_USER = "usuario"
 ADMIN_PASS = "una-contraseña-segura"
