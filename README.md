@@ -25,6 +25,11 @@ ADMIN_PASS = "una-contraseña-segura"
 
 `ADMIN_USER` / `ADMIN_PASS` también pueden definirse como variables de entorno.
 
+Con `ADMIN_USER` / `ADMIN_PASS` se entra (por la pestaña de docentes) al panel de **Administración**:
+estado de cada docente y su carpeta (reportes, lista de alumnos, pase de lista, plantillas faltantes),
+entrar al panel de cualquier docente para darle soporte, tutoría de todos los grupos, revisión de
+`docentes.xlsx`, recarga de datos de Drive y plantilla de `docentes.xlsx`.
+
 Sin `gcp_service_account` la app funciona en **modo local**, leyendo los CSV y
 `credenciales.xlsx` desde la carpeta `datos/` (ignorada por git: nunca subas
 credenciales de alumnos al repositorio).

@@ -4286,6 +4286,11 @@ def subject_student_summary(subject, groups, parcial):
     types = sorted(t for t in raw['Tipo de tarea'].dropna().astype(str).unique() if t) if (not raw.empty and 'Tipo de tarea' in raw.columns) else []
     cfg = khan_view_config(load_teacher_criterios(folder_id, types))
     rows = {}
+    graded = pd.DataFrame()
+    # Con actividad en Khan en algún momento del semestre (no solo en el periodo elegido)
+    with_khan = set(zip(raw['Grupo'], raw['Nombre del estudiante'])) if not raw.empty else set()
+    p_range = parse_parciales_dates(cfg.get('parciales', {})).get(parcial) if parcial else None
+    not_started = bool(p_range) and p_range['start'] > now_local().date()
     if not raw.empty:
         graded = assign_parciales_vectorized(apply_dynamic_grading(raw.copy(), cfg), cfg)
         if parcial:
@@ -4298,7 +4303,8 @@ def subject_student_summary(subject, groups, parcial):
                 rows[(g, n)] = {'Grupo': g, 'Nombre': n, 'Promedio': avg.get((g, n)), 'Atrasadas': int(overdue.get((g, n), 0))}
     # Alumnos de la lista sin actividad en Khan también cuentan (son los más invisibles)
     for _, r in roster.iterrows():
-        rows.setdefault((r['Grupo'], r['Nombre']), {'Grupo': r['Grupo'], 'Nombre': r['Nombre'], 'Promedio': None, 'Atrasadas': 0, 'sin_khan': True})
+        rows.setdefault((r['Grupo'], r['Nombre']), {'Grupo': r['Grupo'], 'Nombre': r['Nombre'], 'Promedio': None, 'Atrasadas': 0,
+                                                    'sin_khan': (r['Grupo'], r['Nombre']) not in with_khan})
 
     evid, extra, att = load_eval_tables(folder_id)
     att_map = attendance_by_name(roster, att, cfg, parcial) if not roster.empty else {}
@@ -4315,11 +4321,23 @@ def subject_student_summary(subject, groups, parcial):
             khan_names = _khan_avg_by_name(g_all, cfg, p_eval)
         fin = compute_final_grades(comps, khan_names, cfg, p_eval)
         finals = dict(zip(fin['Nombre'], fin['Final']))
+        fin_rows = {row['Nombre']: row for row in fin.to_dict('records')}
+    else:
+        fin_rows = {}
+
+    goals = load_goals(folder_id)
+    topics_map = load_topics_map(folder_id)
+    ids_by_name = {(r['Grupo'], r['Nombre']): r['ID'] for _, r in roster.iterrows()} if not roster.empty else {}
+    p_goal = parcial or current_parcial(cfg)
 
     out = []
     scale = int(cfg.get('escala_maxima', 10))
     for (g, n), r in rows.items():
         value = finals.get(n) if pd.notna(finals.get(n)) else r['Promedio']
+        sid = ids_by_name.get((g, n))
+        detail = subject_student_detail(graded, g, n, sid, cfg, parcial, att, fin_rows.get(n), r['Promedio'],
+                                        student_goal(goals, sid, p_goal), topics_map)
+        detail['parcial_goal'] = p_goal
         out.append({
             'Grupo': g, 'Nombre': n, 'Materia': subject['materia'], 'Docente': subject['docente'], 'Correo': subject['email'],
             'Promedio': round(value, 1) if value is not None and not pd.isna(value) else None,
@@ -4328,9 +4346,53 @@ def subject_student_summary(subject, groups, parcial):
             'Asistencia %': round(att_map[n]) if n in att_map else None,
             'Asistencia mínima': float(cfg.get('asistencia_minima', 80)),
             'Sin Khan': bool(r.get('sin_khan')),
+            'No iniciado': not_started,
+            '_detail': detail,
             '_key': f"{g}|{' '.join(name_tokens(n))}",
         })
     return out
+
+
+def subject_student_detail(graded, grupo, nombre, sid, cfg, parcial, att, fin_row, khan_avg, goal, topics_map):
+    """Lo que el alumno ha trabajado en una materia, para el reporte de tutoría a la familia."""
+    d = {'scale': int(cfg.get('escala_maxima', 10)), 'khan': khan_avg}
+    g_cfg = group_config(cfg, grupo, parcial)
+    weights = {**DEFAULT_COMPONENTES, **(g_cfg.get('componentes') or {})}
+    if uses_components(g_cfg):
+        d['criterios'] = " + ".join([f"Khan Academy {khan_weight(g_cfg):g}%"] +
+                                    [f"{lbl.split(' ', 1)[1]} {float(weights[k]):g}%" for k, lbl in COMPONENTES if float(weights[k])])
+    else:
+        d['criterios'] = "Actividades de Khan Academy (100%)"
+    t = graded[(graded['Grupo'] == grupo) & (graded['Nombre del estudiante'] == nombre)] if not graded.empty else graded
+    if not t.empty:
+        ev = t[~t['status'].isin(NOT_EVALUATED_STATUSES)]
+        d['evaluadas'] = len(ev)
+        d['entregadas'] = int(ev['is_completed'].astype(bool).sum())
+        d['a_tiempo'] = int(ev['status'].astype(str).str.startswith('A tiempo').sum())
+        d['en_curso'] = int((t['status'] == 'En curso').sum())
+        d['atrasadas'] = list(t.loc[t['status'] == 'No completado'].sort_values('dt_entrega')['Nombre de la tarea'].astype(str))
+        m = topic_mastery(t, topics_map)
+        if not m.empty:
+            m = m.dropna(subset=['Dominio %'])
+            d['temas_reforzar'] = [f"{r['Tema']} ({int(r['Dominio %'])}%)" for _, r in m[m['Dominio %'] < 60].iterrows()]
+            d['temas_dominados'] = [r['Tema'] for _, r in m[m['Dominio %'] >= 85].iterrows()]
+    if fin_row:
+        comp_keys = [('Khan', khan_weight(g_cfg)), ('Evidencias', weights['evidencias']), ('Examen', weights['examen']),
+                     ('Producto', weights['producto']), ('Asistencia %', weights['asistencia'])]
+        d['componentes'] = [(k, fin_row.get(k), float(w)) for k, w in comp_keys if float(w) > 0]
+        d['final'] = fin_row.get('Final')
+        d['pendiente'] = fin_row.get('Pendiente')
+    if sid and att is not None and not att.empty:
+        a = att[att['ID alumno'] == sid]
+        if parcial:
+            a = a[a['Fecha'].apply(lambda x: parcial_of(x, cfg)) == parcial]
+        if not a.empty:
+            d['asistencia'] = {'sesiones': len(a), 'faltas': int((a['Estado'] == "❌ Falta").sum()),
+                               'retardos': int((a['Estado'] == "⏰ Retardo").sum()),
+                               'justificadas': int((a['Estado'] == "📝 Justificada").sum())}
+    if goal and goal.get('meta') is not None:
+        d['meta'] = goal
+    return d
 
 
 def build_tutoria_data(groups, parcial):
@@ -4388,36 +4450,54 @@ def _pdf_txt(text):
     return text.encode('latin-1', 'ignore').decode('latin-1')
 
 
-def build_report_pdf(student, group, subtitle, tables, paragraphs):
-    """
-    Reporte de avance para la familia. tables: [(título, [encabezados], [[celdas]], [anchos])];
-    paragraphs: [(título, texto)].
-    """
-    from fpdf import FPDF
-    pdf = FPDF(orientation='P', unit='mm', format='Letter')
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-    pdf.set_fill_color(30, 58, 138)
-    pdf.rect(0, 0, 216, 28, 'F')
-    pdf.set_text_color(255, 255, 255)
-    pdf.set_font('Helvetica', 'B', 16)
-    pdf.set_xy(12, 7)
-    pdf.cell(0, 8, _pdf_txt(f"{SCHOOL_NAME} - Reporte de avance"))
-    pdf.set_font('Helvetica', '', 10)
-    pdf.set_xy(12, 16)
-    pdf.cell(0, 6, _pdf_txt(subtitle))
-    pdf.set_text_color(15, 23, 42)
-    pdf.set_xy(12, 34)
-    pdf.set_font('Helvetica', 'B', 13)
-    pdf.cell(0, 7, _pdf_txt(str(student).title()), new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font('Helvetica', '', 10)
-    pdf.set_x(12)
-    pdf.cell(0, 6, _pdf_txt(f"Grupo {group}  -  Fecha: {now_local().strftime('%d/%m/%Y')}"), new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(3)
-    for title, headers, rows, widths in tables:
+class _ReportPDF:
+    """Piezas del reporte para la familia (encabezado, tablas, párrafos y firmas) sobre fpdf2."""
+
+    def __init__(self, student, group, subtitle):
+        from fpdf import FPDF
+        self.pdf = pdf = FPDF(orientation='P', unit='mm', format='Letter')
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+        pdf.set_fill_color(30, 58, 138)
+        pdf.rect(0, 0, 216, 28, 'F')
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font('Helvetica', 'B', 16)
+        pdf.set_xy(12, 7)
+        pdf.cell(0, 8, _pdf_txt(f"{SCHOOL_NAME} - Reporte de avance"))
+        pdf.set_font('Helvetica', '', 10)
+        pdf.set_xy(12, 16)
+        pdf.cell(0, 6, _pdf_txt(subtitle))
+        pdf.set_text_color(15, 23, 42)
+        pdf.set_xy(12, 34)
+        pdf.set_font('Helvetica', 'B', 13)
+        pdf.cell(0, 7, _pdf_txt(str(student).title()), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font('Helvetica', '', 10)
         pdf.set_x(12)
-        pdf.set_font('Helvetica', 'B', 11)
-        pdf.cell(0, 7, _pdf_txt(title), new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 6, _pdf_txt(f"Grupo {group}  -  Fecha: {now_local().strftime('%d/%m/%Y')}"), new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
+
+    def ensure_space(self, mm):
+        if self.pdf.get_y() > self.pdf.h - 15 - mm:
+            self.pdf.add_page()
+
+    def heading(self, text, size=11, color=(15, 23, 42), band=False):
+        pdf = self.pdf
+        self.ensure_space(22)
+        pdf.set_x(12)
+        pdf.set_font('Helvetica', 'B', size)
+        pdf.set_text_color(*color)
+        if band:
+            pdf.set_fill_color(239, 246, 255)
+            pdf.cell(192, 8, _pdf_txt(text), fill=True, new_x="LMARGIN", new_y="NEXT")
+        else:
+            pdf.cell(0, 7, _pdf_txt(text), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(15, 23, 42)
+
+    def table(self, title, headers, rows, widths):
+        pdf = self.pdf
+        if title:
+            self.heading(title)
+        self.ensure_space(14)
         pdf.set_font('Helvetica', 'B', 9)
         pdf.set_fill_color(226, 232, 240)
         pdf.set_x(12)
@@ -4434,43 +4514,149 @@ def build_report_pdf(student, group, subtitle, tables, paragraphs):
                 pdf.cell(w, 7, txt, border=1)
             pdf.ln()
         pdf.ln(3)
-    for title, text in paragraphs:
-        pdf.set_x(12)
-        pdf.set_font('Helvetica', 'B', 11)
-        pdf.cell(0, 7, _pdf_txt(title), new_x="LMARGIN", new_y="NEXT")
-        pdf.set_font('Helvetica', '', 10)
+
+    def paragraph(self, title, text, size=10):
+        pdf = self.pdf
+        if title:
+            self.heading(title)
+        pdf.set_font('Helvetica', '', size)
         pdf.set_x(12)
         pdf.multi_cell(190, 5.5, _pdf_txt(text))
         pdf.ln(2)
-    # Las firmas siempre juntas al final (sin quedar solas en otra hoja si caben)
-    if pdf.get_y() > pdf.h - 35:
-        pdf.add_page()
-    pdf.ln(8)
-    pdf.set_x(12)
-    pdf.set_font('Helvetica', '', 9)
-    pdf.cell(90, 6, "______________________________")
-    pdf.cell(90, 6, "______________________________", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_x(12)
-    pdf.cell(90, 5, _pdf_txt("Firma del docente / tutor(a)"))
-    pdf.cell(90, 5, _pdf_txt("Firma de madre, padre o tutor"))
-    return bytes(pdf.output())
+
+    def lines(self, items, size=9.5):
+        """Renglones "Etiqueta: texto" con la etiqueta en negritas."""
+        pdf = self.pdf
+        for label, text in items:
+            pdf.set_x(14)
+            pdf.set_font('Helvetica', 'B', size)
+            lbl = _pdf_txt(f"{label}: ")
+            pdf.cell(pdf.get_string_width(lbl) + 1, 5.5, lbl)
+            pdf.set_font('Helvetica', '', size)
+            pdf.multi_cell(188 - pdf.get_string_width(lbl), 5.5, _pdf_txt(text), new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(1.5)
+
+    def blank_lines(self, n):
+        """Renglones vacíos para escribir a mano."""
+        pdf = self.pdf
+        for _ in range(n):
+            y = pdf.get_y() + 8
+            pdf.set_draw_color(148, 163, 184)
+            pdf.line(12, y, 204, y)
+            pdf.set_y(y)
+        pdf.set_draw_color(0, 0, 0)
+        pdf.ln(2)
+
+    def signatures(self):
+        pdf = self.pdf
+        # Las firmas siempre juntas al final (sin quedar solas en otra hoja si caben)
+        if pdf.get_y() > pdf.h - 35:
+            pdf.add_page()
+        pdf.ln(8)
+        pdf.set_x(12)
+        pdf.set_font('Helvetica', '', 9)
+        pdf.cell(90, 6, "______________________________")
+        pdf.cell(90, 6, "______________________________", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_x(12)
+        pdf.cell(90, 5, _pdf_txt("Firma del docente / tutor(a)"))
+        pdf.cell(90, 5, _pdf_txt("Firma de madre, padre o tutor"))
+
+    def output(self):
+        return bytes(self.pdf.output())
 
 
-def tutoria_report_pdf(df, key_name, group):
-    g = df[df['Alumno'] == key_name]
-    rows = [[r['Materia'], r['Docente'], f"{r['Promedio']:.1f}" if pd.notna(r['Promedio']) else "-",
-             r['Estatus'], str(r['Atrasadas']), f"{r['Asistencia %']:.0f}%" if pd.notna(r['Asistencia %']) else "-"]
-            for _, r in g.sort_values('Materia').iterrows()]
+def build_report_pdf(student, group, subtitle, tables, paragraphs):
+    """
+    Reporte de avance para la familia. tables: [(título, [encabezados], [[celdas]], [anchos])];
+    paragraphs: [(título, texto)].
+    """
+    rep = _ReportPDF(student, group, subtitle)
+    for title, headers, rows, widths in tables:
+        rep.table(title, headers, rows, widths)
+    for title, text in paragraphs:
+        rep.paragraph(title, text)
+    rep.signatures()
+    return rep.output()
+
+
+def _fmt_num(v, pct=False):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "-"
+    return f"{v:.0f}%" if pct else f"{v:.1f}"
+
+
+def tutoria_report_pdf(df, key_name, group, periodo="Todo el semestre", tutor_name=""):
+    """
+    Reporte para la familia desde tutoría: resumen de todas las materias y, por cada una, lo que el alumno
+    ha trabajado con su docente (forma de evaluar, componentes, actividades, asistencia, temas y meta).
+    """
+    g = df[df['Alumno'] == key_name].sort_values('Materia')
+    name = str(key_name).title()
+    rep = _ReportPDF(key_name, group, f"Tutoría académica - Periodo: {periodo}" + (f" - Tutor(a): {tutor_name}" if tutor_name else ""))
+
+    rows = [[r['Materia'], r['Docente'], _fmt_num(r['Promedio']), r['Estatus'], str(r['Atrasadas']), _fmt_num(r['Asistencia %'], pct=True)]
+            for _, r in g.iterrows()]
+    rep.table("Resumen por materia", ["Materia", "Docente", "Calificación", "Estatus", "Pendientes", "Asistencia"], rows,
+              [52, 50, 24, 24, 20, 22])
+
     n_risk = int((g['Estatus'] == 'En riesgo').sum())
+    good = list(g.loc[g['Estatus'].isin(['Excelente', 'Bien']), 'Materia'])
     if n_risk:
-        text = (f"{str(key_name).title()} presenta riesgo en {n_risk} materia(s). Le pedimos su apoyo para revisar juntos sus "
-                "actividades pendientes y acordar un plan de recuperación con los docentes.")
+        text = (f"{name} presenta riesgo en {n_risk} materia(s): {', '.join(g.loc[g['Estatus'] == 'En riesgo', 'Materia'])}. "
+                "Le pedimos su apoyo para revisar juntos sus actividades pendientes y acordar un plan de recuperación con los docentes.")
     else:
-        text = f"{str(key_name).title()} no presenta materias en riesgo en este periodo. Le agradecemos su acompañamiento."
-    return build_report_pdf(key_name, group, "Resumen por materia (tutoría académica)",
-                            [("Avance por materia", ["Materia", "Docente", "Promedio", "Estatus", "Atrasadas", "Asistencia"], rows,
-                              [52, 48, 22, 26, 20, 24])],
-                            [("Observaciones", text)])
+        text = f"{name} no presenta materias en riesgo en este periodo. Le agradecemos su acompañamiento."
+    if good:
+        text += f" Destaca su desempeño en {', '.join(good)}."
+    rep.paragraph("Observaciones generales", text)
+
+    rep.heading("Detalle por materia", size=12)
+    for _, r in g.iterrows():
+        d = r.get('_detail') or {}
+        rep.heading(f"{r['Materia']}  -  {r['Docente']}" + (f" ({r['Correo']})" if r.get('Correo') else ""), size=10.5,
+                    color=(30, 58, 138), band=True)
+        if r.get('No iniciado'):
+            rep.lines([("Estado", "El periodo aún no inicia en esta materia.")])
+            continue
+        items = [("Forma de evaluar", d.get('criterios', '-'))]
+        if d.get('componentes'):
+            parts = [f"{k.replace(' %', '')} {_fmt_num(v, pct=(k == 'Asistencia %'))}" for k, v, _ in d['componentes']]
+            items.append(("Resultados", " | ".join(parts) + f"  ->  Calificación: {_fmt_num(d.get('final'))} de {d['scale']}"))
+            if d.get('pendiente'):
+                items.append(("Falta registrar", d['pendiente']))
+        elif d.get('khan') is not None:
+            items.append(("Promedio en Khan Academy", f"{_fmt_num(d['khan'])} de {d['scale']}"))
+        if d.get('evaluadas'):
+            items.append(("Actividades en Khan Academy",
+                          f"entregó {d['entregadas']} de {d['evaluadas']} ({d['a_tiempo']} a tiempo)"
+                          + (f"; {d['en_curso']} en curso" if d.get('en_curso') else "")))
+        elif r.get('Sin Khan'):
+            items.append(("Actividades en Khan Academy", "no tiene actividad registrada; es importante que ingrese a la plataforma."))
+        if d.get('atrasadas'):
+            more = len(d['atrasadas']) - 5
+            items.append(("Pendientes que aún puede entregar",
+                          ", ".join(d['atrasadas'][:5]) + (f" y {more} más" if more > 0 else "")))
+        if d.get('asistencia'):
+            a = d['asistencia']
+            asist = a['sesiones'] - a['faltas']
+            extra = [x for x in [f"{a['faltas']} falta(s)" if a['faltas'] else "", f"{a['retardos']} retardo(s)" if a['retardos'] else "",
+                                 f"{a['justificadas']} justificada(s)" if a['justificadas'] else ""] if x]
+            items.append(("Asistencia", f"{asist} de {a['sesiones']} clases ({asist / a['sesiones'] * 100:.0f}%)"
+                          + (f": {', '.join(extra)}" if extra else "")))
+        if d.get('temas_reforzar'):
+            items.append(("Temas por reforzar", ", ".join(d['temas_reforzar'])))
+        if d.get('temas_dominados'):
+            items.append(("Temas que domina", ", ".join(d['temas_dominados'])))
+        if d.get('meta'):
+            items.append((f"Meta del alumno ({d.get('parcial_goal', '')})",
+                          f"{d['meta']['meta']:g}" + (f" - \"{d['meta']['plan']}\"" if d['meta'].get('plan') else "")))
+        rep.lines(items)
+
+    rep.ensure_space(55)
+    rep.heading("Compromisos acordados")
+    rep.blank_lines(3)
+    rep.signatures()
+    return rep.output()
 
 
 def render_tutoria(groups, show_title=True):
@@ -4493,7 +4679,14 @@ def render_tutoria(groups, show_title=True):
         g_opts = sorted(df['Grupo'].dropna().unique())
         grupo = st.selectbox("Grupo:", g_opts, key="tut_group")
     df = df[df['Grupo'] == grupo]
-    pri = tutoria_priorities(df)
+    if parcial and df['No iniciado'].all():
+        st.info(f"🗓️ El **{parcial}** todavía no inicia en las materias de este grupo. Aquí aparecerá la información en "
+                "cuanto los docentes registren las primeras actividades. Mientras tanto, revisa el parcial en curso.")
+        return
+    if parcial and df['No iniciado'].any():
+        st.caption("ℹ️ En algunas materias el " + parcial + " todavía no inicia: "
+                   + ", ".join(sorted(df.loc[df['No iniciado'], 'Materia'].unique())) + ".")
+    pri = tutoria_priorities(df[~df['No iniciado']])
     n_al = df['_key'].nunique()
     n2 = sum(1 for p in pri if p['n_risk'] >= 2)
     n1 = sum(1 for p in pri if p['n_risk'] == 1)
@@ -4551,7 +4744,8 @@ def render_tutoria(groups, show_title=True):
     det_view['Promedio'] = det_view['Promedio'].apply(lambda v: f"{v:.1f}" if v is not None and pd.notna(v) else "—")
     det_view['Asistencia %'] = det_view['Asistencia %'].apply(lambda v: f"{v:.0f}%" if v is not None and pd.notna(v) else "—")
     st.dataframe(det_view, hide_index=True, width='stretch')
-    st.download_button("📄 Reporte para la familia (PDF)", tutoria_report_pdf(df, al, grupo),
+    st.download_button("📄 Reporte para la familia (PDF)",
+                       tutoria_report_pdf(df, al, grupo, p_sel, st.session_state.get('teacher_name', '') if st.session_state.get('role') == 'tutor' else ''),
                        file_name=f"Reporte_{re.sub(r'[^A-Za-z0-9]+', '_', str(al))}.pdf", mime="application/pdf",
                        type="primary", key="dl_tutoria_pdf")
 
@@ -4573,6 +4767,210 @@ def render_tutor_only():
             st.rerun()
     render_tutoria(st.session_state.get('tutor_groups') or ['*'], show_title=False)
 
+
+
+# ------------------------------------------------------------------------------
+# Administración general (usuario de los secretos ADMIN_USER / ADMIN_PASS)
+# ------------------------------------------------------------------------------
+ADM_DOCENTES, ADM_TUTORIA, ADM_MANT = "👩‍🏫 Docentes y carpetas", "🧭 Tutoría (todos los grupos)", "🔧 Mantenimiento"
+
+
+def start_superadmin_session():
+    """Inicia (o regresa a) la sesión de administración, sin datos de ningún docente."""
+    st.session_state.clear()
+    st.session_state.update({'logged_in': True, 'role': 'superadmin', 'username': ADMIN_USERNAME,
+                             'teacher_name': "Administración"})
+
+
+def enter_teacher_panel(row):
+    """El administrador entra al panel de un docente (para revisar o dar soporte)."""
+    folder = row.get('carpeta_nombre', '')
+    tutor_groups = parse_tutor_groups(row.get('grupos_tutoria', '')) if str(row.get('rol', '')).startswith(('tutor', 'direct')) else []
+    st.session_state.clear()
+    st.session_state.update({
+        'logged_in': True, 'role': 'admin', 'as_superadmin': True, 'username': row.get('usuario_docente', ''),
+        'teacher_name': row.get('Nombre del Docente', 'Docente'), 'teacher_email': row.get('e_mail', ''),
+        'student_name': f"Prof. {row.get('Nombre del Docente', '')}", 'asignatura': row.get('asignatura') or folder,
+        'carpeta_nombre': folder or "datos (Local)", 'teacher_folder_id': get_cached_folder_id(folder) if folder else None,
+        'tutor_groups': tutor_groups,
+    })
+
+
+@st.cache_data(ttl=300)
+def folder_csv_summary(folder_id):
+    """(número de reportes CSV de Khan, fecha del más reciente) de una carpeta."""
+    items = list_drive_csvs(get_drive_service(), folder_id) if _drive_ready(folder_id) else []
+    if not items:
+        return 0, None
+    last = max(parse_drive_time(i.get('modifiedTime')) for i in items)
+    return len(items), last
+
+
+def teachers_status(docentes):
+    """Una fila por docente con el estado de su carpeta y de sus archivos."""
+    rows = []
+    for _, r in docentes.iterrows():
+        folder = r['carpeta_nombre']
+        fid = get_cached_folder_id(folder) if folder else None
+        row = {'Docente': r['Nombre del Docente'], 'Usuario': r['usuario_docente'], 'Materia': r['asignatura'] or '—',
+               'Rol': r['rol'] or 'docente', 'Grupos de tutoría': r['grupos_tutoria'] or ('todos' if r['rol'] in ('directivo', 'directiva') else '—'),
+               'Carpeta': folder or '—'}
+        if not folder:
+            row.update({'Estado': '🧭 Solo tutoría' if r['rol'] else '⚠️ Sin carpeta ni rol', 'Reportes Khan': None,
+                        'Última actualización': '—', 'Alumnos en lista': None, 'Último pase de lista': '—', 'Plantillas faltantes': '—'})
+        elif not fid:
+            row.update({'Estado': '❌ Carpeta no encontrada', 'Reportes Khan': None, 'Última actualización': '—',
+                        'Alumnos en lista': None, 'Último pase de lista': '—', 'Plantillas faltantes': '—'})
+        else:
+            n_csv, last = folder_csv_summary(fid)
+            roster = load_teacher_table(fid, ROSTER_FILE)
+            att = load_teacher_table(fid, ATT_FILE)
+            missing = missing_setup_files(fid)
+            last_att = att['Fecha'].dropna().astype(str).max() if (not att.empty and 'Fecha' in att.columns) else ''
+            row.update({
+                'Estado': '✅ Al día' if n_csv and not missing else ('🟡 Faltan plantillas' if n_csv else '🟠 Sin reportes de Khan'),
+                'Reportes Khan': n_csv,
+                'Última actualización': format_short_date(last) if last is not None and pd.notna(last) else '—',
+                'Alumnos en lista': len(roster) if not roster.empty else 0,
+                'Último pase de lista': last_att or '—',
+                'Plantillas faltantes': ", ".join(missing) if missing else '—',
+            })
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    for col in ('Reportes Khan', 'Alumnos en lista'):
+        out[col] = pd.to_numeric(out[col], errors='coerce').astype('Int64')
+    return out
+
+
+def docentes_issues(docentes):
+    """Problemas frecuentes en docentes.xlsx, explicados en palabras sencillas."""
+    issues = []
+    dup = docentes[docentes['usuario_docente'].str.lower().duplicated(keep=False)]
+    for user, g in dup.groupby(docentes['usuario_docente'].str.lower()):
+        if g['carpeta_nombre'].nunique() > 1 and (g['carpeta_nombre'] != '').sum() > 1:
+            issues.append(f"El usuario **{user}** aparece con varias carpetas: entrará a la primera ({g['carpeta_nombre'].iloc[0]}).")
+    for _, r in docentes.iterrows():
+        if not r['carpeta_nombre'] and not r['rol']:
+            issues.append(f"**{r['Nombre del Docente']}** no tiene carpeta ni rol: no podrá entrar a ningún panel.")
+        if r['rol'] in ('tutor', 'tutora') and not r['grupos_tutoria']:
+            issues.append(f"**{r['Nombre del Docente']}** es tutor(a) pero no tiene `grupos_tutoria`: verá todos los grupos.")
+        if r['carpeta_nombre'] and not r['asignatura']:
+            issues.append(f"**{r['Nombre del Docente']}** no tiene asignatura: sus alumnos verán el nombre de la carpeta.")
+    return issues
+
+
+def docentes_template_bytes():
+    example = pd.DataFrame([
+        {'usuario_docente': 'docente_mate', 'password': 'Cambiar123', 'asignatura': 'Temas Selectos de Matemáticas II',
+         'carpeta_nombre': 'Matematicas_5H', 'Nombre del Docente': 'Nombre Apellido', 'e_mail': 'docente@ejemplo.com',
+         'rol': 'docente', 'grupos_tutoria': ''},
+        {'usuario_docente': 'tutora_5h', 'password': 'Cambiar123', 'asignatura': '', 'carpeta_nombre': '',
+         'Nombre del Docente': 'Nombre de la tutora', 'e_mail': '', 'rol': 'tutor', 'grupos_tutoria': '5°H, 5°J'},
+        {'usuario_docente': 'subdireccion', 'password': 'Cambiar123', 'asignatura': '', 'carpeta_nombre': '',
+         'Nombre del Docente': 'Subdirección Académica', 'e_mail': '', 'rol': 'directivo', 'grupos_tutoria': 'todos'},
+    ], columns=DOCENTES_COLS)
+    return table_to_xlsx_bytes(example, "Docentes")
+
+
+def render_superadmin():
+    """Panel de administración: estado de cada docente, tutoría de todos los grupos y mantenimiento."""
+    h1, h2 = st.columns([5, 1])
+    with h1:
+        st.markdown("""
+        <div class="main-header" style="background: linear-gradient(135deg, #3b0764 0%, #6d28d9 100%);">
+            <h1>🛠️ Administración del portal</h1><p>CBTA No. 24 · Docentes, tutoría y mantenimiento</p>
+        </div>""", unsafe_allow_html=True)
+    with h2:
+        st.write("")
+        st.write("")
+        if st.button("🚪 Cerrar Sesión", width='stretch', key="adm_logout"):
+            st.session_state.clear()
+            st.rerun()
+    show_flash()
+    section = st.segmented_control("Sección", [ADM_DOCENTES, ADM_TUTORIA, ADM_MANT], default=ADM_DOCENTES,
+                                   key="adm_section", label_visibility="collapsed") or ADM_DOCENTES
+    drive_ok = get_drive_service() is not None and not str(ROOT_FOLDER_ID).startswith('PEGA_AQUÍ')
+    docentes = load_docentes_master()
+
+    if section == ADM_TUTORIA:
+        render_tutoria(['*'], show_title=False)
+        return
+
+    if section == ADM_DOCENTES:
+        if not drive_ok:
+            st.info("ℹ️ Sin conexión a Google Drive: la aplicación está en **modo local** (carpeta `datos/`).")
+            if st.button("Entrar al panel docente (modo local)", type="primary", key="adm_local_panel"):
+                enter_teacher_panel({'Nombre del Docente': 'Docente (modo local)', 'asignatura': 'Materia (modo local)'})
+                st.rerun()
+            return
+        if docentes.empty:
+            st.warning("No se pudo leer `docentes.xlsx` de la carpeta raíz. Revisa la sección **🔧 Mantenimiento**.")
+            return
+        st.caption("Estado de cada docente y de su carpeta en Google Drive. Sirve para ver quién ya subió sus reportes, "
+                   "quién tiene su lista de alumnos y quién necesita ayuda para empezar.")
+        with st.spinner("Revisando las carpetas de los docentes..."):
+            status = teachers_status(docentes)
+        n_ok = int((status['Estado'] == '✅ Al día').sum())
+        n_prob = int(status['Estado'].str.startswith(('❌', '⚠️', '🟠')).sum())
+        stats = [("👩‍🏫 Registros", f"{len(status)}"), ("✅ Al día", f"{n_ok}"),
+                 ("⚠️ Requieren atención", f"{n_prob}"),
+                 ("🧭 Tutores / directivos", f"{int((docentes['rol'] != '').sum())}")]
+        st.markdown(compact_html("<div class='mini-stats teacher-stats'>" + "".join(
+            f"<div class='mini-stat'><div class='mini-label'>{l}</div><div class='mini-val'>{v}</div></div>" for l, v in stats) + "</div>"),
+            unsafe_allow_html=True)
+        st.dataframe(status, hide_index=True, width='stretch', height=min(600, 40 + len(status) * 36))
+        st.download_button("📥 Descargar estado (Excel)", table_to_xlsx_bytes(status, "Docentes"),
+                           file_name=f"Estado_docentes_{now_local().strftime('%Y%m%d')}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="adm_dl_status")
+
+        st.markdown("##### 🔑 Entrar al panel de un docente")
+        st.caption("Para revisar su información o ayudarle a configurar algo. Verás su panel tal como lo ve él o ella; "
+                   "con **⬅️ Administración** regresas aquí.")
+        with_folder = docentes[docentes['carpeta_nombre'] != ''].reset_index(drop=True)
+        if with_folder.empty:
+            st.info("Ningún docente tiene carpeta asignada todavía.")
+        else:
+            labels = [f"{r['Nombre del Docente']} · {r['asignatura'] or r['carpeta_nombre']}" for _, r in with_folder.iterrows()]
+            c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
+            with c1:
+                idx = st.selectbox("Docente:", range(len(labels)), format_func=lambda i: labels[i], key="adm_enter_sel")
+            with c2:
+                if st.button("Entrar", type="primary", width='stretch', key="adm_enter_btn"):
+                    enter_teacher_panel(with_folder.iloc[idx].to_dict())
+                    st.rerun()
+        return
+
+    # Mantenimiento
+    st.markdown("##### 🔌 Conexión")
+    if drive_ok:
+        st.success("✅ Conectado a Google Drive con la cuenta de servicio.")
+    else:
+        st.warning("⚠️ Sin conexión a Google Drive (falta `gcp_service_account` en los secretos). La app funciona en modo local.")
+    if drive_ok:
+        if docentes.empty:
+            st.error("❌ No se encontró o no se pudo leer `docentes.xlsx` en la carpeta raíz.")
+        else:
+            st.success(f"✅ `docentes.xlsx`: {len(docentes)} registro(s) válidos.")
+            issues = docentes_issues(docentes)
+            if issues:
+                st.warning("Revisa en `docentes.xlsx`:\n\n" + "\n".join(f"- {i}" for i in issues))
+            else:
+                st.caption("No se detectaron problemas en `docentes.xlsx`.")
+        st.link_button("📂 Abrir la carpeta raíz en Google Drive", f"https://drive.google.com/drive/folders/{ROOT_FOLDER_ID}")
+
+    st.markdown("##### 🔄 Datos")
+    st.caption("La app guarda en memoria lo que lee de Drive por unos minutos para ser rápida. Si un docente acaba de "
+               "subir archivos o se editó `docentes.xlsx`, recarga para verlo de inmediato.")
+    if st.button("🔄 Recargar todo desde Google Drive", key="adm_clear_cache"):
+        st.cache_data.clear()
+        set_flash('success', "✅ Datos recargados desde Google Drive.")
+        st.rerun()
+
+    st.markdown("##### 📄 Plantilla de `docentes.xlsx`")
+    st.caption("Columnas: usuario, contraseña, asignatura, carpeta, nombre y correo. Opcionales: `rol` (docente, tutor o "
+               "directivo) y `grupos_tutoria` (ej. \"5°H, 5°J\" o \"todos\"). Un tutor o directivo sin carpeta entra directo a tutoría.")
+    st.download_button("📥 Descargar plantilla de docentes.xlsx", docentes_template_bytes(), file_name="docentes_plantilla.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="adm_dl_docentes")
 
 
 # ------------------------------------------------------------------------------
@@ -5224,16 +5622,7 @@ def render_login():
                             st.rerun()
 
                         elif ADMIN_USERNAME and ADMIN_PASSWORD and doc_user_input == ADMIN_USERNAME and doc_pass_input == ADMIN_PASSWORD:
-                            st.session_state['logged_in'] = True
-                            st.session_state['role'] = 'admin'
-                            st.session_state['username'] = ADMIN_USERNAME
-                            st.session_state['teacher_name'] = "Administrador General"
-                            st.session_state['teacher_email'] = ""
-                            st.session_state['student_name'] = "Profesor / Administrador General"
-                            st.session_state['asignatura'] = "Temas Selectos de Matemáticas II"
-                            st.session_state['carpeta_nombre'] = "datos (Local)"
-                            st.session_state['teacher_folder_id'] = None
-                            st.success("Acceso concedido como Administrador Maestro.")
+                            start_superadmin_session()
                             st.rerun()
 
                         elif docentes_df.empty and drive_ready:
@@ -5284,10 +5673,16 @@ def render_admin():
     with header_col2:
         st.write("")
         st.write("")
+        if st.session_state.get('as_superadmin'):
+            if st.button("⬅️ Administración", width='stretch', key="back_to_superadmin"):
+                start_superadmin_session()
+                st.rerun()
         if st.button("🚪 Cerrar Sesión", width='stretch'):
             st.session_state.clear()
             st.rerun()
 
+    if st.session_state.get('as_superadmin'):
+        st.caption("🛠️ Estás viendo el panel de este docente como administrador. Los cambios que guardes se aplican en su carpeta.")
     show_flash()
 
     # Navegación por secciones (en lugar de pestañas): solo se dibuja la sección elegida,
@@ -6328,6 +6723,8 @@ def main():
             render_admin()
         elif st.session_state.get('role') == 'tutor':
             render_tutor_only()
+        elif st.session_state.get('role') == 'superadmin':
+            render_superadmin()
         else:
             render_student()
 
