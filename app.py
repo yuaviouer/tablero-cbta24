@@ -2061,7 +2061,7 @@ def build_motivation_message(ins):
 
     if status is None:
         if n_up:
-            return ("¡Bienvenido(a)!", f"Aún no tienes actividades evaluadas. Tienes {n_up} actividad(es) en curso: entrégalas a tiempo y empieza el semestre con el pie derecho.")
+            return ("¡Bienvenido(a)!", f"Aún no tienes actividades evaluadas. Tienes {n_up} actividad(es) en curso: entrégalas a tiempo y empieza con el pie derecho.")
         return ("¡Bienvenido(a)!", "Aún no tienes actividades evaluadas. Aquí verás tu avance en cuanto tu docente publique las primeras tareas.")
 
     streak_txt = f" Llevas {ins['streak']} bloque(s) seguidos entregando todo a tiempo." if ins['streak'] >= 2 else ""
@@ -2071,7 +2071,7 @@ def build_motivation_message(ins):
         trend_txt = " Tu último bloque fue mejor que tu promedio: ¡vas mejorando!"
 
     if status == 'Excelente':
-        return ("¡Vas excelente!", f"Tu esfuerzo se nota.{streak_txt}{trend_txt} Mantén este ritmo todo el semestre.")
+        return ("¡Vas excelente!", f"Tu esfuerzo se nota.{streak_txt}{trend_txt} Mantén este ritmo todo el parcial.")
     if status == 'Bien':
         gap = max(0.0, ins['min_excelente'] - avg)
         extra = ""
@@ -2164,11 +2164,16 @@ def render_student_home(ins):
     title, body = build_motivation_message(ins)
     avg_txt = f"{ins['avg']:.1f}" if ins['avg'] is not None else "—"
     status_txt = ins['status'] or "Sin evaluar"
+    sel = ins.get('parcial_sel')
+    if ins.get('components'):
+        hero_label = f"Khan Academy · {sel}" if sel else "Promedio en Khan Academy"
+    else:
+        hero_label = f"Calificación del {sel}" if sel else "Promedio general"
     st.markdown(compact_html(f"""
     <div class="hero-card" style="border-left-color: {style['accent']};">
         <div class="hero-top">
             <div>
-                <div class="hero-label">{'Promedio en Khan Academy' if ins.get('components') else 'Promedio general'}</div>
+                <div class="hero-label">{hero_label}</div>
                 <div class="hero-grade">{avg_txt}<span> / {ins['scale']}</span></div>
             </div>
             <div class="hero-status" style="background: {style['bg']}; color: {style['fg']};">{style['icon']} {status_txt}</div>
@@ -2178,9 +2183,18 @@ def render_student_home(ins):
     """), unsafe_allow_html=True)
 
     # Fila compacta de indicadores (se mantiene en una sola fila también en celular)
-    parcial_label = f"Promedio {ins['parcial_actual']}" if ins['parcial_actual'] else "Parcial actual"
+    if sel and ins.get('components'):
+        # Con evidencias/examen, el promedio de Khan del semestre no es una calificación: mejor, lo pendiente del parcial
+        first_stat = ("📝 Por entregar", f"{len(ins['upcoming']) + len(ins['overdue'])} <small>actividad(es)</small>")
+    elif sel:
+        sem_val = ins.get('semester_avg')
+        first_stat = ("📚 Promedio de los parciales", (f"{sem_val:.1f}" if sem_val is not None else "—") +
+                      (f" <small>({ins['n_parciales']} parcial{'es' if ins['n_parciales'] != 1 else ''})</small>" if sem_val is not None else ""))
+    else:
+        parcial_label = f"Promedio {ins['parcial_actual']}" if ins['parcial_actual'] else "Parcial actual"
+        first_stat = (parcial_label, f"{ins['parcial_avg']:.1f}" if ins['parcial_avg'] is not None else "—")
     mini_stats = [
-        (parcial_label, f"{ins['parcial_avg']:.1f}" if ins['parcial_avg'] is not None else "—"),
+        first_stat,
         ("🔥 Racha puntual", f"{ins['streak']} <small>bloque(s)</small>"),
         ("⏰ A tiempo", f"{ins['on_time_pct']:.0f}%" if ins['on_time_pct'] is not None else "—"),
     ]
@@ -2211,15 +2225,17 @@ def render_student_home(ins):
 
 def render_student_pending(ins, key_prefix):
     upcoming, overdue, scheduled = ins['upcoming'], ins['overdue'], ins['scheduled']
+    sel = ins.get('parcial_sel')
+    noun = f"tu calificación del {sel}" if sel else "tu promedio"
 
     # Calculadora de recuperación
     if ins['avg_best'] is not None:
-        st.markdown("#### 🧮 ¿Cuánto puede subir mi promedio?")
+        st.markdown(f"#### 🧮 ¿Cuánto puede subir {noun}?")
         delta = (ins['avg_best'] - ins['avg']) if ins['avg'] is not None else None
         delta_html = f" <small class='delta-up'>▲ {delta:.1f}</small>" if delta is not None and delta >= 0.05 else ""
         st.markdown(f"""
         <div class='mini-stats' style='grid-template-columns: repeat(2, 1fr);'>
-            <div class='mini-stat'><div class='mini-label'>Promedio actual</div><div class='mini-val'>{f"{ins['avg']:.1f}" if ins['avg'] is not None else "—"}</div></div>
+            <div class='mini-stat'><div class='mini-label'>{f"Llevas en el {sel}" if sel else "Promedio actual"}</div><div class='mini-val'>{f"{ins['avg']:.1f}" if ins['avg'] is not None else "—"}</div></div>
             <div class='mini-stat'><div class='mini-label'>Si entregas todo lo pendiente</div><div class='mini-val'>{ins['avg_best']:.1f}{delta_html}</div></div>
         </div>""", unsafe_allow_html=True)
         lines = []
@@ -2229,7 +2245,8 @@ def render_student_pending(ins, key_prefix):
             lines.append(f"- Si entregas tus {len(overdue)} actividad(es) atrasada(s), aunque sea tarde: **{ins['avg_recover_overdue']:.1f}**.")
         if lines:
             st.markdown("\n".join(lines))
-        st.caption("Estimación suponiendo que respondes todo correctamente sin pasarte del máximo de intentos. "
+        st.caption((f"Solo cuentan las actividades del {sel}. " if sel else "") +
+                   "Estimación suponiendo que respondes todo correctamente sin pasarte del máximo de intentos. "
                    "En los ejercicios, los puntos dependen de tus aciertos; si una entrega tardía supera el máximo de intentos, vale 0. "
                    "Las entregas tardías valen menos, ¡pero siempre suman!")
         st.link_button("🚀 Ir a Khan Academy", "https://es.khanacademy.org/", type="primary", width='stretch')
@@ -2269,6 +2286,11 @@ def render_student_pending(ins, key_prefix):
         ]
         st.markdown(compact_html("".join(cards)), unsafe_allow_html=True)
 
+    if ins.get('other_overdue'):
+        others = ", ".join(f"{n} del {p}" for p, n in sorted(ins['other_overdue'].items()))
+        st.caption(f"📂 También tienes actividades atrasadas de otro parcial ({others}). Elige ese parcial arriba para verlas; "
+                   "pregúntale a tu docente si todavía cuentan.")
+
     if not scheduled.empty:
         next_start = scheduled['dt_inicio'].iloc[0]
         st.caption(f"📅 Próximamente: {len(scheduled)} actividad(es) programada(s). La siguiente se habilita el {format_short_date(next_start)}.")
@@ -2280,13 +2302,33 @@ def render_student_experience(student_name, tasks, criteria_config, key_prefix="
         st.info("Todavía no hay actividades registradas para ti en esta asignatura. Si crees que es un error, avísale a tu docente.")
         return
 
-    ins = build_student_insights(tasks, criteria_config)
+    cfg = criteria_config if isinstance(criteria_config, dict) else {}
     if updated_at is not None and pd.notna(updated_at):
         st.caption(f"🔄 Datos actualizados al {format_short_date(updated_at)}. Lo que entregues después aparecerá cuando tu docente actualice los reportes de Khan Academy.")
 
+    # Cada parcial se califica por separado: Inicio y Pendientes muestran solo el parcial elegido
+    # (por defecto, el que está en curso), para no mezclarlo con los anteriores.
+    parcial_opts = [p for p in PARCIALES if 'Parcial' in tasks.columns and (tasks['Parcial'] == p).any()]
+    sel_parcial = None
+    view_tasks = tasks
+    if parcial_opts:
+        cur = current_parcial(cfg)
+        default_p = cur if cur in parcial_opts else parcial_opts[-1]
+        view_key = f"{key_prefix}_view_parcial"
+        extra = {} if view_key in st.session_state else {'default': default_p}
+        sel_parcial = st.segmented_control("Parcial", parcial_opts, key=view_key, required=True,
+                                           label_visibility="collapsed", **extra) or default_p
+        view_tasks = tasks[tasks['Parcial'] == sel_parcial]
+    ins = build_student_insights(view_tasks, cfg)
+    ins['parcial_sel'] = sel_parcial
+    p_avgs = [a for a in (_average_block_grade(tasks[tasks['Parcial'] == p], cfg) for p in parcial_opts) if a is not None]
+    ins['semester_avg'] = sum(p_avgs) / len(p_avgs) if p_avgs else None
+    ins['n_parciales'] = len(p_avgs)
+    other = tasks[(tasks['status'] == 'No completado') & (tasks['Parcial'] != sel_parcial)] if sel_parcial else tasks.iloc[0:0]
+    ins['other_overdue'] = other.groupby('Parcial').size().to_dict() if not other.empty else {}
+
     n_pend = len(ins['upcoming']) + len(ins['overdue'])
     # Pestaña de evaluación del parcial: solo si el docente usa otros componentes o registró algo del alumno
-    cfg = criteria_config if isinstance(criteria_config, dict) else {}
     show_eval = bool(eval_ctx) and bool(student_id) and (
         any(float(v) > 0 for v in (cfg.get('componentes') or {}).values())
         or any(not t.empty and (t['ID alumno'] == student_id).any() for t in (eval_ctx['evid'], eval_ctx['extra'], eval_ctx['att']))
@@ -2307,13 +2349,13 @@ def render_student_experience(student_name, tasks, criteria_config, key_prefix="
         render_student_home(ins)
     with tabs[1]:
         if eval_ctx and student_id:
-            render_evidence_motivation({**eval_ctx, 'tasks': tasks}, student_id, cfg, current_parcial(cfg), compact=True)
+            render_evidence_motivation({**eval_ctx, 'tasks': tasks}, student_id, cfg, sel_parcial or current_parcial(cfg), compact=True)
         render_student_pending(ins, key_prefix)
     with tabs[2]:
         render_student_dashboard(student_name, tasks, criteria_config=criteria_config, is_admin_drilldown=(key_prefix == 'admin'))
     if show_eval:
         with tab_of["🧾 Mi evaluación"]:
-            render_student_evaluation({**eval_ctx, 'tasks': tasks}, student_id, criteria_config, key_prefix)
+            render_student_evaluation({**eval_ctx, 'tasks': tasks}, student_id, criteria_config, key_prefix, sel_parcial)
     if topics_map:
         with tab_of["📚 Mis temas"]:
             render_student_topics(tasks, topics_map)
@@ -2530,7 +2572,93 @@ def render_group_trend_chart(block_summary, tasks, criteria_config, color_map):
     st.altair_chart((rule + rule_text + line).properties(height=280), width='stretch')
 
 
-def render_teacher_summary(tasks, block_summary, criteria_config, color_map, asignatura="la materia", attendance=None):
+# ------------------------------------------------------------------------------
+# Seguimiento: alumnos que el docente ya atendió
+# ------------------------------------------------------------------------------
+def load_followups(folder_id):
+    return _norm_table(load_teacher_table(folder_id, SEGUIMIENTO_FILE), SEGUIMIENTO_COLS)
+
+
+def latest_followups(followups):
+    """{(grupo, alumno): última fila de seguimiento}."""
+    if followups is None or followups.empty:
+        return {}
+    fu = followups.sort_values('Fecha')
+    return {(r['Grupo'], r['Alumno']): r.to_dict() for _, r in fu.iterrows()}
+
+
+def last_evaluated_date(tasks, grupo, alumno):
+    """Fecha de entrega de la actividad evaluada más reciente del alumno (la información "nueva" más reciente)."""
+    t = tasks[(tasks['Grupo'] == grupo) & (tasks['Nombre del estudiante'] == alumno) & ~tasks['status'].isin(NOT_EVALUATED_STATUSES)]
+    d = t['dt_entrega'].dropna()
+    return d.max().date() if not d.empty else None
+
+
+def split_attended(att_df, tasks, followups):
+    """
+    Separa la lista de atención en (pendientes, atendidos). Un alumno marcado como atendido no vuelve a la
+    lista hasta que se cierra una entrega posterior a la fecha en que se le atendió (hay información nueva).
+    """
+    if att_df.empty:
+        return att_df, att_df
+    latest = latest_followups(followups)
+    hidden = []
+    for idx, r in att_df.iterrows():
+        fu = latest.get((r['Grupo'], r['Nombre del estudiante']))
+        if not fu:
+            continue
+        try:
+            fu_date = pd.to_datetime(fu['Fecha']).date()
+        except Exception:
+            continue
+        last = last_evaluated_date(tasks, r['Grupo'], r['Nombre del estudiante'])
+        if last is None or fu_date >= last:
+            hidden.append(idx)
+    attended = att_df.loc[hidden].copy()
+    if not attended.empty:
+        attended['_fu'] = [latest[(g, n)] for g, n in zip(attended['Grupo'], attended['Nombre del estudiante'])]
+    return att_df.drop(index=hidden), attended
+
+
+def render_followup_controls(folder_id, pending_df, attended_df):
+    """Controles discretos para marcar alumnos como atendidos (con nota) o volver a mostrarlos."""
+    _show_pending_upload("dl_pending_followup")
+    if not pending_df.empty:
+        with st.expander("✅ Ya atendí a un alumno de esta lista"), st.form("fu_form", clear_on_submit=True, border=False):
+            labels = {f"{r['Nombre del estudiante']} · {r['Grupo']}": (r['Grupo'], r['Nombre del estudiante']) for _, r in pending_df.iterrows()}
+            who = st.selectbox("Alumno:", list(labels), key="fu_student")
+            note = st.text_input("Nota (opcional):", key="fu_note", max_chars=200,
+                                 placeholder="Ej. Platiqué con él y con su mamá; se comprometió a entregar el viernes.")
+            st.caption("Saldrá de la lista. Si en una entrega posterior vuelve a cumplir algún motivo, aparecerá de nuevo.")
+            if st.form_submit_button("Marcar como atendido", type="primary"):
+                grupo, alumno = labels[who]
+                table = _norm_table(read_teacher_table(folder_id, SEGUIMIENTO_FILE), SEGUIMIENTO_COLS)
+                new = pd.DataFrame([{'Grupo': grupo, 'Alumno': alumno, 'Fecha': now_local().strftime('%Y-%m-%d %H:%M'),
+                                     'Nota': note.strip()}])
+                _finish_save([save_teacher_table(folder_id, SEGUIMIENTO_FILE, pd.concat([table, new], ignore_index=True), "Seguimiento")])
+    if not attended_df.empty:
+        with st.expander(f"✔️ Atendidos ({len(attended_df)}) · reaparecen si hay información nueva"):
+            for _, r in attended_df.iterrows():
+                fu = r['_fu']
+                when = format_short_date(pd.to_datetime(fu['Fecha']), with_time=False) if fu.get('Fecha') else ""
+                st.markdown(f"**{html.escape(r['Nombre del estudiante'])}** · {html.escape(str(r['Grupo']))} · atendido el {when}"
+                            + (f"  \n<span style='color:#475569'>📝 {html.escape(fu['Nota'])}</span>" if fu.get('Nota') else ""),
+                            unsafe_allow_html=True)
+            labels = {f"{r['Nombre del estudiante']} · {r['Grupo']}": (r['Grupo'], r['Nombre del estudiante']) for _, r in attended_df.iterrows()}
+            c1, c2 = st.columns([3, 2], vertical_alignment="bottom")
+            with c1:
+                who = st.selectbox("Volver a mostrar en la lista:", list(labels), key="fu_undo_student")
+            with c2:
+                if st.button("↺ Volver a mostrar", width='stretch', key="fu_undo"):
+                    grupo, alumno = labels[who]
+                    table = _norm_table(read_teacher_table(folder_id, SEGUIMIENTO_FILE), SEGUIMIENTO_COLS)
+                    mine = table[(table['Grupo'] == grupo) & (table['Alumno'] == alumno)]
+                    if not mine.empty:
+                        table = table.drop(index=mine.sort_values('Fecha').index[-1])
+                    _finish_save([save_teacher_table(folder_id, SEGUIMIENTO_FILE, table, "Seguimiento")])
+
+
+def render_teacher_summary(tasks, block_summary, criteria_config, color_map, asignatura="la materia", attendance=None, folder_id=None, parcial_label=None):
     """Pestaña 'Resumen y acciones' del panel docente."""
     cfg = criteria_config if isinstance(criteria_config, dict) else {}
     class_df = build_class_insights(tasks, block_summary, cfg)
@@ -2538,6 +2666,7 @@ def render_teacher_summary(tasks, block_summary, criteria_config, color_map, asi
         st.info("Aún no hay información suficiente para el resumen.")
         return
     att_df, rec_df = build_attention_lists(class_df, cfg, attendance)
+    att_df, attended_df = split_attended(att_df, tasks, load_followups(folder_id))
     scale = int(cfg.get('escala_maxima', 10))
     step = 1.0 if scale == 10 else 10.0
 
@@ -2610,9 +2739,10 @@ def render_teacher_summary(tasks, block_summary, criteria_config, color_map, asi
     export_cols_att = ['Prioridad', 'Nombre del estudiante', 'Grupo', 'Promedio', 'Motivos', 'Acción sugerida', 'Atrasadas']
     export_cols_rec = ['Nombre del estudiante', 'Grupo', 'Promedio', 'Motivo de reconocimiento']
 
-    st.markdown("#### 🆘 Necesitan atención")
+    st.markdown("#### 🆘 Necesitan atención" + (f" · {parcial_label}" if parcial_label else ""))
     if att_df.empty:
-        st.success("🎉 Ningún alumno requiere atención especial con los filtros actuales.")
+        st.success("🎉 Ningún alumno requiere atención especial con los filtros actuales."
+                   + (f" ({len(attended_df)} ya atendido(s).)" if not attended_df.empty else ""))
     else:
         st.caption(f"{len(att_df)} alumno(s), ordenados por prioridad. Para ver el detalle de alguno, usa la sección **🔍 Alumno**.")
         cards = []
@@ -2638,6 +2768,7 @@ def render_teacher_summary(tasks, block_summary, criteria_config, color_map, asi
             file_name=f"Alumnos_atencion_{now_local().strftime('%Y%m%d')}.csv", mime="text/csv",
             key="dl_attention"
         )
+    render_followup_controls(folder_id, att_df, attended_df)
 
     st.markdown("#### 🌟 Para reconocer")
     if rec_df.empty:
@@ -3414,7 +3545,9 @@ EXTRA_FILE = "calificaciones_parcial.xlsx"
 ATT_FILE = "asistencia.xlsx"
 EVID_COLS = ['ID alumno', 'Grupo', 'Bloque', 'Fecha bloque', 'Nivel', 'Actualizado']
 EXTRA_COLS = ['ID alumno', 'Parcial', 'Componente', 'Calificación', 'Actualizado']
-ATT_COLS = ['ID alumno', 'Grupo', 'Fecha', 'Estado']
+ATT_COLS = ['ID alumno', 'Grupo', 'Fecha', 'Estado', 'Nota']
+SEGUIMIENTO_FILE = "seguimiento.xlsx"
+SEGUIMIENTO_COLS = ['Grupo', 'Alumno', 'Fecha', 'Nota']
 
 # Rúbrica de evidencias: nivel -> porcentaje del componente
 EVID_LEVELS = [
@@ -3463,6 +3596,7 @@ def evid_color(pct, cfg):
 def rubric_markdown(cfg, suffix=""):
     return "\n".join(f"- **{lbl}** ({pct:g}%{suffix}): {desc}" for lbl, pct, desc in evid_levels(cfg))
 ATT_STATES = ["✅ Asistió", "⏰ Retardo", "📝 Justificada", "❌ Falta"]
+ATT_NOTE_STATES = ("⏰ Retardo", "📝 Justificada")
 PARCIALES = ['Parcial 1', 'Parcial 2', 'Parcial 3']
 
 
@@ -3657,7 +3791,9 @@ def render_attendance_section(folder_id, roster, criteria_config):
     grupo, _, students = _eval_selectors(roster, cfg, "att", with_parcial=False)
     fecha = st.date_input("Fecha de la clase:", value=now_local().date(), key="att_date")
     f_iso = fecha.isoformat()
-    current = att[(att['Grupo'] == grupo) & (att['Fecha'] == f_iso)].set_index('ID alumno')['Estado'] if not att.empty else pd.Series(dtype=str)
+    day = att[(att['Grupo'] == grupo) & (att['Fecha'] == f_iso)].set_index('ID alumno') if not att.empty else pd.DataFrame(columns=['Estado', 'Nota'])
+    current = day['Estado']
+    current_notes = day['Nota']
     st.caption("✅ Ya hay pase de lista para esta fecha; puedes corregirlo." if not current.empty else
                "Todos empiezan como **Asistió**: toca solo a quien faltó o llegó tarde. El retardo y la falta justificada no cuentan como falta.")
 
@@ -3665,7 +3801,7 @@ def render_attendance_section(folder_id, roster, criteria_config):
     if st.button("↺ Marcar a todos como Asistió", key=f"att_reset_{grupo}_{f_iso}"):
         for k in keys.values():
             st.session_state[k] = ATT_STATES[0]
-    states = {}
+    states, notes = {}, {}
     for _, s in students.iterrows():
         c1, c2 = st.columns([2, 3], vertical_alignment="center")
         with c1:
@@ -3675,11 +3811,19 @@ def render_attendance_section(folder_id, roster, criteria_config):
             val = st.pills("Estado", ATT_STATES, key=keys[s['ID']], required=True,
                            format_func=lambda o: _ATT_SHORT[o], label_visibility="collapsed", wrap=True, **default)
             states[s['ID']] = val or ATT_STATES[0]
+        # Nota opcional solo para retardos y justificantes (no estorba al resto del pase de lista)
+        if states[s['ID']] in ATT_NOTE_STATES:
+            notes[s['ID']] = st.text_input(
+                "Nota", value=str(current_notes.get(s['ID'], '') or ''), key=f"attnote_{grupo}_{f_iso}_{s['ID']}",
+                label_visibility="collapsed", max_chars=150,
+                placeholder="📝 Nota opcional: ej. trajo receta médica; avisó su mamá por WhatsApp"
+            ).strip()
     n_f = sum(v == "❌ Falta" for v in states.values())
     n_r = sum(v == "⏰ Retardo" for v in states.values())
     st.markdown(f"**{len(states) - n_f} presentes** · {n_f} falta(s) · {n_r} retardo(s)")
     if st.button("💾 Guardar asistencia", type="primary", width='stretch', key="save_att_btn"):
-        new = pd.DataFrame({'ID alumno': list(states), 'Grupo': grupo, 'Fecha': f_iso, 'Estado': list(states.values())})
+        new = pd.DataFrame({'ID alumno': list(states), 'Grupo': grupo, 'Fecha': f_iso, 'Estado': list(states.values()),
+                            'Nota': [notes.get(i, '') if states[i] in ATT_NOTE_STATES else '' for i in states]})
         base = fresh_table(folder_id, ATT_FILE, ATT_COLS)
         _finish_save([save_teacher_table(folder_id, ATT_FILE, upsert_rows(base, new, ['ID alumno', 'Fecha']), "Asistencia")])
 
@@ -3694,6 +3838,17 @@ def render_attendance_section(folder_id, roster, criteria_config):
                          expanded=bool(n_low)):
             st.dataframe(summ.sort_values('Asistencia %'), hide_index=True, width='stretch',
                          column_config={'Asistencia %': st.column_config.ProgressColumn(format="%d%%", min_value=0, max_value=100)})
+    # Notas de retardos y justificantes del parcial, para revisarlas al cerrar el parcial
+    if not att.empty:
+        ids = set(students['ID'])
+        noted = att[att['ID alumno'].isin(ids) & (att['Nota'] != '')].copy()
+        noted = noted[noted['Fecha'].apply(lambda d: parcial_of(d, cfg)) == parcial]
+        if not noted.empty:
+            names = students.set_index('ID')['Nombre']
+            noted['Alumno'] = noted['ID alumno'].map(names)
+            noted = noted.sort_values(['Alumno', 'Fecha'])[['Alumno', 'Fecha', 'Estado', 'Nota']]
+            with st.expander(f"📝 Notas de retardos y justificantes · {parcial} ({len(noted)})"):
+                st.dataframe(noted, hide_index=True, width='stretch')
 
 
 def render_evidence_section(folder_id, roster, tasks, criteria_config):
@@ -3894,7 +4049,7 @@ def render_evidence_motivation(ctx, student_id, criteria_config, parcial, compac
     return True
 
 
-def render_student_evaluation(ctx, student_id, criteria_config, key_prefix):
+def render_student_evaluation(ctx, student_id, criteria_config, key_prefix, default_parcial=None):
     """Pestaña '🧾 Mi evaluación' del alumno: componentes, sellos y asistencia."""
     cfg = criteria_config or {}
     scale = int(cfg.get('escala_maxima', 10))
@@ -3905,8 +4060,8 @@ def render_student_evaluation(ctx, student_id, criteria_config, key_prefix):
     if me.empty:
         st.info("Tu docente aún no te ha registrado en su lista oficial.")
         return
-    cur = current_parcial(cfg)
-    parcial = st.selectbox("Parcial:", PARCIALES, index=PARCIALES.index(cur), key=f"{key_prefix}_my_eval_parcial")
+    cur = default_parcial if default_parcial in PARCIALES else current_parcial(cfg)
+    parcial = st.selectbox("Parcial:", PARCIALES, index=PARCIALES.index(cur), key=f"{key_prefix}_my_eval_parcial_{cur}")
     cfg = group_config(cfg, me.iloc[0]['Grupo'], parcial)
     weights = {**DEFAULT_COMPONENTES, **(cfg.get('componentes') or {})}
     comps = compute_components(me, evid, extra, att, cfg, parcial)
@@ -4025,6 +4180,7 @@ def setup_files_spec(raw_khan, unique_task_types):
         (ATT_FILE, "🙋 Pase de lista (lo llena la app).", lambda: table_to_xlsx_bytes(pd.DataFrame(columns=ATT_COLS), "Asistencia")),
         (EVID_FILE, "📓 Sellos de evidencia (lo llena la app).", lambda: table_to_xlsx_bytes(pd.DataFrame(columns=EVID_COLS), "Evidencias")),
         (EXTRA_FILE, "📝 Examen y producto del parcial (lo llena la app).", lambda: table_to_xlsx_bytes(pd.DataFrame(columns=EXTRA_COLS), "Calificaciones")),
+        (SEGUIMIENTO_FILE, "✅ Alumnos que marcaste como atendidos en Inicio, con tus notas (lo llena la app).", lambda: table_to_xlsx_bytes(pd.DataFrame(columns=SEGUIMIENTO_COLS), "Seguimiento")),
         (METAS_FILE, "🎯 Metas que se ponen tus alumnos en cada parcial (lo llenan ellos desde su portal).", lambda: table_to_xlsx_bytes(pd.DataFrame(columns=METAS_COLS), "Metas")),
         (TEMAS_FILE, "📚 Tema de cada actividad. Ya viene con tus actividades de Khan: llénalo aquí o en Ajustes → 📚 Temas.", topics_seed),
     ]
@@ -5663,9 +5819,13 @@ def render_admin():
             )
 
         with f_col2:
+            p_filter_opts = ["Todos los Parciales", "Parcial 1", "Parcial 2", "Parcial 3", "Sin asignar"]
+            p_now = current_parcial(active_criteria_config)
+            has_now = (assignments_tagged['Parcial'] == p_now).any() if 'Parcial' in assignments_tagged.columns else False
             filtro_parcial_master = st.selectbox(
-                "Filtrar por Parcial:",
-                ["Todos los Parciales", "Parcial 1", "Parcial 2", "Parcial 3", "Sin asignar"]
+                "Filtrar por Parcial:", p_filter_opts,
+                index=p_filter_opts.index(p_now) if has_now else 0, key="master_parcial_filter",
+                help="Empieza en el parcial en curso. Elige 'Todos los Parciales' para ver el semestre completo."
             )
 
     else:
@@ -5776,7 +5936,9 @@ def render_admin():
         render_final_section(teacher_folder_id, roster, assignments_tagged, active_criteria_config)
 
     if section == NAV_INICIO:
-        render_teacher_summary(active_master, block_summary, active_criteria_config, group_color_map(available_groups), asignatura, att_map)
+        render_teacher_summary(active_master, block_summary, active_criteria_config, group_color_map(available_groups), asignatura, att_map,
+                               folder_id=teacher_folder_id,
+                               parcial_label=None if filtro_parcial_master in ("Todos los Parciales", "Sin asignar") else filtro_parcial_master)
 
     if section == NAV_CALIF and calif_sub == CALIF_ACT:
         render_task_analysis(active_master)
@@ -5950,6 +6112,15 @@ def render_admin():
         if not mastery.empty:
             st.markdown("#### 📚 Dominio por tema")
             render_topic_bars(mastery)
+        fu_all = load_followups(teacher_folder_id)
+        fu_mine = fu_all[(fu_all['Grupo'] == student_group) & (fu_all['Alumno'] == selected_student)] if not fu_all.empty else fu_all
+        notes_att = eval_att[(eval_att['ID alumno'] == sel_id) & (eval_att['Nota'] != '')] if (sel_id and not eval_att.empty) else eval_att.iloc[0:0]
+        if not fu_mine.empty or not notes_att.empty:
+            with st.expander(f"📝 Seguimiento y notas ({len(fu_mine) + len(notes_att)})"):
+                for _, r in fu_mine.sort_values('Fecha').iterrows():
+                    st.markdown(f"✅ **Atendido** · {html.escape(str(r['Fecha'])[:10])}" + (f" — {html.escape(r['Nota'])}" if r['Nota'] else ""))
+                for _, r in notes_att.sort_values('Fecha').iterrows():
+                    st.markdown(f"{html.escape(r['Estado'])} · {html.escape(r['Fecha'])} — {html.escape(r['Nota'])}")
         final_row = None
         if uses_components(group_config(drill_cfg, student_group, p_now)) and sel_id:
             comps = compute_components(roster[roster['ID'] == sel_id], eval_evid, eval_extra, eval_att, drill_cfg, p_now)
