@@ -3712,7 +3712,12 @@ def compute_final_grades(components, khan_by_name, criteria_config, parcial=None
         }
         used = [(w, v) for w, v in values.values() if w > 0 and v is not None]
         pending = [k for k, (w, v) in values.items() if w > 0 and v is None]
-        final = sum(w * v for w, v in used) / sum(w for w, _ in used) if used else None
+        total_w = sum(w for w, _ in values.values() if w > 0)
+        used_w = sum(w for w, _ in used)
+        # Proyección: promedio de lo evaluado (lo que obtendría si mantiene ese desempeño en lo que falta)
+        final = sum(w * v for w, v in used) / used_w if used else None
+        # Acumulado: puntos ganados hasta hoy sobre el total del parcial (lo pendiente cuenta como 0 por ahora)
+        acumulado = sum(w * v for w, v in used) / total_w if (used and total_w) else None
         rows.append({
             'ID': r['ID'], 'Grupo': r['Grupo'], 'Nombre': r['Nombre'],
             'Khan': round(khan_full, 1) if khan_full is not None else None,
@@ -3721,6 +3726,8 @@ def compute_final_grades(components, khan_by_name, criteria_config, parcial=None
             'Producto': r['Producto'] if pd.notna(r['Producto']) else None,
             'Asistencia %': round(r['Asistencia %'], 0) if pd.notna(r['Asistencia %']) else None,
             'Final': round(final, 1) if final is not None else None,
+            'Acumulado': round(acumulado, 1) if acumulado is not None else None,
+            'Evaluado %': round(used_w / total_w * 100) if total_w else 0,
             'Pendiente': ", ".join(dict(COMPONENTES).get(k, 'Khan').split(' ', 1)[-1] for k in pending),
         })
     return pd.DataFrame(rows)
@@ -3949,8 +3956,10 @@ def render_final_section(folder_id, roster, tasks, criteria_config):
         over = group_overrides(base_cfg, grupo, parcial)
         origin = (f" (acordada con {grupo} para {parcial})" if over and over['del_parcial'] else
                   f" (acordada con {grupo})" if over else " (criterios generales)")
-    st.caption("Ponderación" + origin + ": " + " + ".join(parts) + ". Si a un alumno le falta algún componente, su calificación se calcula "
-               "con lo registrado y el faltante aparece en **Pendiente**.")
+    st.caption("Ponderación" + origin + ": " + " + ".join(parts) + ". **Acumulado**: puntos ganados hasta hoy sobre el total "
+               "del parcial (lo que falta registrar cuenta como 0 por ahora). **Proyección**: promedio de lo ya evaluado, es "
+               "decir, lo que obtendría si mantiene ese desempeño; el estatus se calcula con ella para no alarmar al inicio del "
+               "parcial. Cuando todo está registrado, ambas coinciden.")
     if abs(total_w - 100) > 0.01:
         st.warning(f"⚠️ Los pesos suman {total_w:g}%. Ajústalos en ⚙️ Ajustes → Criterios y componentes.")
     comps = compute_components(students, evid, extra, att, cfg, parcial)
@@ -3959,14 +3968,17 @@ def render_final_section(folder_id, roster, tasks, criteria_config):
         st.info("Sin alumnos en este grupo.")
         return
     final['Estatus'] = final['Final'].apply(lambda v: classify_student(v, cfg.get('thresholds', {}), scale) if v is not None else "Sin datos")
-    show = final.drop(columns=['ID'])
-    for col in ['Khan', 'Evidencias', 'Examen', 'Producto', 'Asistencia %', 'Final']:
+    show = final.drop(columns=['ID']).rename(columns={'Final': 'Proyección', 'Evaluado %': 'Evaluado'})
+    show = show[['Grupo', 'Nombre', 'Khan', 'Evidencias', 'Examen', 'Producto', 'Asistencia %', 'Acumulado', 'Evaluado',
+                 'Proyección', 'Estatus', 'Pendiente']]
+    for col in ['Khan', 'Evidencias', 'Examen', 'Producto', 'Asistencia %', 'Acumulado', 'Proyección']:
         show[col] = pd.to_numeric(show[col], errors='coerce')
     # Vista: celdas sin registro como "—" (Streamlit mostraría "None")
     view = show.copy()
-    for col in ['Khan', 'Evidencias', 'Examen', 'Producto', 'Final']:
+    for col in ['Khan', 'Evidencias', 'Examen', 'Producto', 'Acumulado', 'Proyección']:
         view[col] = view[col].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "—")
     view['Asistencia %'] = view['Asistencia %'].apply(lambda v: f"{v:.0f}%" if pd.notna(v) else "—")
+    view['Evaluado'] = view['Evaluado'].apply(lambda v: f"{v:.0f}%")
     st.dataframe(view, hide_index=True, width='stretch', height=min(560, 40 + len(view) * 36))
     st.download_button("📥 Descargar calificaciones del parcial (Excel)", table_to_xlsx_bytes(show, parcial),
                        file_name=f"Calificaciones_{parcial.replace(' ', '')}_{grupo.replace('°', '')}_{now_local().strftime('%Y%m%d')}.xlsx",
@@ -4079,12 +4091,21 @@ def render_student_evaluation(ctx, student_id, criteria_config, key_prefix, defa
         f"<div class='mini-val'>{(f'{v:.1f}' if v is not None and not pd.isna(v) else '—')}<small> / {scale}</small></div></div>"
         for lbl, w, v in items if w > 0
     )
-    final_txt = f"{final['Final']:.1f}" if final['Final'] is not None else "—"
+    acum = final.get('Acumulado')
+    acum_txt = f"{acum:.1f}" if acum is not None and pd.notna(acum) else "—"
+    evaluated = float(final.get('Evaluado %') or 0)
+    if final['Pendiente']:
+        msg = (f"Se ha evaluado el {evaluated:.0f}% del parcial: de {scale * evaluated / 100:.1f} puntos posibles hasta hoy llevas "
+               f"{acum_txt}. Pendiente por registrar: {final['Pendiente']}.")
+        if final['Final'] is not None and pd.notna(final['Final']):
+            msg += f" Si mantienes este desempeño en lo que falta, terminarías con {final['Final']:.1f}."
+    else:
+        msg = "Todos los componentes están registrados."
     st.markdown(compact_html(f"""
     <div class="hero-card" style="border-left-color:#2563eb;">
-        <div class="hero-label">Calificación estimada de {parcial}</div>
-        <div class="hero-grade">{final_txt}<span> / {scale}</span></div>
-        <div class="hero-msg">{('Pendiente por registrar: ' + html.escape(final['Pendiente']) + '.') if final['Pendiente'] else 'Todos los componentes están registrados.'}</div>
+        <div class="hero-label">Calificación acumulada de {parcial}</div>
+        <div class="hero-grade">{acum_txt}<span> / {scale}</span></div>
+        <div class="hero-msg">{html.escape(msg)}</div>
     </div>
     <div class="mini-stats teacher-stats">{cards}</div>"""), unsafe_allow_html=True)
 
@@ -4394,6 +4415,8 @@ def subject_student_detail(graded, grupo, nombre, sid, cfg, parcial, att, fin_ro
                      ('Producto', weights['producto']), ('Asistencia %', weights['asistencia'])]
         d['componentes'] = [(k, fin_row.get(k), float(w)) for k, w in comp_keys if float(w) > 0]
         d['final'] = fin_row.get('Final')
+        d['acumulado'] = fin_row.get('Acumulado')
+        d['evaluado'] = fin_row.get('Evaluado %')
         d['pendiente'] = fin_row.get('Pendiente')
     if sid and att is not None and not att.empty:
         a = att[att['ID alumno'] == sid]
@@ -4613,10 +4636,18 @@ def tutoria_report_pdf(df, key_name, group, periodo="Todo el semestre", tutor_na
 
     if '_vista' in g.columns:
         g = g.assign(Estatus=g['_vista'])
-    rows = [[r['Materia'], r['Docente'], _fmt_num(r['Promedio']), r['Estatus'], str(r['Atrasadas']), _fmt_num(r['Asistencia %'], pct=True)]
-            for _, r in g.iterrows()]
-    rep.table("Resumen por materia", ["Materia", "Docente", "Calificación", "Estatus", "Pendientes", "Asistencia"], rows,
-              [52, 50, 24, 24, 20, 22])
+    def _acum(r):
+        d = r.get('_detail') or {}
+        if d.get('acumulado') is None or pd.isna(d.get('acumulado')):
+            return _fmt_num(r['Promedio'])
+        return f"{_fmt_num(d['acumulado'])} ({float(d.get('evaluado') or 0):.0f}%)"
+
+    rows = [[r['Materia'], r['Docente'], _acum(r), _fmt_num(r['Promedio']), r['Estatus'], str(r['Atrasadas']),
+             _fmt_num(r['Asistencia %'], pct=True)] for _, r in g.iterrows()]
+    rep.table("Resumen por materia", ["Materia", "Docente", "Acumulado", "Proyección", "Estatus", "Pendientes", "Asistencia"], rows,
+              [40, 40, 26, 22, 24, 20, 20])
+    rep.lines([("Cómo leer la tabla", "Acumulado = puntos ganados hasta hoy (entre paréntesis, cuánto del parcial se ha "
+                "evaluado). Proyección = lo que obtendría si mantiene su desempeño en lo que falta.")], size=8.5)
 
     n_risk = int((g['Estatus'] == 'En riesgo').sum())
     good = list(g.loc[g['Estatus'].isin(['Excelente', 'Bien']), 'Materia'])
@@ -4643,9 +4674,17 @@ def tutoria_report_pdf(df, key_name, group, periodo="Todo el semestre", tutor_na
         items = [("Forma de evaluar", d.get('criterios', '-'))]
         if d.get('componentes'):
             parts = [f"{k.replace(' %', '')} {_fmt_num(v, pct=(k == 'Asistencia %'))}" for k, v, _ in d['componentes']]
-            items.append(("Resultados", " | ".join(parts) + f"  ->  Calificación: {_fmt_num(d.get('final'))} de {d['scale']}"))
+            items.append(("Resultados", " | ".join(parts)))
             if d.get('pendiente'):
+                ev = float(d.get('evaluado') or 0)
+                items.append(("Calificación acumulada",
+                              f"{_fmt_num(d.get('acumulado'))} de {d['scale']} (se ha evaluado el {ev:.0f}% del parcial; "
+                              f"de {d['scale'] * ev / 100:.1f} puntos posibles hasta hoy)"))
+                if d.get('final') is not None and pd.notna(d.get('final')):
+                    items.append(("Si mantiene este desempeño", f"terminaría con {_fmt_num(d['final'])} de {d['scale']}"))
                 items.append(("Falta registrar", d['pendiente']))
+            else:
+                items.append(("Calificación", f"{_fmt_num(d.get('final'))} de {d['scale']}"))
         elif d.get('khan') is not None:
             items.append(("Promedio en Khan Academy", f"{_fmt_num(d['khan'])} de {d['scale']}"))
         if d.get('evaluadas'):
@@ -5309,13 +5348,17 @@ def subject_report_pdf(student, group, asignatura, teacher_name, tasks, criteria
         weights = {**DEFAULT_COMPONENTES, **(cfg.get('componentes') or {})}
         used = {'Khan': khan_weight(cfg), 'Evidencias': weights['evidencias'], 'Examen': weights['examen'],
                 'Producto': weights['producto'], 'Asistencia %': weights['asistencia']}
-        keys = [k for k, w in used.items() if w > 0] + ['Final']
+        pending = bool(final_row.get('Pendiente'))
+        keys = [k for k, w in used.items() if w > 0] + (['Acumulado', 'Final'] if pending else ['Final'])
         cells = ["-" if final_row.get(k) is None or pd.isna(final_row.get(k)) else
                  (f"{final_row[k]:.0f}%" if k == 'Asistencia %' else f"{final_row[k]:g}") for k in keys]
-        heads = [f"{'Asistencia' if k == 'Asistencia %' else k} ({used[k]:g}%)" if k in used else "Calificación" for k in keys]
+        heads = [f"{'Asistencia' if k == 'Asistencia %' else k} ({used[k]:g}%)" if k in used else
+                 {'Acumulado': f"Acumulado ({float(final_row.get('Evaluado %') or 0):.0f}% eval.)",
+                  'Final': "Proyección" if pending else "Calificación"}[k] for k in keys]
         tables.append((f"Calificación del {parcial or current_parcial(cfg)}", heads, [cells], [round(186 / len(keys))] * len(keys)))
         if final_row.get('Pendiente'):
-            paragraphs.append(("Nota", f"Aún falta registrar: {final_row['Pendiente']}. La calificación puede cambiar."))
+            paragraphs.append(("Nota", f"Aún falta registrar: {final_row['Pendiente']}. El acumulado son los puntos ganados "
+                               "hasta hoy; la proyección es lo que obtendría si mantiene su desempeño en lo que falta."))
     if mastery is not None and not mastery.empty:
         trows = [[r['Tema'], "-" if r['Dominio %'] is None or pd.isna(r['Dominio %']) else f"{int(r['Dominio %'])}%",
                   "Sin evaluar" if r['Dominio %'] is None or pd.isna(r['Dominio %']) else topic_level(r['Dominio %'])[0][2:]]
