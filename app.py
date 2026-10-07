@@ -4246,7 +4246,10 @@ def render_setup_section(folder_id, raw_khan, unique_task_types, carpeta_nombre)
 # FASE 6: TUTORÍA (VARIAS MATERIAS), REPORTE PARA LA FAMILIA (PDF), METAS Y TEMAS
 # ==============================================================================
 SCHOOL_NAME = "CBTA No. 24"
-STATUS_DOT = {'Excelente': '🟢', 'Bien': '🟢', 'Regular': '🟡', 'En riesgo': '🔴'}
+CURRENT_PERIOD = "Parcial en curso"
+MIN_BLOCKS_FOR_RISK = 2
+EARLY_LABEL = 'Señal temprana'
+STATUS_DOT = {'Excelente': '🟢', 'Bien': '🟢', 'Regular': '🟡', 'En riesgo': '🔴', EARLY_LABEL: '🟠'}
 
 
 def parse_tutor_groups(value):
@@ -4285,6 +4288,9 @@ def subject_student_summary(subject, groups, parcial):
         roster = roster[roster['Grupo'].isin(groups)] if not roster.empty else roster
     types = sorted(t for t in raw['Tipo de tarea'].dropna().astype(str).unique() if t) if (not raw.empty and 'Tipo de tarea' in raw.columns) else []
     cfg = khan_view_config(load_teacher_criterios(folder_id, types))
+    if parcial == CURRENT_PERIOD:
+        # Cada docente tiene sus propias fechas de parciales: se usa el parcial en curso de esta materia
+        parcial = current_parcial(cfg)
     rows = {}
     graded = pd.DataFrame()
     # Con actividad en Khan en algún momento del semestre (no solo en el periodo elegido)
@@ -4297,10 +4303,13 @@ def subject_student_summary(subject, groups, parcial):
             graded = graded[graded['Parcial'] == parcial]
         if not graded.empty:
             blocks = compute_student_block_grades(graded, cfg)
-            avg = blocks.dropna(subset=['block_grade']).groupby(['Grupo', 'Nombre del estudiante'])['block_grade'].mean()
+            evaluated_blocks = blocks.dropna(subset=['block_grade'])
+            avg = evaluated_blocks.groupby(['Grupo', 'Nombre del estudiante'])['block_grade'].mean()
+            n_blocks = evaluated_blocks.groupby(['Grupo', 'Nombre del estudiante']).size()
             overdue = graded[graded['status'] == 'No completado'].groupby(['Grupo', 'Nombre del estudiante']).size()
             for (g, n) in graded.groupby(['Grupo', 'Nombre del estudiante']).size().index:
-                rows[(g, n)] = {'Grupo': g, 'Nombre': n, 'Promedio': avg.get((g, n)), 'Atrasadas': int(overdue.get((g, n), 0))}
+                rows[(g, n)] = {'Grupo': g, 'Nombre': n, 'Promedio': avg.get((g, n)), 'Atrasadas': int(overdue.get((g, n), 0)),
+                                'Bloques': int(n_blocks.get((g, n), 0))}
     # Alumnos de la lista sin actividad en Khan también cuentan (son los más invisibles)
     for _, r in roster.iterrows():
         rows.setdefault((r['Grupo'], r['Nombre']), {'Grupo': r['Grupo'], 'Nombre': r['Nombre'], 'Promedio': None, 'Atrasadas': 0,
@@ -4347,6 +4356,9 @@ def subject_student_summary(subject, groups, parcial):
             'Asistencia mínima': float(cfg.get('asistencia_minima', 80)),
             'Sin Khan': bool(r.get('sin_khan')),
             'No iniciado': not_started,
+            'Periodo': parcial or "Todo el semestre",
+            # Con una sola entrega evaluada todavía no se puede hablar de riesgo: es una señal temprana
+            'Pocos datos': int(r.get('Bloques', 0)) < MIN_BLOCKS_FOR_RISK,
             '_detail': detail,
             '_key': f"{g}|{' '.join(name_tokens(n))}",
         })
@@ -4371,6 +4383,7 @@ def subject_student_detail(graded, grupo, nombre, sid, cfg, parcial, att, fin_ro
         d['a_tiempo'] = int(ev['status'].astype(str).str.startswith('A tiempo').sum())
         d['en_curso'] = int((t['status'] == 'En curso').sum())
         d['atrasadas'] = list(t.loc[t['status'] == 'No completado'].sort_values('dt_entrega')['Nombre de la tarea'].astype(str))
+        d['actividades'] = activity_lists(t)
         m = topic_mastery(t, topics_map)
         if not m.empty:
             m = m.dropna(subset=['Dominio %'])
@@ -4414,11 +4427,12 @@ def build_tutoria_data(groups, parcial):
 def tutoria_priorities(df):
     rows = []
     for key, g in df.groupby('_key'):
-        risk = g[g['Estatus'] == 'En riesgo']
+        risk = g[(g['Estatus'] == 'En riesgo') & ~g['Pocos datos']]
+        early = g[(g['Estatus'] == 'En riesgo') & g['Pocos datos']]
         low_att = g[g['Asistencia %'].notna() & (g['Asistencia %'] < g['Asistencia mínima'])]
         no_khan = g[g['Sin Khan']]
         n_risk = len(risk)
-        if n_risk == 0 and low_att.empty and no_khan.empty:
+        if n_risk == 0 and low_att.empty and no_khan.empty and early.empty:
             continue
         if n_risk >= 3:
             action = "Reunión con la familia y canalizar a orientación educativa"
@@ -4426,6 +4440,8 @@ def tutoria_priorities(df):
             action = "Entrevista de tutoría y plan de recuperación con los docentes de esas materias"
         elif n_risk == 1:
             action = f"Dar seguimiento con el docente de {risk.iloc[0]['Materia']}"
+        elif low_att.empty and no_khan.empty:
+            action = "Señal temprana: revisar cómo le va en la siguiente entrega antes de intervenir"
         elif low_att.empty:
             action = "Ayudarle a entrar a Khan Academy y avisar a sus docentes"
         else:
@@ -4437,11 +4453,12 @@ def tutoria_priorities(df):
             'risk': [f"{r['Materia']} ({r['Promedio']:.1f})" if pd.notna(r['Promedio']) else r['Materia'] for _, r in risk.iterrows()],
             'att': [f"{r['Materia']} ({r['Asistencia %']:.0f}%)" for _, r in low_att.iterrows()],
             'no_khan': list(no_khan['Materia']),
+            'early': [f"{r['Materia']} ({r['Promedio']:.1f})" if pd.notna(r['Promedio']) else r['Materia'] for _, r in early.iterrows()],
             'atrasadas': int(g['Atrasadas'].sum()),
             'action': action,
             'min_att': low_att['Asistencia %'].min() if not low_att.empty else 101,
         })
-    return sorted(rows, key=lambda r: (-r['n_risk'], r['min_att'], -r['atrasadas']))
+    return sorted(rows, key=lambda r: (-r['n_risk'], r['min_att'], -len(r['no_khan']), -r['atrasadas']))
 
 
 def _pdf_txt(text):
@@ -4594,6 +4611,8 @@ def tutoria_report_pdf(df, key_name, group, periodo="Todo el semestre", tutor_na
     name = str(key_name).title()
     rep = _ReportPDF(key_name, group, f"Tutoría académica - Periodo: {periodo}" + (f" - Tutor(a): {tutor_name}" if tutor_name else ""))
 
+    if '_vista' in g.columns:
+        g = g.assign(Estatus=g['_vista'])
     rows = [[r['Materia'], r['Docente'], _fmt_num(r['Promedio']), r['Estatus'], str(r['Atrasadas']), _fmt_num(r['Asistencia %'], pct=True)]
             for _, r in g.iterrows()]
     rep.table("Resumen por materia", ["Materia", "Docente", "Calificación", "Estatus", "Pendientes", "Asistencia"], rows,
@@ -4613,8 +4632,11 @@ def tutoria_report_pdf(df, key_name, group, periodo="Todo el semestre", tutor_na
     rep.heading("Detalle por materia", size=12)
     for _, r in g.iterrows():
         d = r.get('_detail') or {}
-        rep.heading(f"{r['Materia']}  -  {r['Docente']}" + (f" ({r['Correo']})" if r.get('Correo') else ""), size=10.5,
+        rep.heading(f"{r['Materia']}  -  {r['Docente']}" + (f" ({r['Correo']})" if r.get('Correo') else "")
+                    + (f"  -  {r['Periodo']}" if periodo == CURRENT_PERIOD and r.get('Periodo') else ""), size=10.5,
                     color=(30, 58, 138), band=True)
+        if r['Estatus'] == EARLY_LABEL:
+            rep.lines([("Nota", "Solo hay una entrega evaluada en este periodo; la calificación todavía puede cambiar mucho.")])
         if r.get('No iniciado'):
             rep.lines([("Estado", "El periodo aún no inicia en esta materia.")])
             continue
@@ -4632,10 +4654,15 @@ def tutoria_report_pdf(df, key_name, group, periodo="Todo el semestre", tutor_na
                           + (f"; {d['en_curso']} en curso" if d.get('en_curso') else "")))
         elif r.get('Sin Khan'):
             items.append(("Actividades en Khan Academy", "no tiene actividad registrada; es importante que ingrese a la plataforma."))
-        if d.get('atrasadas'):
-            more = len(d['atrasadas']) - 5
-            items.append(("Pendientes que aún puede entregar",
-                          ", ".join(d['atrasadas'][:5]) + (f" y {more} más" if more > 0 else "")))
+        acts = d.get('actividades') or {}
+        if acts.get('a_tiempo'):
+            items.append((f"Realizadas a tiempo ({len(acts['a_tiempo'])})", "; ".join(acts['a_tiempo'])))
+        if acts.get('tarde'):
+            items.append((f"Realizadas con retraso ({len(acts['tarde'])})", "; ".join(acts['tarde'])))
+        if acts.get('no_entregadas'):
+            items.append((f"No realizadas ({len(acts['no_entregadas'])}) - aún puede entregarlas", "; ".join(acts['no_entregadas'])))
+        if acts.get('en_curso'):
+            items.append((f"En curso ({len(acts['en_curso'])})", "; ".join(acts['en_curso'])))
         if d.get('asistencia'):
             a = d['asistencia']
             asist = a['sesiones'] - a['faltas']
@@ -4665,10 +4692,11 @@ def render_tutoria(groups, show_title=True):
         st.markdown("### 🧭 Tutoría académica")
     st.caption("Reúne lo que registran todos los docentes: así se ve a quién atender primero, aunque en cada materia "
                "parezca un caso aislado. " + ("Grupos: todos." if groups == ['*'] else f"Grupos: {', '.join(groups)}."))
-    p_opts = ["Todo el semestre"] + PARCIALES
+    p_opts = [CURRENT_PERIOD, "Todo el semestre"] + PARCIALES
     c1, c2 = st.columns(2)
     with c2:
-        p_sel = st.selectbox("Periodo:", p_opts, index=p_opts.index(current_parcial({})) if current_parcial({}) in p_opts else 0, key="tut_parcial")
+        p_sel = st.selectbox("Periodo:", p_opts, index=0, key="tut_parcial",
+                             help="'Parcial en curso' usa las fechas de parciales de cada docente: así coincide con lo que ve el alumno.")
     parcial = None if p_sel == "Todo el semestre" else p_sel
     with st.spinner("Reuniendo la información de todas las materias..."):
         df = build_tutoria_data(groups, parcial)
@@ -4686,6 +4714,11 @@ def render_tutoria(groups, show_title=True):
     if parcial and df['No iniciado'].any():
         st.caption("ℹ️ En algunas materias el " + parcial + " todavía no inicia: "
                    + ", ".join(sorted(df.loc[df['No iniciado'], 'Materia'].unique())) + ".")
+    if parcial == CURRENT_PERIOD and df['Periodo'].nunique() > 1:
+        per = df.drop_duplicates('Materia').groupby('Periodo')['Materia'].apply(lambda s: ", ".join(sorted(s)))
+        st.caption("ℹ️ Parcial en curso de cada materia: " + " · ".join(f"**{p}**: {m}" for p, m in per.items()))
+    elif parcial == CURRENT_PERIOD and not df.empty:
+        st.caption(f"ℹ️ Parcial en curso: **{df['Periodo'].iloc[0]}**.")
     pri = tutoria_priorities(df[~df['No iniciado']])
     n_al = df['_key'].nunique()
     n2 = sum(1 for p in pri if p['n_risk'] >= 2)
@@ -4711,6 +4744,8 @@ def render_tutoria(groups, show_title=True):
                 items.append(f"<li>Asistencia baja en: {html.escape(', '.join(p['att']))}</li>")
             if p['no_khan']:
                 items.append(f"<li>Sin actividad en Khan en: {html.escape(', '.join(p['no_khan']))}</li>")
+            if p['early']:
+                items.append(f"<li>Señal temprana (solo 1 entrega evaluada): {html.escape(', '.join(p['early']))}</li>")
             if p['atrasadas']:
                 items.append(f"<li>{p['atrasadas']} actividad(es) atrasada(s) en total</li>")
             cards.append(f"""
@@ -4724,9 +4759,11 @@ def render_tutoria(groups, show_title=True):
 
     st.markdown("#### 📋 Concentrado por materia")
     st.caption("En un parcial se muestra la calificación del parcial de cada materia (con evidencias, examen, etc., si el "
-               "docente los usa); en todo el semestre, el promedio de Khan Academy. ⚪ = sin datos todavía.")
+               "docente los usa); en todo el semestre, el promedio de Khan Academy. 🟠 = señal temprana (solo una "
+               "entrega evaluada; aún no se considera riesgo) · ⚪ = sin datos todavía.")
+    df = df.assign(_vista=[EARLY_LABEL if (e == 'En riesgo' and p) else e for e, p in zip(df['Estatus'], df['Pocos datos'])])
     mat = df.pivot_table(index='Alumno', columns='Materia', values='Promedio', aggfunc='first')
-    stat = df.pivot_table(index='Alumno', columns='Materia', values='Estatus', aggfunc='first')
+    stat = df.pivot_table(index='Alumno', columns='Materia', values='_vista', aggfunc='first')
     view = mat.copy().astype(object)
     for c in mat.columns:
         view[c] = [f"{STATUS_DOT.get(s, '⚪')} {v:.1f}" if pd.notna(v) else "⚪ —" for v, s in zip(mat[c], stat[c])]
@@ -4739,7 +4776,8 @@ def render_tutoria(groups, show_title=True):
 
     st.markdown("#### 🔍 Detalle de un alumno")
     al = st.selectbox("Alumno:", sorted(df['Alumno'].unique()), key="tut_student")
-    det = df[df['Alumno'] == al][['Materia', 'Docente', 'Correo', 'Promedio', 'Estatus', 'Atrasadas', 'Asistencia %']].sort_values('Materia')
+    det = df[df['Alumno'] == al].assign(Estatus=lambda d: d['_vista'])[
+        ['Materia', 'Periodo', 'Docente', 'Correo', 'Promedio', 'Estatus', 'Atrasadas', 'Asistencia %']].sort_values('Materia')
     det_view = det.copy()
     det_view['Promedio'] = det_view['Promedio'].apply(lambda v: f"{v:.1f}" if v is not None and pd.notna(v) else "—")
     det_view['Asistencia %'] = det_view['Asistencia %'].apply(lambda v: f"{v:.0f}%" if v is not None and pd.notna(v) else "—")
@@ -5119,6 +5157,9 @@ def topic_mastery(tasks, topics_map):
         rows.append({'Tema': tema, 'Dominio %': round(pct) if pct is not None else None, 'Evaluadas': len(ev),
                      'Por venir': int(g['status'].isin(NOT_EVALUATED_STATUSES).sum()),
                      'Para repasar': list(weak['Nombre de la tarea'].astype(str).unique())[:4]})
+    if not rows:
+        # Hay temas definidos, pero ninguno corresponde a estas actividades (p. ej., otro parcial)
+        return pd.DataFrame(columns=['Tema', 'Dominio %', 'Evaluadas', 'Por venir', 'Para repasar'])
     return pd.DataFrame(rows).sort_values('Dominio %', na_position='last').reset_index(drop=True)
 
 
@@ -5230,10 +5271,31 @@ def render_group_topics(tasks, topics_map):
 # ------------------------------------------------------------------------------
 # Reporte de una materia para la familia (desde el panel docente)
 # ------------------------------------------------------------------------------
+ACTIVITY_STATUS_LABELS = {'A tiempo': 'Entregada a tiempo', 'A tiempo (con penalización)': 'A tiempo (intentos extra)',
+                          'Tardía': 'Entregada tarde', 'No completado': 'No entregada', 'En curso': 'En curso',
+                          'Programada': 'Programada'}
+
+
+def activity_lists(tasks):
+    """Nombres de las actividades por situación: a tiempo, tarde, no entregadas y en curso (en orden de entrega)."""
+    if tasks is None or tasks.empty:
+        return {'a_tiempo': [], 'tarde': [], 'no_entregadas': [], 'en_curso': [], 'programadas': 0}
+    t = tasks.sort_values(['dt_entrega', 'Nombre de la tarea'])
+    name, stt = t['Nombre de la tarea'].astype(str), t['status'].astype(str)
+    return {'a_tiempo': list(name[stt.str.startswith('A tiempo')]), 'tarde': list(name[stt == 'Tardía']),
+            'no_entregadas': list(name[stt == 'No completado']), 'en_curso': list(name[stt == 'En curso']),
+            'programadas': int((stt == 'Programada').sum())}
+
+
 def subject_report_pdf(student, group, asignatura, teacher_name, tasks, criteria_config, final_row=None, att_pct=None,
-                       goal=None, mastery=None):
+                       goal=None, mastery=None, parcial=None):
+    """
+    Reporte de una materia para la familia. `tasks` son todas las actividades del alumno (para el resumen por
+    parcial); el detalle de actividades, el mensaje y lo pendiente usan solo el parcial indicado, si lo hay.
+    """
     cfg = criteria_config or {}
-    ins = build_student_insights(tasks, cfg)
+    period_tasks = tasks[tasks['Parcial'] == parcial] if (parcial and 'Parcial' in tasks.columns) else tasks
+    ins = build_student_insights(period_tasks, cfg)
     scale = int(cfg.get('escala_maxima', 10))
     tables, paragraphs = [], []
     rows = []
@@ -5251,7 +5313,7 @@ def subject_report_pdf(student, group, asignatura, teacher_name, tasks, criteria
         cells = ["-" if final_row.get(k) is None or pd.isna(final_row.get(k)) else
                  (f"{final_row[k]:.0f}%" if k == 'Asistencia %' else f"{final_row[k]:g}") for k in keys]
         heads = [f"{'Asistencia' if k == 'Asistencia %' else k} ({used[k]:g}%)" if k in used else "Calificación" for k in keys]
-        tables.append((f"Calificación del {current_parcial(cfg)}", heads, [cells], [round(186 / len(keys))] * len(keys)))
+        tables.append((f"Calificación del {parcial or current_parcial(cfg)}", heads, [cells], [round(186 / len(keys))] * len(keys)))
         if final_row.get('Pendiente'):
             paragraphs.append(("Nota", f"Aún falta registrar: {final_row['Pendiente']}. La calificación puede cambiar."))
     if mastery is not None and not mastery.empty:
@@ -5259,15 +5321,25 @@ def subject_report_pdf(student, group, asignatura, teacher_name, tasks, criteria
                   "Sin evaluar" if r['Dominio %'] is None or pd.isna(r['Dominio %']) else topic_level(r['Dominio %'])[0][2:]]
                  for _, r in mastery.iterrows()]
         tables.append(("Dominio por tema", ["Tema", "Dominio", "Nivel"], trows, [100, 30, 50]))
-    pend = ins['overdue'].head(8)
-    if not pend.empty:
-        tables.append(("Actividades vencidas que aún puede hacer", ["Actividad", "Venció"],
-                       [[r['Nombre de la tarea'], format_short_date(r['dt_entrega'], with_time=False)] for _, r in pend.iterrows()], [140, 40]))
+    acts = period_tasks[period_tasks['status'] != 'Programada'].sort_values(['dt_entrega', 'Nombre de la tarea']) if not period_tasks.empty else period_tasks
+    if not acts.empty:
+        arows = [[r['Nombre de la tarea'], format_short_date(r['dt_entrega'], with_time=False) if pd.notna(r['dt_entrega']) else "-",
+                  ACTIVITY_STATUS_LABELS.get(str(r['status']), str(r['status'])),
+                  "-" if r['status'] in NOT_EVALUATED_STATUSES else f"{r['earned_points']:.1f} / {r['max_points']:.1f}"]
+                 for _, r in acts.iterrows()]
+        lists = activity_lists(period_tasks)
+        done = len(lists['a_tiempo']) + len(lists['tarde'])
+        tables.append((f"Actividades en Khan Academy{' - ' + parcial if parcial else ''} (realizó {done} de {done + len(lists['no_entregadas'])})",
+                       ["Actividad", "Fecha de entrega", "Situación", "Puntos"], arows, [92, 32, 40, 26]))
+        if lists['no_entregadas']:
+            paragraphs.append(("Actividades que aún puede entregar",
+                               "Aunque ya vencieron, en Khan Academy todavía puede realizarlas (valen menos, pero suman): "
+                               + "; ".join(lists['no_entregadas']) + "."))
     if att_pct is not None:
         minimum = float(cfg.get('asistencia_minima', 80))
         paragraphs.append(("Asistencia", f"Asistencia en el periodo: {att_pct:.0f}% (mínimo requerido: {minimum:.0f}%)."))
     if goal and goal.get('meta') is not None:
-        paragraphs.append(("Meta del alumno", f"Se propuso obtener {goal['meta']:g} en el {current_parcial(cfg)}."
+        paragraphs.append(("Meta del alumno", f"Se propuso obtener {goal['meta']:g} en el {parcial or current_parcial(cfg)}."
                            + (f" Su plan: {goal['plan']}" if goal.get('plan') else "")))
     paragraphs.append(("Mensaje del docente", build_student_message(ins, student, asignatura, teacher_name, 'familia')))
     return build_report_pdf(student, group, f"{asignatura} - Docente: {teacher_name}", tables, paragraphs)
@@ -6458,8 +6530,12 @@ def render_admin():
                 key="admin_drilldown_student_select"
             )
 
-        student_tasks_data = assignments_tagged[assignments_tagged['Nombre del estudiante'] == selected_student].copy()
-        student_group = student_tasks_data['Grupo'].iloc[0] if not student_tasks_data.empty else "N/A"
+        # Todas las actividades del alumno (para la vista previa y el resumen por parcial del PDF) y las del
+        # periodo elegido en "Filtrar por Parcial" (para el estatus, la lista, el mensaje y los temas)
+        student_all = assignments_tagged[assignments_tagged['Nombre del estudiante'] == selected_student].copy()
+        drill_parcial = None if filtro_parcial_master == "Todos los Parciales" else filtro_parcial_master
+        student_tasks_data = student_all[student_all['Parcial'] == drill_parcial].copy() if drill_parcial else student_all
+        student_group = student_all['Grupo'].iloc[0] if not student_all.empty else "N/A"
         # Criterios del grupo del alumno (si el docente los define por grupo)
         drill_cfg = group_config(active_criteria_config, student_group)
 
@@ -6477,7 +6553,9 @@ def render_admin():
         with drill_col3:
             st.write("")
             st.write("")
-            st.info(f"**Estatus:** {st_estatus} ({st_avg:.1f})")
+            st.info(f"**{drill_parcial or 'Semestre'}:** {st_estatus} ({st_avg:.1f})" if not valid_st_blocks.empty
+                    else f"**{drill_parcial or 'Semestre'}:** sin actividades evaluadas")
+        st.caption(f"📅 Mostrando: **{drill_parcial or 'todos los parciales'}**. Cámbialo con *Filtrar por Parcial* (arriba).")
 
         # --------------------------------------------------------------------------
         # TABLA COMPLETA CON FORMATO CONDICIONAL (.style)
@@ -6498,7 +6576,7 @@ def render_admin():
         # Metas, dominio por tema y reporte imprimible para la familia
         sel_ids = roster.loc[roster['Nombre'] == selected_student, 'ID'] if not roster.empty else pd.Series(dtype=str)
         sel_id = sel_ids.iloc[0] if not sel_ids.empty else None
-        p_now = current_parcial(drill_cfg)
+        p_now = drill_parcial if drill_parcial in PARCIALES else current_parcial(drill_cfg)
         goal = student_goal(load_goals(teacher_folder_id), sel_id, p_now)
         topics_map = load_topics_map(teacher_folder_id)
         mastery = topic_mastery(student_tasks_data, topics_map)
@@ -6519,12 +6597,13 @@ def render_admin():
         final_row = None
         if uses_components(group_config(drill_cfg, student_group, p_now)) and sel_id:
             comps = compute_components(roster[roster['ID'] == sel_id], eval_evid, eval_extra, eval_att, drill_cfg, p_now)
-            fin = compute_final_grades(comps, _khan_avg_by_name(student_tasks_data, drill_cfg, p_now), drill_cfg, p_now)
+            fin = compute_final_grades(comps, _khan_avg_by_name(student_all, drill_cfg, p_now), drill_cfg, p_now)
             final_row = fin.iloc[0].to_dict() if not fin.empty else None
         pdf_att = attendance_by_name(roster, eval_att, drill_cfg, p_now).get(selected_student)
         try:
-            pdf_bytes = subject_report_pdf(selected_student, student_group, asignatura, teacher_name, student_tasks_data,
-                                           group_config(drill_cfg, student_group, p_now), final_row, pdf_att, goal, mastery)
+            pdf_bytes = subject_report_pdf(selected_student, student_group, asignatura, teacher_name, student_all,
+                                           group_config(drill_cfg, student_group, p_now), final_row, pdf_att, goal, mastery,
+                                           parcial=drill_parcial if drill_parcial in PARCIALES else None)
             st.download_button("📄 Reporte de avance para la familia (PDF imprimible)", pdf_bytes,
                                file_name=f"Reporte_{re.sub(r'[^A-Za-z0-9]+', '_', str(selected_student))}.pdf",
                                mime="application/pdf", key="dl_student_pdf", width='stretch')
@@ -6534,88 +6613,91 @@ def render_admin():
         st.markdown("#### 📋 Listado Completo de Actividades del Alumno")
         st.caption("Semáforo de detección rápida: 🟥 **Rojo tenue:** Calificación de 0 puntos (sin entrega o penalizada) | 🟨 **Amarillo tenue:** Actividad realizada con intentos que superan el límite permitido | ⚪ **Gris/Cursiva:** Actividad programada o en curso (aún no vence).")
 
-        # Ordenar por fecha de entrega y nombre
-        all_tasks_sorted = student_tasks_data.sort_values(by=['dt_entrega', 'Nombre de la tarea']).copy()
+        if student_tasks_data.empty:
+            st.info(f"Este alumno no tiene actividades en {drill_parcial or 'el periodo elegido'}.")
+        else:
+            # Ordenar por fecha de entrega y nombre
+            all_tasks_sorted = student_tasks_data.sort_values(by=['dt_entrega', 'Nombre de la tarea']).copy()
 
-        # Columnas requeridas: 'Nombre de la tarea', 'Tipo', 'Parcial', 'Fecha de entrega', 'Número de intentos', 'Puntos Obtenidos'
-        drill_rows = []
-        for _, task_r in all_tasks_sorted.iterrows():
-            is_prog = task_r.get('status') in NOT_EVALUATED_STATUSES
-            if is_prog:
-                pts_display = task_r.get('status')
-                attempts_display = "—"
-            else:
-                pts_display = f"{task_r['earned_points']:.1f}"
-                raw_att = task_r.get('Número de intentos')
-                attempts_display = str(task_r.get('attempts_count', 0)) if pd.notna(raw_att) and str(raw_att).strip() not in ['', 'En progreso'] else ("1" if task_r.get('is_completed') else "0")
+            # Columnas requeridas: 'Nombre de la tarea', 'Tipo', 'Parcial', 'Fecha de entrega', 'Número de intentos', 'Puntos Obtenidos'
+            drill_rows = []
+            for _, task_r in all_tasks_sorted.iterrows():
+                is_prog = task_r.get('status') in NOT_EVALUATED_STATUSES
+                if is_prog:
+                    pts_display = task_r.get('status')
+                    attempts_display = "—"
+                else:
+                    pts_display = f"{task_r['earned_points']:.1f}"
+                    raw_att = task_r.get('Número de intentos')
+                    attempts_display = str(task_r.get('attempts_count', 0)) if pd.notna(raw_att) and str(raw_att).strip() not in ['', 'En progreso'] else ("1" if task_r.get('is_completed') else "0")
 
-            drill_rows.append({
-                'Nombre de la tarea': task_r['Nombre de la tarea'],
-                'Tipo': task_r['Tipo de tarea'],
-                'Parcial': task_r['Parcial'],
-                'Fecha de entrega': task_r['Fecha de entrega'],
-                'Número de intentos': attempts_display,
-                'Puntos Obtenidos': pts_display,
-                '_status': task_r['status'],
-                '_earned_points': task_r['earned_points'],
-                '_evaluar_intentos': task_r['evaluar_intentos'],
-                '_max_intentos': task_r['max_intentos']
-            })
+                drill_rows.append({
+                    'Nombre de la tarea': task_r['Nombre de la tarea'],
+                    'Tipo': task_r['Tipo de tarea'],
+                    'Parcial': task_r['Parcial'],
+                    'Fecha de entrega': task_r['Fecha de entrega'],
+                    'Número de intentos': attempts_display,
+                    'Puntos Obtenidos': pts_display,
+                    '_status': task_r['status'],
+                    '_earned_points': task_r['earned_points'],
+                    '_evaluar_intentos': task_r['evaluar_intentos'],
+                    '_max_intentos': task_r['max_intentos']
+                })
 
-        drill_display = pd.DataFrame(drill_rows)
+            drill_display = pd.DataFrame(drill_rows)
 
-        # Función de formato condicional con Pandas .style
-        def highlight_drilldown_rows(row):
-            status = row.get('_status', '')
-            if status in NOT_EVALUATED_STATUSES:
-                return ['background-color: #f8fafc; color: #64748b; font-style: italic;'] * len(row)
+            # Función de formato condicional con Pandas .style
+            def highlight_drilldown_rows(row):
+                status = row.get('_status', '')
+                if status in NOT_EVALUATED_STATUSES:
+                    return ['background-color: #f8fafc; color: #64748b; font-style: italic;'] * len(row)
 
-            score = row.get('_earned_points', 0)
-            attempts = row.get('Número de intentos', 0)
-            eval_attempts = row.get('_evaluar_intentos', False)
-            max_attempts = row.get('_max_intentos', 3)
-            try:
-                s_val = float(score)
-            except (ValueError, TypeError):
-                s_val = 0.0
-            try:
-                a_val = int(float(str(attempts).strip()))
-            except (ValueError, TypeError):
-                a_val = 0
+                score = row.get('_earned_points', 0)
+                attempts = row.get('Número de intentos', 0)
+                eval_attempts = row.get('_evaluar_intentos', False)
+                max_attempts = row.get('_max_intentos', 3)
+                try:
+                    s_val = float(score)
+                except (ValueError, TypeError):
+                    s_val = 0.0
+                try:
+                    a_val = int(float(str(attempts).strip()))
+                except (ValueError, TypeError):
+                    a_val = 0
 
-            # Rojo tenue para puntaje final de 0 en actividades activas
-            if s_val == 0.0:
-                return ['background-color: #fee2e2; color: #991b1b; font-weight: 500;'] * len(row)
-            # Amarillo tenue para intentos extras (> max_intentos) SOLO si la actividad evalúa intentos
-            elif eval_attempts and a_val > max_attempts:
-                return ['background-color: #fef9c3; color: #854d0e; font-weight: 500;'] * len(row)
-            return [''] * len(row)
+                # Rojo tenue para puntaje final de 0 en actividades activas
+                if s_val == 0.0:
+                    return ['background-color: #fee2e2; color: #991b1b; font-weight: 500;'] * len(row)
+                # Amarillo tenue para intentos extras (> max_intentos) SOLO si la actividad evalúa intentos
+                elif eval_attempts and a_val > max_attempts:
+                    return ['background-color: #fef9c3; color: #854d0e; font-weight: 500;'] * len(row)
+                return [''] * len(row)
 
-        cols_to_show = ['Nombre de la tarea', 'Tipo', 'Parcial', 'Fecha de entrega', 'Número de intentos', 'Puntos Obtenidos']
-        styled_drilldown = drill_display.style.apply(highlight_drilldown_rows, axis=1)
+            cols_to_show = ['Nombre de la tarea', 'Tipo', 'Parcial', 'Fecha de entrega', 'Número de intentos', 'Puntos Obtenidos']
+            styled_drilldown = drill_display.style.apply(highlight_drilldown_rows, axis=1)
 
-        st.dataframe(
-            styled_drilldown,
-            column_order=cols_to_show,
-            width='stretch',
-            hide_index=True,
-            height=min(550, 100 + len(drill_display) * 35),
-            column_config={
-                "Nombre de la tarea": st.column_config.TextColumn("Nombre de la tarea", width="large"),
-                "Tipo": st.column_config.TextColumn("Tipo", width="small"),
-                "Parcial": st.column_config.TextColumn("Parcial", width="small"),
-                "Fecha de entrega": st.column_config.TextColumn("Fecha de entrega", width="medium"),
-                "Número de intentos": st.column_config.TextColumn("Número de intentos", width="small"),
-                "Puntos Obtenidos": st.column_config.TextColumn("Puntos Obtenidos", width="small"),
-            }
-        )
+            st.dataframe(
+                styled_drilldown,
+                column_order=cols_to_show,
+                width='stretch',
+                hide_index=True,
+                height=min(550, 100 + len(drill_display) * 35),
+                column_config={
+                    "Nombre de la tarea": st.column_config.TextColumn("Nombre de la tarea", width="large"),
+                    "Tipo": st.column_config.TextColumn("Tipo", width="small"),
+                    "Parcial": st.column_config.TextColumn("Parcial", width="small"),
+                    "Fecha de entrega": st.column_config.TextColumn("Fecha de entrega", width="medium"),
+                    "Número de intentos": st.column_config.TextColumn("Número de intentos", width="small"),
+                    "Puntos Obtenidos": st.column_config.TextColumn("Puntos Obtenidos", width="small"),
+                }
+            )
 
-        st.write("")
+            st.write("")
 
         # Visualización complementaria: Dashboard idéntico con desglose por bloques y filtros
         with st.expander("👁️ Ver como alumno (vista previa de su portal, útil para explicarle su avance)", expanded=False):
-            updated_at = student_tasks_data['Archivo_Modificado'].max() if 'Archivo_Modificado' in student_tasks_data.columns else None
-            render_student_experience(selected_student, student_tasks_data, drill_cfg, key_prefix="admin", updated_at=updated_at,
+            updated_at = student_all['Archivo_Modificado'].max() if 'Archivo_Modificado' in student_all.columns else None
+            render_student_experience(selected_student, student_all, drill_cfg, key_prefix="admin", updated_at=updated_at,
                                       eval_ctx={**eval_ctx, 'folder_id': teacher_folder_id}, student_id=sel_id)
 
 
