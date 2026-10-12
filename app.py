@@ -968,6 +968,71 @@ def apply_dynamic_grading(df, criteria_config):
 # ==============================================================================
 # CLASIFICACIÓN DE RENDIMIENTO DEL ESTUDIANTE (ESTATUS)
 # ==============================================================================
+# ------------------------------------------------------------------------------
+# Rendimiento: calificar a todos los alumnos cuesta varios segundos con grupos grandes.
+# El resultado se guarda en caché unos minutos (las actividades pasan de "En curso" a
+# "No completado" con la hora, por eso no se guarda más tiempo) y se comparte entre
+# todas las sesiones, así que cada clic del docente no vuelve a calificar todo.
+# ------------------------------------------------------------------------------
+GRADING_CACHE_TTL = 300
+
+
+def _cfg_key(cfg):
+    return json.dumps(cfg or {}, default=str, sort_keys=True, ensure_ascii=False)
+
+
+@st.cache_data(ttl=GRADING_CACHE_TTL, max_entries=16, show_spinner=False)
+def _grade_assignments_cached(raw_df, cfg_key):
+    cfg = json.loads(cfg_key)
+    return assign_parciales_vectorized(apply_dynamic_grading(raw_df.copy(), cfg), cfg)
+
+
+def grade_assignments(raw_df, criteria_config):
+    """Califica las actividades y les asigna parcial (con caché compartida)."""
+    if raw_df is None or raw_df.empty:
+        return assign_parciales_vectorized(apply_dynamic_grading(raw_df.copy() if raw_df is not None else pd.DataFrame(),
+                                                                 criteria_config), criteria_config)
+    return _grade_assignments_cached(raw_df, _cfg_key(criteria_config))
+
+
+@st.cache_data(ttl=GRADING_CACHE_TTL, max_entries=32, show_spinner=False)
+def _block_grades_cached(df, cfg_key):
+    return compute_student_block_grades(df, json.loads(cfg_key))
+
+
+def block_grades(df, criteria_config):
+    """compute_student_block_grades con caché (para el concentrado de todo el grupo)."""
+    if df is None or df.empty:
+        return compute_student_block_grades(df if df is not None else pd.DataFrame(), criteria_config)
+    return _block_grades_cached(df, _cfg_key(criteria_config))
+
+
+def _table_signature(df):
+    """Huella barata de una tabla pequeña (lista de alumnos, vínculos) para saber si cambió."""
+    if df is None or df.empty:
+        return "0"
+    return f"{len(df)}:{int(pd.util.hash_pandas_object(df.astype(str), index=False).sum())}"
+
+
+@st.cache_data(ttl=600, max_entries=16, show_spinner=False)
+def _linked_assignments_cached(folder_id, signature):
+    raw = load_teacher_raw_assignments(folder_id)
+    roster, links = load_roster_and_links(folder_id)
+    return apply_roster_links(raw, roster, links)
+
+
+def linked_assignments(folder_id, raw_khan, roster, links):
+    """
+    apply_roster_links con caché compartida: une cuentas duplicadas y usa los nombres oficiales.
+    Se recalcula solo si cambian los reportes, la lista o los vínculos (la huella los incluye).
+    """
+    if raw_khan is None or raw_khan.empty:
+        return apply_roster_links(raw_khan, roster, links)
+    last = raw_khan['Archivo_Modificado'].max() if 'Archivo_Modificado' in raw_khan.columns else ''
+    signature = f"{len(raw_khan)}|{last}|{_table_signature(roster)}|{_table_signature(links)}"
+    return _linked_assignments_cached(folder_id, signature)
+
+
 def classify_student(score, thresholds=None, scale=10):
     """
     Clasifica el rendimiento del estudiante según su promedio general
@@ -1378,7 +1443,12 @@ def prepare_raw_assignments(dfs):
     }
     for dt_col, src_col in date_sources.items():
         if src_col in all_data.columns:
-            all_data[dt_col] = pd.to_datetime(all_data[src_col].apply(parse_khan_date), errors='coerce')
+            # Las fechas se repiten muchísimo (todo el grupo comparte las mismas fechas de entrega):
+            # se convierte cada texto distinto una sola vez en lugar de fila por fila.
+            texts = all_data[src_col]
+            unique_vals = texts.dropna().unique()
+            parsed = {v: parse_khan_date(v) for v in unique_vals}
+            all_data[dt_col] = pd.to_datetime(texts.map(parsed), errors='coerce')
         else:
             all_data[dt_col] = pd.NaT
     return all_data
@@ -1551,7 +1621,9 @@ def compute_student_block_grades(assignments_df, criterios_config=None):
         scale = float(criterios_config.get('escala_maxima', 10))
         weight = float(criterios_config.get('peso_khan', 100))
 
-    block_summary = assignments_df.groupby(
+    flagged = assignments_df.assign(_future=assignments_df['status'] == 'Programada',
+                                    _not_eval=assignments_df['status'].isin(NOT_EVALUATED_STATUSES))
+    block_summary = flagged.groupby(
         ['Grupo', 'Nombre del estudiante', 'Fecha de entrega'],
         as_index=False
     ).agg(
@@ -1559,8 +1631,8 @@ def compute_student_block_grades(assignments_df, criterios_config=None):
         max_sum=('max_points', 'sum'),
         dt_entrega=('dt_entrega', 'first'),
         parcial=('Parcial', 'first') if 'Parcial' in assignments_df.columns else ('dt_entrega', 'first'),
-        all_future=('status', lambda s: (s == 'Programada').all() if len(s) > 0 else False),
-        not_evaluated=('status', lambda s: s.isin(NOT_EVALUATED_STATUSES).all() if len(s) > 0 else False)
+        all_future=('_future', 'all'),
+        not_evaluated=('_not_eval', 'all')
     )
 
     # Con criterios por grupo, el peso de Khan (cuando escala la calificación) puede variar por grupo y parcial
@@ -2385,15 +2457,16 @@ def build_class_insights(tasks, block_summary, criteria_config):
     keys = ['Grupo', 'Nombre del estudiante', 'Fecha de entrega']
 
     blocks = block_summary.copy()
-    status_by_block = tasks.groupby(keys)['status']
-    blocks = blocks.merge(
-        pd.DataFrame({
-            'has_pending': status_by_block.agg(lambda s: s.isin(NOT_EVALUATED_STATUSES).any()),
-            'all_on_time': status_by_block.agg(lambda s: s.astype(str).str.startswith('A tiempo').all()),
-            'all_missing': status_by_block.agg(lambda s: (s == 'No completado').all()),
-        }).reset_index(),
-        on=keys, how='left'
-    )
+    # Banderas por bloque calculadas de forma vectorizada (mucho más rápido que lambdas por grupo)
+    status_str = tasks['status'].astype(str)
+    flags = tasks[keys].assign(
+        has_pending=tasks['status'].isin(NOT_EVALUATED_STATUSES),
+        all_on_time=status_str.str.startswith('A tiempo'),
+        all_missing=tasks['status'] == 'No completado',
+    ).groupby(keys).agg(has_pending=('has_pending', 'any'), all_on_time=('all_on_time', 'all'),
+                        all_missing=('all_missing', 'all')).reset_index()
+    blocks = blocks.merge(flags, on=keys, how='left')
+    tasks_by_student = {k: g for k, g in tasks.groupby(['Grupo', 'Nombre del estudiante'])}
     blocks['finished'] = (~blocks['has_pending'].fillna(True).astype(bool)) & blocks['block_grade'].notna()
 
     rows = []
@@ -2420,7 +2493,7 @@ def build_class_insights(tasks, block_summary, criteria_config):
                 break
             on_time_streak += 1
 
-        t = tasks[(tasks['Grupo'] == grupo) & (tasks['Nombre del estudiante'] == nombre)]
+        t = tasks_by_student.get((grupo, nombre), tasks.iloc[0:0])
         evaluated = t[~t['status'].isin(NOT_EVALUATED_STATUSES)]
         completed = evaluated[evaluated['is_completed'].astype(bool)]
         n_late = int(evaluated['is_late'].astype(bool).sum())
@@ -2445,6 +2518,11 @@ def build_class_insights(tasks, block_summary, criteria_config):
             'n_excess_attempts': len(excess),
         })
     return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=GRADING_CACHE_TTL, max_entries=16, show_spinner=False)
+def _class_insights_cached(tasks, block_summary, cfg_key):
+    return build_class_insights(tasks, block_summary, json.loads(cfg_key))
 
 
 def build_attention_lists(class_df, criteria_config, attendance=None):
@@ -2661,7 +2739,7 @@ def render_followup_controls(folder_id, pending_df, attended_df):
 def render_teacher_summary(tasks, block_summary, criteria_config, color_map, asignatura="la materia", attendance=None, folder_id=None, parcial_label=None):
     """Pestaña 'Resumen y acciones' del panel docente."""
     cfg = criteria_config if isinstance(criteria_config, dict) else {}
-    class_df = build_class_insights(tasks, block_summary, cfg)
+    class_df = _class_insights_cached(tasks, block_summary, _cfg_key(cfg))
     if class_df.empty:
         st.info("Aún no hay información suficiente para el resumen.")
         return
@@ -4319,7 +4397,7 @@ def subject_student_summary(subject, groups, parcial):
     p_range = parse_parciales_dates(cfg.get('parciales', {})).get(parcial) if parcial else None
     not_started = bool(p_range) and p_range['start'] > now_local().date()
     if not raw.empty:
-        graded = assign_parciales_vectorized(apply_dynamic_grading(raw.copy(), cfg), cfg)
+        graded = grade_assignments(raw, cfg)
         if parcial:
             graded = graded[graded['Parcial'] == parcial]
         if not graded.empty:
@@ -4347,7 +4425,7 @@ def subject_student_summary(subject, groups, parcial):
         comps = compute_components(roster, evid, extra, att, cfg, p_eval)
         khan_names = {}
         if not raw.empty:
-            g_all = assign_parciales_vectorized(apply_dynamic_grading(raw.copy(), cfg), cfg)
+            g_all = grade_assignments(raw, cfg)
             khan_names = _khan_avg_by_name(g_all, cfg, p_eval)
         fin = compute_final_grades(comps, khan_names, cfg, p_eval)
         finals = dict(zip(fin['Nombre'], fin['Final']))
@@ -5819,7 +5897,7 @@ def render_admin():
     all_credentials = load_teacher_credentials(teacher_folder_id)
     # Lista oficial: une cuentas duplicadas y usa el nombre oficial de cada alumno
     roster, roster_links = load_roster_and_links(teacher_folder_id)
-    raw_assignments = apply_roster_links(raw_khan, roster, roster_links)
+    raw_assignments = linked_assignments(teacher_folder_id, raw_khan, roster, roster_links)
 
     # Detectar dinámicamente los tipos de tarea presentes en los datos
     if not raw_assignments.empty and 'Tipo de tarea' in raw_assignments.columns:
@@ -6306,11 +6384,8 @@ def render_admin():
         st.warning(f"No hay reportes CSV de Khan Academy en la carpeta `{carpeta_nombre}`. Súbelos en **⚙️ Ajustes → ☁️ Archivos y Drive**.")
         return
 
-    # Calificación dinámica en tiempo real según los criterios activos
-    all_assignments = apply_dynamic_grading(raw_assignments.copy(), active_criteria_config)
-
-    # CRÍTICO: Asignar Parciales vectorialmente comparando .dt.date contra datetime.date de la configuración activa
-    assignments_tagged = assign_parciales_vectorized(all_assignments.copy(), active_criteria_config)
+    # Calificación según los criterios activos y asignación de parciales (en caché: no se recalcula en cada clic)
+    assignments_tagged = grade_assignments(raw_assignments, active_criteria_config)
 
 
     # Grupos disponibles
@@ -6357,7 +6432,7 @@ def render_admin():
         return
 
     # Calcular bloques para los datos filtrados con la escala y peso activos
-    block_summary = compute_student_block_grades(active_master, active_criteria_config)
+    block_summary = block_grades(active_master, active_criteria_config)
 
     # Orden cronológico de las columnas de fecha
     date_order = (
@@ -6756,7 +6831,7 @@ def render_student():
     # Cargar datos crudos exclusivamente de la carpeta de la asignatura/docente en Drive
     raw_khan = load_teacher_raw_assignments(teacher_folder_id)
     roster, roster_links = load_roster_and_links(teacher_folder_id)
-    raw_assignments = apply_roster_links(raw_khan, roster, roster_links)
+    raw_assignments = linked_assignments(teacher_folder_id, raw_khan, roster, roster_links)
 
     # Nombre oficial del alumno: por su ID (acceso con PIN) o por su cuenta de Khan vinculada
     student_id = st.session_state.get('student_id')
